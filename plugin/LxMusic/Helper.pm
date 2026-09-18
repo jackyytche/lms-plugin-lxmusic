@@ -233,7 +233,9 @@ sub _finish {
 	}
 	unlink($job->{out});
 
-	my ($ok, $data, $err, $logs, $alerts) = _parse($buf);
+	# 注意：_parse 是类方法（单测以 Helper->_parse 调用）——这里必须同样以类方法
+	# 调用；裸 _parse($buf) 会让 $class 吃掉 $buf、$text=undef，RESULT 永远解析失败。
+	my ($ok, $data, $err, $logs, $alerts) = __PACKAGE__->_parse($buf);
 
 	if ($why ne 'ok') {
 		$ok   = 0;
