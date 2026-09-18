@@ -27,6 +27,11 @@ jobs:
           cd plugin
           mkdir -p t_build/Plugins/LxMusic
           cp LxMusic/*.pm t_build/Plugins/LxMusic/
+          for m in URI::Escape MIME::Base64 JSON::XS Encode HTML::Entities Time::HiRes POSIX; do
+            perl -M"$m" -e1 2>&1 && echo "DEP OK: $m" || echo "DEP FAIL: $m"
+          done
+          perl -I t -I t_build -e 'use Plugins::LxMusic::ProtocolHandler; print "PROTO LOADED\n"' 2>&1 || echo "FAIL_PROTO_LOAD rc=$?"
+          perl -I t -I t_build -e 'use Plugins::LxMusic::Plugin; print "PLUGIN LOADED\n"' 2>&1 || echo "FAIL_PLUGIN_LOAD rc=$?"
           perl -I t -I t_build -c t_build/Plugins/LxMusic/Helper.pm 2>&1 || echo "FAIL_HELPER rc=$?"
           perl -I t -I t_build -c t_build/Plugins/LxMusic/ProtocolHandler.pm 2>&1 || echo "FAIL_PROTO rc=$?"
           perl -I t -I t_build -c t_build/Plugins/LxMusic/Plugin.pm 2>&1 || echo "FAIL_PLUGIN rc=$?"
