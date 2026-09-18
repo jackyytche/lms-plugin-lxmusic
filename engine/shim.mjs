@@ -120,10 +120,10 @@ function main(std, os) {
 	function httpOnce(url, options) {
 		const os_ = os;
 		const uniq = String(Date.now()) + ((Math.random() * 1e6) | 0);
-		const fBody = '/tmp/lx-b-' + uniq, fHdr = '/tmp/lx-h-' + uniq, fErr = '/tmp/lx-e-' + uniq, fCode = '/tmp/lx-c-' + uniq, fIn = '/tmp/lx-i-' + uniq;
+		const fBody = '/tmp/lx-b-' + uniq, fHdr = '/tmp/lx-h-' + uniq, fErr = '/tmp/lx-e-' + uniq, fIn = '/tmp/lx-i-' + uniq;
 		const timeout = Math.min(Math.max(Number(options.timeout) || 15, 1), 60);
 
-		const args = ['curl', '-sS', '-L', '--max-time', String(timeout), '-D', fHdr, '-o', fBody, '-w', '%{http_code}'];
+		const args = ['curl', '-sS', '-L', '--max-time', String(timeout), '-D', fHdr, '-o', fBody, '--stderr', fErr];
 		if (options.method) args.push('-X', String(options.method).toUpperCase());
 		const method = String(options.method || 'GET').toUpperCase();
 		if (options.headers) {
@@ -143,7 +143,7 @@ function main(std, os) {
 		args.push(String(url));
 
 		const t0 = Date.now();
-		const wstatus = os_.exec(args, { block: true, fileOut: fCode, fileErr: fErr });
+		const wstatus = os_.exec(args, { block: true });
 		const elapsed = Date.now() - t0;
 
 		function slurp(p) {
@@ -158,10 +158,9 @@ function main(std, os) {
 			f.close();
 			return s;
 		}
-		const codeStr = slurp(fCode).trim();
 		const rawHdr = slurp(fHdr);
 		const body = slurp(fBody).replace(/\n\z/, '');
-		for (const p of [fBody, fHdr, fErr, fCode, fIn]) {
+		for (const p of [fBody, fHdr, fErr, fIn]) {
 			try { os_.remove(p); } catch (e) {}
 		}
 
@@ -169,13 +168,15 @@ function main(std, os) {
 		const exitCode = typeof wstatus === 'number' ? (wstatus >> 8) : 0;
 		if (sig !== 0) throw new Error('curl killed by signal ' + sig);
 		if (exitCode === 28) throw new Error('timeout after ' + timeout + 's');
-		if (exitCode !== 0 && codeStr === '') throw new Error('curl exit ' + exitCode + ' (' + elapsed + 'ms)');
+		if (exitCode !== 0 && rawHdr === '') throw new Error('curl exit ' + exitCode + ' (' + elapsed + 'ms)');
 
-		// 取最后一个 status line（兼容重定向链）
-		let code = Number(codeStr) || 0;
+		// 解析 status line（取最后一个，兼容重定向链）+ headers
+		let code = 0;
 		const headerObj = {};
 		const lines = String(rawHdr).split(/\r?\n/);
 		for (const ln of lines) {
+			const m = ln.match(/^HTTP\/[\d.]+\s+(\d+)/);
+			if (m) code = Number(m[1]);
 			const kv = ln.match(/^([A-Za-z0-9-]+)\s*:\s*(.*)$/);
 			if (kv) headerObj[kv[1].toLowerCase()] = kv[2].replace(/\s+\z/, '');
 		}
