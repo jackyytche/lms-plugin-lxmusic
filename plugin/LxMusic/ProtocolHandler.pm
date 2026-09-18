@@ -21,6 +21,7 @@ use URI::Escape qw(uri_escape_utf8 uri_unescape);
 
 BEGIN { print STDERR "PH-C\n"; }
 use Slim::Music::Info;
+use Slim::Player::ProtocolHandlers;
 use Slim::Utils::Log;
 
 BEGIN { print STDERR "PH-D\n"; }
