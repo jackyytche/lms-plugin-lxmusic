@@ -305,9 +305,8 @@ function main(std) {
 	};
 
 	try {
-		// 以函数作用域执行源脚本，显式注入 lx（等价 sloppy 全局脚本语义）
-		const runSrc = new Function('lx', '"use strict"; return (function() {' + sourceCode + '\n})();');
-		runSrc(globalThis.lx);
+		// 间接 eval = 全局 sloppy 作用域执行源脚本（new Function 路径在 bellard qjs 上进程级崩溃，弃用）
+		(0, eval)(sourceCode);
 	} catch (e) {
 		print('RESULT ' + JSON.stringify({ ok: false, error: 'source load failed: ' + String((e && e.message) || e) }));
 		std.exit(1);
