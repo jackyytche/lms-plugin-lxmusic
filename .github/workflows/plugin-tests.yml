@@ -1,0 +1,23 @@
+name: Plugin tests (perl)
+
+# Helper.pm 存根回归：协议解析 / 源安装 / 引擎复制与自检。
+# ubuntu 原生 perl + LMS 同款依赖（AnyEvent、JSON::XS）。
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install perl deps
+        run: sudo apt-get update && sudo apt-get install -y libanyevent-perl libjson-xs-perl
+
+      - name: Helper regression
+        run: |
+          cd plugin
+          perl t/helper-test.pl

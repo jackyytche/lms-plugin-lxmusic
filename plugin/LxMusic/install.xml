@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<extension>
+	<name>LX Music</name>
+	<title>洛雪音乐</title>
+	<module>Plugins::LxMusic::Plugin</module>
+	<version>0.1.0-alpha0</version>
+	<description>Play music from LX Music custom-source subscriptions on Daphile. Import a subscription, search and stream tracks with quality selection.</description>
+	<creator>jackyytche</creator>
+	<homepage URL="https://github.com/jackyytche/lms-plugin-lxmusic"/>
+	<targetApplication>
+		<name>Lyrion Music Server</name>
+		<minVersion>7.7</minVersion>
+		<maxVersion>*</maxVersion>
+	</targetApplication>
+</extension>
