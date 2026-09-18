@@ -103,6 +103,7 @@ function main(std, os) {
 	}
 
 	function send(name, data) {
+		print('LOG send: ' + String(name) + ' data=' + JSON.stringify(data == null ? null : data).slice(0, 400));
 		if (name === EVENT_NAMES.updateAlert) {
 			print('ALERT ' + JSON.stringify(data == null ? {} : data));
 		}
@@ -203,11 +204,17 @@ function main(std, os) {
 		if (typeof callback !== 'function') throw new TypeError('lx.request: callback required');
 		options = options || {};
 		if (timeout) options.timeout = timeout;
+		print('LOG req: ' + String(options.method || 'GET') + ' ' + String(url).slice(0, 140)
+			+ (options.body ? ' body=' + String(options.body).length + 'B' : ''));
 		try {
 			const r = httpSync(url, options);
+			print('LOG resp: code=' + r.code + ' len=' + (r.body == null ? -1 : String(r.body).length)
+				+ ' head=' + JSON.stringify(String(r.body || '').slice(0, 80)));
 			callback(null, r.body, r.code, r.headers);
 		} catch (e) {
-			callback(String((e && e.message) || e));
+			const msg = String((e && e.message) || e);
+			print('LOG req ERR: ' + msg);
+			callback(msg);
 		}
 	}
 
@@ -375,7 +382,8 @@ function main(std, os) {
 	const source = info.source || '';
 	const infoArg = info.info || info;
 
-	print('LOG h0 calling handler, action=' + action);
+	print('LOG h0 calling handler, action=' + action
+		+ ' args=' + JSON.stringify({ source, action, info: infoArg }).slice(0, 300));
 	let ret;
 	try {
 		ret = handlers[EVENT_NAMES.request]({ source, action, info: infoArg });
@@ -383,7 +391,10 @@ function main(std, os) {
 		print('RESULT ' + JSON.stringify({ ok: false, error: 'handler sync throw: ' + String((e && e.message) || e) }));
 		std.exit(1);
 	}
-	print('LOG h1 ret=' + (ret && ret.then ? 'promise' : typeof ret));
+	const fn = handlers[EVENT_NAMES.request];
+	print('LOG h1 ret=' + (ret && ret.then ? 'promise' : typeof ret)
+		+ ' fnCtor=' + (fn.constructor && fn.constructor.name) + ' fnParams=' + fn.length
+		+ ' thenPresent=' + !!(ret && typeof ret.then === 'function'));
 
 	Promise.resolve(ret).then(r => {
 		print('LOG t1 type=' + typeof r);
