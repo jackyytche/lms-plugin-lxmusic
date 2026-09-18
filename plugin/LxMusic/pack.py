@@ -68,6 +68,8 @@ def main():
 \t\t\t<url>{base}/{ZIP_NAME}</url>
 \t\t\t<sha>{sha1}</sha>
 \t\t\t<creator>jackyytche</creator>
+\t\t\t<email>noreply@example.com</email>
+\t\t\t<category>musicservices</category>
 \t\t</plugin>
 \t</plugins>
 </extensions>
