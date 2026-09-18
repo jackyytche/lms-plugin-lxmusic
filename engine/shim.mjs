@@ -70,6 +70,20 @@ import('std').then(std => {
 function main(std) {
 	function log(...a) { print('LOG ' + a.join(' ')); }
 
+	// 读全文本文件（bellard std 无 readFile：open + getline 循环）
+	function readTextFile(path) {
+		const f = std.open(path, 'r');
+		if (!f) throw new Error('cannot open ' + path);
+		let s = '';
+		for (;;) {
+			const line = f.getline();
+			if (line === undefined || line === null) break;
+			s += line;
+		}
+		f.close();
+		return s;
+	}
+
 	// ---------- lx 事件环境 ----------
 	const handlers = {};
 	const EVENT_NAMES = Object.freeze({
@@ -267,7 +281,7 @@ function main(std) {
 	// ---------- 加载源脚本 ----------
 	let sourceCode;
 	try {
-		sourceCode = std.readFile(sourcePath);
+		sourceCode = readTextFile(sourcePath);
 	} catch (e) {
 		print('RESULT ' + JSON.stringify({ ok: false, error: 'cannot read source: ' + e }));
 		std.exit(1);
