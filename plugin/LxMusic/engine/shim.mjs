@@ -497,14 +497,16 @@ function main(std, os) {
 		std.exit(1);
 	}
 
+	// 源脚本加载后先驱动其异步初始化（desktop 宿主是常驻进程，inited 之后
+	// handler 才可用；qjs 一次性进程必须手动泵定时器/微任务到 inited）
+	// 注意：rconfig 200 的回调在 promise 微任务里注册 handler——必须先 drain
+	// 再判 handler，否则初始化成功也会被误判为 "did not register"。
+	drainUntilInited();
+
 	if (typeof handlers[EVENT_NAMES.request] !== 'function') {
 		print('RESULT ' + JSON.stringify({ ok: false, error: 'source did not register request handler' }));
 		std.exit(1);
 	}
-
-	// 源脚本加载后先驱动其异步初始化（desktop 宿主是常驻进程，inited 之后
-	// handler 才可用；qjs 一次性进程必须手动泵定时器/微任务到 inited）
-	drainUntilInited();
 
 	// 诊断：全局新增键（真差分）+ handler 函数体头部（识别转发器/占位符）
 	try {
