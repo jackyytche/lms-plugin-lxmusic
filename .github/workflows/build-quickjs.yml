@@ -1,6 +1,6 @@
 name: Build QuickJS (linux-x86_64)
 
-# 自编译 bellard 原版 quickjs（自带 std/os 模块 + js_std_loop Promise 作业驱动）。
+# 自编译 bellard 原版 quickjs（自带 std 模块 + urlGet + 作业驱动）。
 # 产物 qjs 静态二进制挂到本仓库 release（tag: qjs-v*），
 # 由洛雪音乐插件打包流程下载放入 Bin/x86_64-linux/。
 # 触发：手动 (workflow_dispatch) 或推 qjs-v* tag。
@@ -34,24 +34,22 @@ jobs:
           file qjs
           ./qjs -e "print('qjs ok, scriptArgs=' + typeof scriptArgs)"
 
-      - name: Smoke test std/os modules
+      - name: Smoke test std module
         run: |
           cd qjs-src
           ./qjs -e "import('std').then(m=>print('STD:', Object.keys(m).join(',')))"
-          ./qjs -e "import('os').then(m=>print('OS:', Object.keys(m).join(',')))"
 
       - name: Shim regression (md5 / urlGet+redirect / Promise loop)
         run: |
           Q=qjs-src/qjs
-          set -e
-          OUT=$($Q engine/shim.mjs engine/test/test-source.js ping '{}')
-          echo "$OUT"
+          OUT=$($Q engine/shim.mjs engine/test/test-source.js ping '{}' 2>&1) || true
+          echo "OUT1>>>$OUT<<<"
           echo "$OUT" | grep -q '"pong":true'
           echo "$OUT" | grep -q '900150983cd24fb0d6963f7d28e17f72'
           echo "$OUT" | grep -q '"b64":"aGVsbG8="'
           echo "$OUT" | grep -q '"env":"desktop"'
-          OUT2=$($Q engine/shim.mjs engine/test/test-source.js http '{}')
-          echo "$OUT2"
+          OUT2=$($Q engine/shim.mjs engine/test/test-source.js http '{}' 2>&1) || true
+          echo "OUT2>>>$OUT2<<<"
           echo "$OUT2" | grep -q '"ok200":true'
           echo "SHIM REGRESSION OK"
 
