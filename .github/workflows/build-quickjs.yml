@@ -17,6 +17,9 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Checkout this repo (shim + tests)
+        uses: actions/checkout@v4
+
       - name: Clone upstream bellard/quickjs
         run: |
           git clone --depth 1 https://github.com/bellard/quickjs.git qjs-src
@@ -36,6 +39,21 @@ jobs:
           cd qjs-src
           ./qjs -e "import('std').then(m=>print('STD:', Object.keys(m).join(',')))"
           ./qjs -e "import('os').then(m=>print('OS:', Object.keys(m).join(',')))"
+
+      - name: Shim regression (md5 / curl bridge / Promise loop)
+        run: |
+          Q=qjs-src/qjs
+          set -e
+          OUT=$($Q engine/shim.mjs -- engine/test/test-source.js ping '{}')
+          echo "$OUT"
+          echo "$OUT" | grep -q '"pong":true'
+          echo "$OUT" | grep -q '900150983cd24fb0d6963f7d28e17f72'
+          echo "$OUT" | grep -q '"b64":"aGVsbG8="'
+          echo "$OUT" | grep -q '"env":"desktop"'
+          OUT2=$($Q engine/shim.mjs -- engine/test/test-source.js http '{}')
+          echo "$OUT2"
+          echo "$OUT2" | grep -q '"status":200'
+          echo "SHIM REGRESSION OK"
 
       - name: Release binary (tag name = qjs-v*)
         if: startsWith(github.ref, 'refs/tags/qjs-v')
