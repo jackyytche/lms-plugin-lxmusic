@@ -62,12 +62,17 @@ function utf8Decode(u8) {
 
 import('std').then(std => {
 	globalThis.__lxStd = std;
-	main(std);
+	import('os').then(os => {
+		globalThis.__lxOs = os;
+		main(std, os);
+	}).catch(e => {
+		print('RESULT ' + JSON.stringify({ ok: false, error: 'fatal: cannot import os: ' + String((e && e.message) || e) }));
+	});
 }).catch(e => {
 	print('RESULT ' + JSON.stringify({ ok: false, error: 'fatal: cannot import std: ' + String((e && e.message) || e) }));
 });
 
-function main(std) {
+function main(std, os) {
 	function log(...a) { print('LOG ' + a.join(' ')); }
 
 	// 读全文本文件（bellard std 无 readFile：open + getline 循环；getline 不含换行，需补回）
@@ -113,44 +118,69 @@ function main(std) {
 	}
 
 	function httpOnce(url, options) {
-		// —— urlGet 能力诊断（临时）——
-		try {
-			const rb = std.urlGet(url);
-			log('diagBARE urlGet keys=' + JSON.stringify(Object.keys(rb || {})) +
-				' status=' + (rb && rb.status) +
-				' respType=' + (rb ? typeof rb.response : 'n/a') +
-				' respLen=' + (rb ? (typeof rb.response === 'string' ? rb.response.length : (rb.response ? rb.response.byteLength : 0)) : 'n/a'));
-		} catch (e) { log('diagBARE throw: ' + String((e && e.message) || e)); }
+		const os_ = os;
+		const uniq = String(Date.now()) + ((Math.random() * 1e6) | 0);
+		const fBody = '/tmp/lx-b-' + uniq, fHdr = '/tmp/lx-h-' + uniq, fErr = '/tmp/lx-e-' + uniq, fCode = '/tmp/lx-c-' + uniq, fIn = '/tmp/lx-i-' + uniq;
+		const timeout = Math.min(Math.max(Number(options.timeout) || 15, 1), 60);
 
-		const reqOpts = {
-			method: String(options.method || 'GET').toUpperCase(),
-			timeoutSec: Math.min(Math.max(Number(options.timeout) || 15, 1), 60),
-		};
+		const args = ['curl', '-sS', '-L', '--max-time', String(timeout), '-D', fHdr, '-o', fBody, '-w', '%{http_code}'];
+		if (options.method) args.push('-X', String(options.method).toUpperCase());
+		const method = String(options.method || 'GET').toUpperCase();
 		if (options.headers) {
-			reqOpts.headers = {};
-			for (const k of Object.keys(options.headers)) reqOpts.headers[k] = String(options.headers[k]);
+			for (const k of Object.keys(options.headers)) args.push('-H', k + ': ' + String(options.headers[k]));
 		}
 		if (options.body != null && options.body !== '') {
-			reqOpts.content = String(options.body);
-		} else if (options.form && reqOpts.method !== 'GET') {
+			const wf = std.open(fIn, 'wb');
+			if (!wf) throw new Error('cannot write request body file');
+			wf.write(toUtf8(String(options.body)));
+			wf.close();
+			args.push('--data-binary', '@' + fIn);
+		} else if (options.form && method !== 'GET') {
 			const parts = [];
 			for (const k of Object.keys(options.form)) parts.push(encodeURIComponent(k) + '=' + encodeURIComponent(options.form[k]));
-			reqOpts.content = parts.join('&');
-			reqOpts.headers = reqOpts.headers || {};
-			if (!reqOpts.headers['Content-Type']) reqOpts.headers['Content-Type'] = 'application/x-www-form-urlencoded';
+			args.push('--data-urlencode', parts.join('&'));
 		}
+		args.push(String(url));
+
 		const t0 = Date.now();
-		const r = std.urlGet(url, reqOpts);
+		const wstatus = os_.exec(args, { block: true, fileOut: fCode, fileErr: fErr });
 		const elapsed = Date.now() - t0;
-		log('diagOPT reqOpts=' + JSON.stringify(reqOpts) +
-			' rkeys=' + JSON.stringify(Object.keys(r || {})) +
-			' status=' + (r && r.status) +
-			' respLen=' + (r ? (typeof r.response === 'string' ? r.response.length : (r.response ? r.response.byteLength : 0)) : 'n/a'));
-		const body = typeof r.response === 'string' ? r.response : utf8Decode(new Uint8Array(r.response || []));
+
+		function slurp(p) {
+			const f = std.open(p, 'r');
+			if (!f) return '';
+			let s = '';
+			for (;;) {
+				const line = f.getline();
+				if (line === undefined || line === null) break;
+				s += line + '\n';
+			}
+			f.close();
+			return s;
+		}
+		const codeStr = slurp(fCode).trim();
+		const rawHdr = slurp(fHdr);
+		const body = slurp(fBody).replace(/\n\z/, '');
+		for (const p of [fBody, fHdr, fErr, fCode, fIn]) {
+			try { os_.remove(p); } catch (e) {}
+		}
+
+		const sig = typeof wstatus === 'number' ? (wstatus & 0x7f) : 0;
+		const exitCode = typeof wstatus === 'number' ? (wstatus >> 8) : 0;
+		if (sig !== 0) throw new Error('curl killed by signal ' + sig);
+		if (exitCode === 28) throw new Error('timeout after ' + timeout + 's');
+		if (exitCode !== 0 && codeStr === '') throw new Error('curl exit ' + exitCode + ' (' + elapsed + 'ms)');
+
+		// 取最后一个 status line（兼容重定向链）
+		let code = Number(codeStr) || 0;
 		const headerObj = {};
-		for (const k of Object.keys(r.headers || {})) headerObj[String(k).toLowerCase()] = String(r.headers[k]);
-		log('http', reqOpts.method, url, '->', r.status, '(' + elapsed + 'ms,' + body.length + 'B)');
-		return { body, code: r.status, headers: headerObj };
+		const lines = String(rawHdr).split(/\r?\n/);
+		for (const ln of lines) {
+			const kv = ln.match(/^([A-Za-z0-9-]+)\s*:\s*(.*)$/);
+			if (kv) headerObj[kv[1].toLowerCase()] = kv[2].replace(/\s+\z/, '');
+		}
+		log('http', method, url, '->', code, '(' + elapsed + 'ms,' + body.length + 'B)');
+		return { body, code, headers: headerObj };
 	}
 
 	function httpSync(url, options) {
