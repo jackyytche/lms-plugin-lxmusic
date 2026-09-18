@@ -1,0 +1,17 @@
+Ambiguous call resolved as CORE::warn(), qualify as such or use & at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/Slim/Utils/Log.pm line 25.
+Ambiguous call resolved as CORE::warn(), qualify as such or use & at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/Slim/Utils/Log.pm line 26.
+Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 152.
+	(Maybe you meant system() when you said exec()?)
+ok - parse ok=1
+ok - parse data url
+ok - parse log captured
+ok - parse err ok=0
+ok - parse err message
+ok - parse no-result
+ok - parse bad-json
+ok - parse noise ignored
+ok - parse alert captured
+ok - init returned true
+ok - installSource sanitised
+
+ALL PASS
