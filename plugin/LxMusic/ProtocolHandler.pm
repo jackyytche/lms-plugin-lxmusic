@@ -12,20 +12,25 @@ package Plugins::LxMusic::ProtocolHandler;
 use strict;
 use warnings;
 
+BEGIN { print STDERR "PH-A\n"; }
 use base qw(Slim::Player::Protocols::HTTP);
 
+BEGIN { print STDERR "PH-B\n"; }
 use MIME::Base64 qw(encode_base64url decode_base64url);
 use URI::Escape qw(uri_escape_utf8 uri_unescape);
 
+BEGIN { print STDERR "PH-C\n"; }
 use Slim::Music::Info;
 use Slim::Utils::Log;
 
+BEGIN { print STDERR "PH-D\n"; }
 use Plugins::LxMusic::Helper;
 
+BEGIN { print STDERR "PH-E\n"; }
 my $log = logger('plugin.lxmusic');
-
+BEGIN { print STDERR "PH-F\n"; }
 Slim::Player::ProtocolHandlers->registerHandler('lxm', __PACKAGE__);
-
+BEGIN { print STDERR "PH-G\n"; }
 my $JSON = JSON::XS->new->utf8->canonical;
 
 # 达菲 seek 修正（Ximalaya 0.1.26 同款）：声明转码级 seek，
