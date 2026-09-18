@@ -314,16 +314,19 @@ function main(std, os) {
 		Promise.resolve().then(() => fn());
 	};
 
-	// 反复排空定时器队列，直到 inited 或轮数上限（防止源无限轮询）
-	function drainUntilInited() {
+	// 反复让出执行栈直到 inited 或轮数上限（防止源无限轮询）。
+	// 关键：qjs 顶层同步代码中 promise 微任务不执行——必须 await 让栈退回引擎，
+	// rconfig 回调之后的 then 链（注册 handler + send(inited)）才有机会跑。
+	async function drainUntilInited() {
 		let rounds = 0;
-		while (!__inited && __timers.length && rounds < 300) {
+		while (!__inited && rounds < 200) {
+			rounds++;
 			const batch = __timers.splice(0, __timers.length);
 			for (const t of batch) {
 				try { t.fn.apply(null, t.args); }
 				catch (e) { print('LOG timer ERR: ' + String((e && e.message) || e)); }
 			}
-			rounds++;
+			await null;
 		}
 		print('LOG drain: rounds=' + rounds + ' inited=' + __inited + ' pending=' + __timers.length);
 	}
@@ -500,8 +503,8 @@ function main(std, os) {
 	// 源脚本加载后先驱动其异步初始化（desktop 宿主是常驻进程，inited 之后
 	// handler 才可用；qjs 一次性进程必须手动泵定时器/微任务到 inited）
 	// 注意：rconfig 200 的回调在 promise 微任务里注册 handler——必须先 drain
-	// 再判 handler，否则初始化成功也会被误判为 "did not register"。
-	drainUntilInited();
+	// 再判 handler；drain 内部用 await 让出栈，否则微任务在 qjs 顶层不执行。
+	await drainUntilInited();
 
 	if (typeof handlers[EVENT_NAMES.request] !== 'function') {
 		print('RESULT ' + JSON.stringify({ ok: false, error: 'source did not register request handler' }));
