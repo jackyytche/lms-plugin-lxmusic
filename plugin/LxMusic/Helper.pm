@@ -86,8 +86,8 @@ sub init {
 	chmod(0755, $QJS);                       # 关键：解压丢 +x，/tmp 里修复
 
 	# 引擎自检（阻塞但 <100ms，仅 init 一次）
-	my $out = _qx([$QJS, '-e', 'print("lx-engine-ok:"+("abc"==String.fromCharCode(97,98,99)))']);
-	if ($out && $out =~ /lx-engine-ok:1/) {
+	my $out = _qx([$QJS, '-e', 'print("lx-engine-ok:"+(1+1))']);
+	if ($out && $out =~ /lx-engine-ok:2/) {
 		$log->info('LxMusic Helper: engine ready at ' . $QJS);
 		return 1;
 	}

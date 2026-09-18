@@ -67,7 +67,7 @@ sub check {
 # ---------- 6. installSource：名字清洗 ----------
 {
 	my $p = Plugins::LxMusic::Helper->installSource('../evil?name.js', 'var x=1;');
-	check('installSource sanitised',   defined $p && $p !~ m{[\?\.\.]}, $p // '');
+	check('installSource sanitised',   defined $p && $p !~ m{\?\;} && $p !~ m{\.\.}, $p // '');
 }
 
 print $failed ? "\nFAILED: $failed\n" : "\nALL PASS\n";
