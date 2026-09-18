@@ -1,6 +1,6 @@
 Ambiguous call resolved as CORE::warn(), qualify as such or use & at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/Slim/Utils/Log.pm line 25.
 Ambiguous call resolved as CORE::warn(), qualify as such or use & at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/Slim/Utils/Log.pm line 26.
-Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 163.
+Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 166.
 	(Maybe you meant system() when you said exec()?)
 ok - parse ok=1
 ok - parse data url
