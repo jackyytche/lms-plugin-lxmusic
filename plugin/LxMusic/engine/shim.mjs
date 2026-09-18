@@ -214,7 +214,20 @@ async function main(std, os) {
 			const r = httpSync(url, options);
 			print('LOG resp: code=' + r.code + ' len=' + (r.body == null ? -1 : String(r.body).length)
 				+ ' head=' + JSON.stringify(String(r.body || '').slice(0, 80)));
-			callback(null, r.body, r.code, r.headers);
+			// 对齐 desktop preload 的 callback 形状（源按它解析）：
+			//   第二参 = { statusCode, statusMessage, headers, bytes, raw(Buffer), body(尽量 JSON 解析) }
+			//   第三参 = JSON 解析后的 body（不是 status 数字！）
+			const rawBytes = toUtf8(String(r.body == null ? '' : r.body));
+			let parsed = r.body;
+			try { parsed = JSON.parse(parsed); } catch (e) {}
+			callback(null, {
+				statusCode: r.code,
+				statusMessage: '',
+				headers: r.headers,
+				bytes: rawBytes.length,
+				raw: new NodeBuf(rawBytes),
+				body: parsed,
+			}, parsed);
 		} catch (e) {
 			const msg = String((e && e.message) || e);
 			print('LOG req ERR: ' + msg);
