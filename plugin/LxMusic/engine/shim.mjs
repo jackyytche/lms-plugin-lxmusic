@@ -72,7 +72,7 @@ import('std').then(std => {
 	print('RESULT ' + JSON.stringify({ ok: false, error: 'fatal: cannot import std: ' + String((e && e.message) || e) }));
 });
 
-function main(std, os) {
+async function main(std, os) {
 	function log(...a) { print('LOG ' + a.join(' ')); }
 
 	// 读全文本文件（bellard std 无 readFile：open + getline 循环；getline 不含换行，需补回）
