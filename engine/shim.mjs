@@ -342,9 +342,14 @@ function main(std) {
 	print('LOG h1 ret=' + (ret && ret.then ? 'promise' : typeof ret));
 
 	Promise.resolve(ret).then(r => {
-		print('LOG h2 then fired');
-		print('RESULT ' + JSON.stringify({ ok: true, data: r == null ? null : r }));
+		print('LOG t1 type=' + typeof r);
+		print('LOG t2 keys=' + (r ? Object.keys(r).join(',') : 'null'));
+		const s = JSON.stringify({ ok: true, data: r == null ? null : r });
+		print('LOG t3 stringify len=' + s.length);
+		print('RESULT ' + s);
+		print('LOG t4 before flush');
 		std.out.flush();
+		print('LOG t5 flushed, exiting');
 		std.exit(0);
 	}).catch(e => {
 		print('RESULT ' + JSON.stringify({ ok: false, error: String((e && e.message) || e) }));

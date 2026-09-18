@@ -42,14 +42,14 @@ jobs:
       - name: Shim regression (md5 / urlGet+redirect / Promise loop)
         run: |
           Q=qjs-src/qjs
-          OUT=$($Q engine/shim.mjs engine/test/test-source.js ping '{}' 2>&1) || true
-          echo "OUT1>>>$OUT<<<"
+          OUT=$($Q engine/shim.mjs engine/test/test-source.js ping '{}' 2>&1); RC=$?
+          echo "RC1=$RC OUT1>>>$OUT<<<"
           echo "$OUT" | grep -q '"pong":true'
           echo "$OUT" | grep -q '900150983cd24fb0d6963f7d28e17f72'
           echo "$OUT" | grep -q '"b64":"aGVsbG8="'
           echo "$OUT" | grep -q '"env":"desktop"'
-          OUT2=$($Q engine/shim.mjs engine/test/test-source.js http '{}' 2>&1) || true
-          echo "OUT2>>>$OUT2<<<"
+          OUT2=$($Q engine/shim.mjs engine/test/test-source.js http '{}' 2>&1); RC=$?
+          echo "RC2=$RC OUT2>>>$OUT2<<<"
           echo "$OUT2" | grep -q '"ok200":true'
           echo "SHIM REGRESSION OK"
 
