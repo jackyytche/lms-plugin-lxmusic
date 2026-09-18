@@ -206,7 +206,7 @@ function main(std, os) {
 		if (typeof callback !== 'function') throw new TypeError('lx.request: callback required');
 		options = options || {};
 		if (timeout) options.timeout = timeout;
-		print('LOG req: ' + String(options.method || 'GET') + ' ' + String(url).slice(0, 140)
+		print('LOG req hdrs=' + JSON.stringify(options.headers || {}) + ' ' + 'LOG req: ' + String(options.method || 'GET') + ' ' + String(url).slice(0, 140)
 			+ (options.body ? ' body=' + String(options.body).length + 'B' : ''));
 		try {
 			const r = httpSync(url, options);
@@ -440,7 +440,6 @@ function main(std, os) {
 		currentScriptInfo: null,
 		version: '2.0.0',
 		env: 'desktop',
-		env: 'desktop',
 	};
 
 	// ---------- 解析参数 ----------
@@ -489,7 +488,8 @@ function main(std, os) {
 		delete handlers[EVENT_NAMES.request];   // 冒烟占位符不参与后续（避免误判源 handler）
 		print('LOG e2 handlers: ' + JSON.stringify(Object.keys(handlers)));
 		std.loadScript(sourcePath);
-		print('LOG e3 loadScript ok, handlers: ' + JSON.stringify(Object.keys(handlers)));
+		try { print('LOG srcmd5=' + md5Hex(sourceCode) + ' len=' + sourceCode.length); } catch (e) {}
+	print('LOG e3 loadScript ok, handlers: ' + JSON.stringify(Object.keys(handlers)));
 	} catch (e) {
 		print('RESULT ' + JSON.stringify({ ok: false, error: 'source load failed: ' + String((e && e.message) || e) }));
 		std.exit(1);
