@@ -304,15 +304,17 @@ function main(std) {
 		log: log,
 	};
 
+	// ---------- 分级执行源脚本（定位真实崩溃点） ----------
 	try {
-		// 间接 eval = 全局 sloppy 作用域执行源脚本（new Function 路径在 bellard qjs 上进程级崩溃，弃用）
-		(0, eval)(sourceCode);
+		print('LOG e0 eval smoke: ' + (0, eval)('1+1'));
+		(0, eval)('lx.on("request", function h(){}); print("LOG e1 simple-on ok")');
+		print('LOG e2 handlers: ' + JSON.stringify(Object.keys(handlers)));
+		std.loadScript(sourcePath);
+		print('LOG e3 loadScript ok, handlers: ' + JSON.stringify(Object.keys(handlers)));
 	} catch (e) {
 		print('RESULT ' + JSON.stringify({ ok: false, error: 'source load failed: ' + String((e && e.message) || e) }));
 		std.exit(1);
 	}
-
-	print('LOG handlers after load: ' + JSON.stringify(Object.keys(handlers)));
 
 	if (typeof handlers[EVENT_NAMES.request] !== 'function') {
 		print('RESULT ' + JSON.stringify({ ok: false, error: 'source did not register request handler' }));
