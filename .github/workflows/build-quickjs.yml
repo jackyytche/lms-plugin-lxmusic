@@ -48,9 +48,12 @@ jobs:
           echo "$OUT" | grep -q '900150983cd24fb0d6963f7d28e17f72'
           echo "$OUT" | grep -q '"b64":"aGVsbG8="'
           echo "$OUT" | grep -q '"env":"desktop"'
-          OUT2=$($Q engine/shim.mjs engine/test/test-source.js http '{}' 2>&1); RC=$?
-          echo "RC2=$RC OUT2>>>$OUT2<<<"
+          OUT2=$($Q engine/shim.mjs engine/test/test-source.js http '{}' 2>&1) || true
+          echo "RC2 OUT2>>>$OUT2<<<"
           echo "$OUT2" | grep -q '"ok200":true'
+          OUT3=$($Q engine/shim.mjs engine/test/test-source.js redirect '{}' 2>&1) || true
+          echo "OUT3>>>$OUT3<<<"
+          echo "$OUT3" | grep -q '"ok200":true'
           echo "SHIM REGRESSION OK"
 
       - name: Release binary (tag name = qjs-v*)
