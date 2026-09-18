@@ -26,7 +26,7 @@ jobs:
           cd plugin
           mkdir -p t_build/Plugins/LxMusic
           cp LxMusic/*.pm t_build/Plugins/LxMusic/
-          cp ../t_diag/H1.pm ../t_diag/H3.pm ../t_diag/H4.pm ../t_diag/H5.pm t_build/Plugins/LxMusic/
+          cp ../t_diag/H1.pm ../t_diag/H3.pm ../t_diag/H4a.pm ../t_diag/H4b.pm ../t_diag/H4c.pm ../t_diag/H5.pm t_build/Plugins/LxMusic/
 
       - name: DEPS all core modules loadable
         run: perl -MURI::Escape -MMIME::Base64 -MJSON::XS -MEncode -MHTML::Entities -MTime::HiRes -MPOSIX -e1
@@ -37,8 +37,14 @@ jobs:
       - name: CHECK H3 flags-and-url-subs
         run: cd plugin && perl -I t -I t_build -c t_build/Plugins/LxMusic/H3.pm
 
-      - name: CHECK H4 play-subs
-        run: cd plugin && perl -I t -I t_build -c t_build/Plugins/LxMusic/H4.pm
+      - name: CHECK H4a scanUrl
+        run: cd plugin && perl -I t -I t_build -c t_build/Plugins/LxMusic/H4a.pm
+
+      - name: CHECK H4b new
+        run: cd plugin && perl -I t -I t_build -c t_build/Plugins/LxMusic/H4b.pm
+
+      - name: CHECK H4c explodePlaylist
+        run: cd plugin && perl -I t -I t_build -c t_build/Plugins/LxMusic/H4c.pm
 
       - name: CHECK H5 metadata-subs
         run: cd plugin && perl -I t -I t_build -c t_build/Plugins/LxMusic/H5.pm
