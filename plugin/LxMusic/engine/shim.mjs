@@ -76,6 +76,8 @@ function main(std, os) {
 	function log(...a) { print('LOG ' + a.join(' ')); }
 
 	// 读全文本文件（bellard std 无 readFile：open + getline 循环；getline 不含换行，需补回）
+	// 注意：页面 textarea 提交会把换行规范成 CRLF，installSource 落盘后 current.js 是 CRLF 行尾，
+	// 而源的完整性签名基于原版 LF 内容——读入时必须统一回 LF，否则 rawScript hash 必错（403）。
 	function readTextFile(path) {
 		const f = std.open(path, 'r');
 		if (!f) throw new Error('cannot open ' + path);
@@ -83,7 +85,7 @@ function main(std, os) {
 		for (;;) {
 			const line = f.getline();
 			if (line === undefined || line === null) break;
-			s += line + '\n';
+			s += line.replace(/\r$/, '') + '\n';
 		}
 		f.close();
 		return s;

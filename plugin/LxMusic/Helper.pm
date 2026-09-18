@@ -92,6 +92,9 @@ sub sourceInfo {
 
 sub installSource {
 	my ($class, $name, $content) = @_;
+	# 浏览器 textarea 提交把换行规范成 CRLF；lx 源的完整性签名基于原版 LF 内容，
+	# 必须在落盘前统一回 LF，否则 qjs 端 rawScript hash 与官方不一致（服务端 403）。
+	$content =~ s/\r\n/\n/g;
 	$name =~ s/\.{2,}/_/g;                   # 收敛连续点（防穿越）
 	$name =~ s/[^\w.-]/_/g;                  # 防非法字符
 	$name =~ s/^[.\-]+//;                    # 首字符须为字母数字下划线
