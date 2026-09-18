@@ -1,8 +1,8 @@
-# HANDOFF — lx-music Daphile 插件开发快照
+﻿# HANDOFF — lx-music Daphile 插件开发快照
 
 ## 当前状态（2026-09-18）
 
-**v0.1.0-alpha1 已发布** —— M0.1 设备验证的全部软件侧工作就绪。
+**v0.1.0-alpha2 已发布（alpha1 的 Run-test 转圈 = 达菲主循环不驱动 AnyEvent，已换 Slim::Utils::Timers 轮询修复）** —— M0.1 设备验证的全部软件侧工作就绪。
 
 - Release: https://github.com/jackyytche/lms-plugin-lxmusic/releases/tag/v0.1.0-alpha1
   - `LxMusic.zip`（1,134,864 B, SHA1 `a77f4c4163e6c6d77725d64fdaa2b3e6856d945f`）
