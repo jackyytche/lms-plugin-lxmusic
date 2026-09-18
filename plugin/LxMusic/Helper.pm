@@ -96,6 +96,19 @@ sub init {
 }
 
 # ---------- 订阅源安装 ----------
+my $CURRENT_SOURCE = File::Spec->catfile($SOURCES, 'current.js');
+
+# 当前生效的订阅源路径（导入/启动时装好；无源返回 undef）
+sub currentSourcePath {
+	my ($class) = @_;
+	return (-f $CURRENT_SOURCE) ? $CURRENT_SOURCE : undef;
+}
+
+sub sourceInfo {
+	my ($class) = @_;
+	return { installed => -f $CURRENT_SOURCE ? 1 : 0, path => $CURRENT_SOURCE };
+}
+
 sub installSource {
 	my ($class, $name, $content) = @_;
 	$name =~ s/\.{2,}/_/g;                   # 收敛连续点（防穿越）
@@ -109,6 +122,15 @@ sub installSource {
 	};
 	print {$fh} $content;
 	close $fh;
+	# current.js = 当前生效源（request 固定用它，简化协议处理器）
+	if ($path ne $CURRENT_SOURCE) {
+		open(my $cf, '>:encoding(UTF-8)', $CURRENT_SOURCE) or do {
+			$log->error("LxMusic Helper: write current source: $!");
+			return undef;
+		};
+		print {$cf} $content;
+		close $cf;
+	}
 	return $path;
 }
 

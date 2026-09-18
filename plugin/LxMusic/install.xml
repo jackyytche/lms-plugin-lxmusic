@@ -3,7 +3,7 @@
 	<name>LX Music</name>
 	<title>洛雪音乐</title>
 	<module>Plugins::LxMusic::Plugin</module>
-	<version>0.1.0-alpha0</version>
+	<version>0.1.0-alpha1</version>
 	<description>Play music from LX Music custom-source subscriptions on Daphile. Import a subscription, search and stream tracks with quality selection.</description>
 	<creator>jackyytche</creator>
 	<homepage URL="https://github.com/jackyytche/lms-plugin-lxmusic"/>
