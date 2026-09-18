@@ -98,7 +98,9 @@ sub init {
 # ---------- 订阅源安装 ----------
 sub installSource {
 	my ($class, $name, $content) = @_;
-	$name =~ s/[^\w.-]/_/g;                  # 防路径穿越
+	$name =~ s/\.{2,}/_/g;                   # 收敛连续点（防穿越）
+	$name =~ s/[^\w.-]/_/g;                  # 防非法字符
+	$name =~ s/^[.\-]+//;                    # 首字符须为字母数字下划线
 	mkpath($SOURCES);
 	my $path = File::Spec->catfile($SOURCES, $name);
 	open(my $fh, '>:encoding(UTF-8)', $path) or do {
@@ -215,7 +217,7 @@ sub _finish {
 
 # stdout 协议解析（纯函数，便于单测）
 sub _parse {
-	my ($text) = @_;
+	my ($class, $text) = @_;
 	my (@logs, @alerts, $result);
 	for my $line (split(/\r?\n/, $text // '')) {
 		if    ($line =~ /^RESULT (.*)$/s) { $result = $1 }
@@ -242,7 +244,14 @@ sub _err {
 }
 
 sub _pluginDir {
-	my $inc = $INC{'Plugins/LxMusic/Helper.pm'} or return undef;
+	my $inc = $INC{'Plugins/LxMusic/Helper.pm'};
+	if (!$inc) {
+		# 测试场景：require 文件路径加载，%INC 键为原始路径——按文件名回溯
+		for (values %INC) {
+			if (m{/LxMusic/Helper\.pm$}) { $inc = $_; last }
+		}
+	}
+	$inc or return undef;
 	my ($vol, $dirs, undef) = File::Spec->splitpath($inc);
 	return File::Spec->catpath($vol, $dirs, '');
 }
