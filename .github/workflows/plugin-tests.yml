@@ -21,3 +21,13 @@ jobs:
         run: |
           cd plugin
           perl t/helper-test.pl
+
+      - name: Syntax check all plugin modules (stub LMS tree)
+        run: |
+          cd plugin
+          mkdir -p t_build/Plugins/LxMusic
+          cp LxMusic/*.pm t_build/Plugins/LxMusic/
+          perl -I t -I t_build -c t_build/Plugins/LxMusic/Helper.pm
+          perl -I t -I t_build -c t_build/Plugins/LxMusic/ProtocolHandler.pm
+          perl -I t -I t_build -c t_build/Plugins/LxMusic/Plugin.pm
+          echo "SYNTAX OK"
