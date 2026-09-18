@@ -182,7 +182,11 @@ sub _handleImport {
 	return 'import failed: empty content'
 		unless $content && $content =~ /\S/ && length($content) > 50;
 
-	my $looksOk = $content =~ /(lx\s*\.\s*on|EVENT_NAMES|on\s*\(\s*['"]?request)/;
+	# v6 源多为混淆版，明文特征有限：认 SERVER_SCRIPT_CONFIG / @name 头 / 通用挂载
+	my $looksOk = ($content =~ /SERVER_SCRIPT_CONFIG/
+		|| $content =~ /\@name/
+		|| $content =~ /EVENT_NAMES/
+		|| $content =~ /lx\s*\.\s*on/);
 	my $safe = _safeName($name);
 	$prefs->set('sourceContent', $content);
 	$prefs->set('sourceName', $safe);
