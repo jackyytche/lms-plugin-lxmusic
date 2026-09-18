@@ -323,6 +323,78 @@ function main(std, os) {
 		print('LOG drain: rounds=' + rounds + ' inited=' + __inited + ' pending=' + __timers.length);
 	}
 
+	// ---------- Node 环境近似 polyfill（源脚本按 Node 宿主习惯编写） ----------
+	function hexEncode(u8) {
+		let s = '';
+		for (let i = 0; i < u8.length; i++) s += (u8[i] & 255).toString(16).padStart(2, '0');
+		return s;
+	}
+	function hexDecode(s) {
+		const clean = String(s).replace(/[^0-9a-fA-F]/g, '');
+		const out = new Uint8Array(clean.length >> 1);
+		for (let i = 0; i < out.length; i++) out[i] = parseInt(clean.substr(i * 2, 2), 16);
+		return out;
+	}
+	function makeBuf(data, enc) {
+		let u8;
+		if (typeof data === 'string') {
+			u8 = enc === 'base64' ? b64Decode(data) : enc === 'hex' ? hexDecode(data) : toUtf8(data);
+		}
+		else if (typeof data === 'number') u8 = new Uint8Array(data);
+		else u8 = new Uint8Array(data instanceof Uint8Array ? data : new Uint8Array(data || 0));
+		const b = {
+			u8,
+			length: u8.length,
+			toString(e) {
+				return e === 'base64' ? b64Encode(u8) : e === 'hex' ? hexEncode(u8) : utf8Decode(u8);
+			},
+			slice(a, z) { return makeBuf(u8.slice(a || 0, z == null ? u8.length : z)); },
+			concat(others) {
+				const all = [u8].concat((others || []).map(x => (x && x.u8) ? x.u8 : new Uint8Array(x || 0)));
+				const total = all.reduce((n, a) => n + a.length, 0);
+				const out2 = new Uint8Array(total);
+				let off = 0;
+				for (const a of all) { out2.set(a, off); off += a.length; }
+				return makeBuf(out2);
+			},
+		};
+		return b;
+	}
+	const NodeBuffer = {
+		from: (d, e) => makeBuf(d, e),
+		alloc: (n) => makeBuf(n),
+		concat: (arr) => makeBuf(0).concat(arr),
+		isBuffer: (x) => !!(x && x.u8 instanceof Uint8Array),
+	};
+	globalThis.Buffer = NodeBuffer;
+	globalThis.TextEncoder = class { encode(s) { return toUtf8(String(s)); } };
+	globalThis.TextDecoder = class { decode(u8) { return utf8Decode(u8); } };
+	globalThis.process = {
+		platform: 'linux',
+		version: 'v18.0.0',
+		env: {},
+		argv: ['qjs'],
+		nextTick: (fn) => Promise.resolve().then(() => fn()),
+	};
+	globalThis.setImmediate = globalThis.setTimeout;
+	globalThis.clearImmediate = globalThis.clearTimeout;
+	globalThis.fetch = function (url, opts) {
+		return new Promise((resolve, reject) => {
+			try {
+				const r = httpSync(String(url), opts || {});
+				const body = String(r.body == null ? '' : r.body);
+				resolve({
+					ok: r.code >= 200 && r.code < 300,
+					status: r.code,
+					headers: r.headers || {},
+					text: () => Promise.resolve(body),
+					json: () => Promise.resolve(JSON.parse(body || 'null')),
+				});
+			}
+			catch (e) { reject(e); }
+		});
+	};
+
 	// ---------- 全局 lx 对象 ----------
 	globalThis.lx = {
 		EVENT_NAMES: Object.freeze({ request: 'request', inited: 'inited', updateAlert: 'updateAlert' }),
@@ -409,6 +481,14 @@ function main(std, os) {
 	// 源脚本加载后先驱动其异步初始化（desktop 宿主是常驻进程，inited 之后
 	// handler 才可用；qjs 一次性进程必须手动泵定时器/微任务到 inited）
 	drainUntilInited();
+
+	// 诊断：全局新增键 + handler 函数体头部（识别转发器/占位符）
+	try {
+		print('LOG globals: ' + JSON.stringify(Object.getOwnPropertyNames(globalThis).slice(-60)));
+		const hf = handlers[EVENT_NAMES.request];
+		print('LOG fnHead: ' + JSON.stringify(String(hf).slice(0, 400)));
+	}
+	catch (e) { print('LOG diag ERR: ' + String((e && e.message) || e)); }
 
 	// ---------- 调用 action ----------
 	let info;
