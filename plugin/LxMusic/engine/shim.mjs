@@ -107,6 +107,7 @@ function main(std, os) {
 		if (name === EVENT_NAMES.updateAlert) {
 			print('ALERT ' + JSON.stringify(data == null ? {} : data));
 		}
+		if (name === EVENT_NAMES.inited) __inited = true;
 	}
 
 	// ---------- HTTP（std.urlGet + 手动 3xx 跟随） ----------
@@ -289,6 +290,39 @@ function main(std, os) {
 		return u;
 	}
 
+	// ---------- 定时器 polyfill（bellard qjs 的 std/os 无 setTimeout） ----------
+	// 同步近似：登记回调，drain 阶段按登记顺序立即执行（忽略 ms 延迟），
+	// 回调之间栈 unwind 时微任务（Promise 链）自动推进——源的异步初始化
+	// 靠这个泵跑到 send(inited)。
+	const __timers = [];
+	let __timerSeq = 1;
+	let __inited = false;
+	globalThis.setTimeout = function (fn, ms) {
+		const args = Array.prototype.slice.call(arguments, 2);
+		__timers.push({ fn, args });
+		return __timerSeq++;
+	};
+	globalThis.clearTimeout = function () {};
+	globalThis.setInterval = globalThis.setTimeout;
+	globalThis.clearInterval = globalThis.clearTimeout;
+	globalThis.queueMicrotask = globalThis.queueMicrotask || function (fn) {
+		Promise.resolve().then(() => fn());
+	};
+
+	// 反复排空定时器队列，直到 inited 或轮数上限（防止源无限轮询）
+	function drainUntilInited() {
+		let rounds = 0;
+		while (!__inited && __timers.length && rounds < 300) {
+			const batch = __timers.splice(0, __timers.length);
+			for (const t of batch) {
+				try { t.fn.apply(null, t.args); }
+				catch (e) { print('LOG timer ERR: ' + String((e && e.message) || e)); }
+			}
+			rounds++;
+		}
+		print('LOG drain: rounds=' + rounds + ' inited=' + __inited + ' pending=' + __timers.length);
+	}
+
 	// ---------- 全局 lx 对象 ----------
 	globalThis.lx = {
 		EVENT_NAMES: Object.freeze({ request: 'request', inited: 'inited', updateAlert: 'updateAlert' }),
@@ -371,6 +405,10 @@ function main(std, os) {
 		print('RESULT ' + JSON.stringify({ ok: false, error: 'source did not register request handler' }));
 		std.exit(1);
 	}
+
+	// 源脚本加载后先驱动其异步初始化（desktop 宿主是常驻进程，inited 之后
+	// handler 才可用；qjs 一次性进程必须手动泵定时器/微任务到 inited）
+	drainUntilInited();
 
 	// ---------- 调用 action ----------
 	let info;
