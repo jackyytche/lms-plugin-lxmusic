@@ -221,8 +221,10 @@ function main(std, os) {
 	}
 
 	// ---------- MD5（RFC 1321 纯 JS） ----------
-	function md5Hex(str) {
-		const bytes = toUtf8(String(str));
+	function md5Hex(input) {
+		// 字节直入：字符串按 UTF-8 编码；Buffer/Uint8Array 原样逐字节（不做 utf8 解码——
+		// 非 UTF-8 序列经解码会替换为 U+FFFD，签名即错）
+		const bytes = typeof input === 'string' ? toUtf8(input) : new Uint8Array(input);
 		const S = [7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
 			5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20,
 			4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
@@ -336,36 +338,40 @@ function main(std, os) {
 		for (let i = 0; i < out.length; i++) out[i] = parseInt(clean.substr(i * 2, 2), 16);
 		return out;
 	}
-	function makeBuf(data, enc) {
-		let u8;
-		if (typeof data === 'string') {
-			u8 = enc === 'base64' ? b64Decode(data) : enc === 'hex' ? hexDecode(data) : toUtf8(data);
+	// 真 Uint8Array 子类：buf[i] 下标、new Uint8Array(buf)、逐字节遍历全部原生可用——
+	// 混淆源的签名计算依赖字节级语义，普通对象 polyfill 会产出错误签名。
+	class NodeBuf extends Uint8Array {
+		constructor(data, enc) {
+			if (typeof data === 'string') {
+				const u8 = enc === 'base64' ? b64Decode(data)
+					: enc === 'hex' ? hexDecode(data)
+					: toUtf8(data);
+				super(u8);
+			}
+			else if (typeof data === 'number') super(data);
+			else super(data instanceof Uint8Array ? data : new Uint8Array(data || 0));
 		}
-		else if (typeof data === 'number') u8 = new Uint8Array(data);
-		else u8 = new Uint8Array(data instanceof Uint8Array ? data : new Uint8Array(data || 0));
-		const b = {
-			u8,
-			length: u8.length,
-			toString(e) {
-				return e === 'base64' ? b64Encode(u8) : e === 'hex' ? hexEncode(u8) : utf8Decode(u8);
-			},
-			slice(a, z) { return makeBuf(u8.slice(a || 0, z == null ? u8.length : z)); },
-			concat(others) {
-				const all = [u8].concat((others || []).map(x => (x && x.u8) ? x.u8 : new Uint8Array(x || 0)));
-				const total = all.reduce((n, a) => n + a.length, 0);
-				const out2 = new Uint8Array(total);
-				let off = 0;
-				for (const a of all) { out2.set(a, off); off += a.length; }
-				return makeBuf(out2);
-			},
-		};
-		return b;
+		toString(enc) {
+			return enc === 'base64' ? b64Encode(this)
+				: enc === 'hex' ? hexEncode(this)
+				: utf8Decode(this);
+		}
+		slice(a, b) { return new NodeBuf(super.slice(a || 0, b == null ? this.length : b)); }
+		subarray(a, b) { return this.slice(a, b); }
+		concat(others) {
+			const all = [this].concat((others || []).map(x => (x instanceof Uint8Array) ? x : new NodeBuf(x)));
+			const total = all.reduce((n, a) => n + a.length, 0);
+			const out2 = new Uint8Array(total);
+			let off = 0;
+			for (const a of all) { out2.set(a, off); off += a.length; }
+			return new NodeBuf(out2);
+		}
 	}
 	const NodeBuffer = {
-		from: (d, e) => makeBuf(d, e),
-		alloc: (n) => makeBuf(n),
-		concat: (arr) => makeBuf(0).concat(arr),
-		isBuffer: (x) => !!(x && x.u8 instanceof Uint8Array),
+		from: (d, e) => new NodeBuf(d, e),
+		alloc: (n) => new NodeBuf(Number(n) || 0),
+		concat: (arr) => new NodeBuf(0).concat(arr),
+		isBuffer: (x) => x instanceof NodeBuf,
 	};
 	globalThis.Buffer = NodeBuffer;
 	globalThis.TextEncoder = class { encode(s) { return toUtf8(String(s)); } };
@@ -415,7 +421,7 @@ function main(std, os) {
 		request: lxRequest,
 		utils: {
 			crypto: {
-				md5: (data) => md5Hex(typeof data === 'string' ? data : utf8Decode(data)),
+				md5: (data) => md5Hex(data),
 				aesEncrypt: () => { throw new Error('shim: aesEncrypt not implemented yet'); },
 				rsaEncrypt: () => { throw new Error('shim: rsaEncrypt not implemented yet'); },
 				randomBytes,

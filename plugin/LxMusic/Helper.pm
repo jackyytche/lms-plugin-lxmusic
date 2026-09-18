@@ -174,7 +174,7 @@ sub request {
 	};
 	$JOBS{$pid} = $job;
 
-	$log->info("LxMusic Helper: job $pid ($action) started, timeout ${timeout}s");
+	$log->warn("LxMusic Helper: job $pid ($action) started, timeout ${timeout}s");
 	Slim::Utils::Timers::setTimer($job, time() + 0.25, \&_poll);
 
 	return $pid;
@@ -240,6 +240,10 @@ sub _finish {
 
 	# 诊断增强：失败时回显子进程原始输出尾部（页面 logs 区直接可见）
 	if (!$ok) {
+		# 达菲 server.log 过滤 info 级——失败现场用 warn 级落盘，远程可抓
+		my $flat = $buf;
+		$flat =~ s/\s+/ /g;
+		$log->warn("LxMusic Helper: job $job->{pid} failed ($why), raw: " . substr($flat, 0, 2500));
 		my @raw = grep { defined && length } split(/\r?\n/, $buf);
 		push @$logs, '--- child stdout tail ---';
 		if (@raw) {
