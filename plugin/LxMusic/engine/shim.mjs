@@ -99,6 +99,7 @@ function main(std, os) {
 
 	function on(name, handler) {
 		if (typeof handler !== 'function') throw new TypeError('lx.on: handler must be function');
+		print('LOG on: ' + String(name) + ' fnHead=' + JSON.stringify(String(handler).slice(0, 120)));
 		handlers[name] = handler;
 	}
 
@@ -378,6 +379,17 @@ function main(std, os) {
 	};
 	globalThis.setImmediate = globalThis.setTimeout;
 	globalThis.clearImmediate = globalThis.clearTimeout;
+	globalThis.console = {
+		log: (...a) => print('LOG console.log: ' + a.map(x => typeof x === 'string' ? x : JSON.stringify(x)).join(' ')),
+		info: (...a) => print('LOG console.info: ' + a.map(x => typeof x === 'string' ? x : JSON.stringify(x)).join(' ')),
+		warn: (...a) => print('LOG console.warn: ' + a.map(x => typeof x === 'string' ? x : JSON.stringify(x)).join(' ')),
+		error: (...a) => print('LOG console.error: ' + a.map(x => typeof x === 'string' ? x : JSON.stringify(x)).join(' ')),
+		debug: (...a) => print('LOG console.debug: ' + a.map(x => typeof x === 'string' ? x : JSON.stringify(x)).join(' ')),
+	};
+	globalThis.require = function (name) {
+		print('LOG require called: ' + String(name));
+		throw new Error('shim: require("' + String(name) + '") not available');
+	};
 	globalThis.fetch = function (url, opts) {
 		return new Promise((resolve, reject) => {
 			try {
@@ -462,9 +474,11 @@ function main(std, os) {
 	};
 
 	// ---------- 分级执行源脚本（定位真实崩溃点） ----------
+	const __globalsBefore = Object.getOwnPropertyNames(globalThis);
 	try {
 		print('LOG e0 eval smoke: ' + (0, eval)('1+1'));
 		(0, eval)('lx.on("request", function h(){}); print("LOG e1 simple-on ok")');
+		delete handlers[EVENT_NAMES.request];   // 冒烟占位符不参与后续（避免误判源 handler）
 		print('LOG e2 handlers: ' + JSON.stringify(Object.keys(handlers)));
 		std.loadScript(sourcePath);
 		print('LOG e3 loadScript ok, handlers: ' + JSON.stringify(Object.keys(handlers)));
@@ -482,11 +496,13 @@ function main(std, os) {
 	// handler 才可用；qjs 一次性进程必须手动泵定时器/微任务到 inited）
 	drainUntilInited();
 
-	// 诊断：全局新增键 + handler 函数体头部（识别转发器/占位符）
+	// 诊断：全局新增键（真差分）+ handler 函数体头部（识别转发器/占位符）
 	try {
-		print('LOG globals: ' + JSON.stringify(Object.getOwnPropertyNames(globalThis).slice(-60)));
+		const __added = Object.getOwnPropertyNames(globalThis)
+			.filter(k => __globalsBefore.indexOf(k) < 0);
+		print('LOG globals added: ' + JSON.stringify(__added));
 		const hf = handlers[EVENT_NAMES.request];
-		print('LOG fnHead: ' + JSON.stringify(String(hf).slice(0, 400)));
+		print('LOG fnHead: ' + (hf ? JSON.stringify(String(hf).slice(0, 400)) : '"<none - source never called lx.on>"'));
 	}
 	catch (e) { print('LOG diag ERR: ' + String((e && e.message) || e)); }
 
