@@ -2,11 +2,13 @@
 # ============================================================
 # 职责：
 #   1) init：把插件自带的 qjs 引擎 + shim.mjs 复制到 tmpfs（达菲 /tmp），
-#      修复可执行位（LMS 解压丢 +x），并做一次引擎自检。
+#      修复可执行位（LMS 解压丢 +x），并做一次引擎自检（阻塞 <100ms）。
 #   2) request：以「每 action 一个进程」模型运行
 #         qjs shim.mjs <source.js> <action> <infoJSON>
-#      异步（fork/exec + AnyEvent::Handle 读管道），超时 KILL，
-#      stdout 按行解析：RESULT 行=结果协议，LOG/ALERT 行=诊断分流。
+#      异步：子进程输出重定向到临时文件，父进程用 LMS 原生
+#      Slim::Utils::Timers 每 0.25s 轮询 waitpid(WNOHANG)，
+#      完成/超时(KILL) 后解析文件回调。不依赖 AnyEvent —— 达菲主循环
+#      不驱动 AE（Ximalaya 实证：须用 LMS 原生事件设施）。
 #   3) installSource：把订阅源脚本安装进运行时目录。
 #
 # 进程协议（与 engine/shim.mjs 对齐）：
@@ -25,14 +27,11 @@ use File::Path qw(mkpath rmtree);
 use File::Spec;
 use JSON::XS ();
 use POSIX ();
-use Symbol qw(qualify_to_ref);
 
 use Slim::Utils::Log;
+use Slim::Utils::Timers;
 
 my $log = Slim::Utils::Log->logger('plugin.lxmusic');
-
-# AnyEvent 为 LMS 内置（ImageResizer 先例）；延迟加载以便存根测试。
-my ($AnyEvent, $AnyEventHandle);
 
 my $TMPDIR  = File::Spec->catdir(File::Spec->tmpdir(), 'LXMusic');
 my $QJS     = File::Spec->catfile($TMPDIR, 'qjs');
@@ -42,24 +41,6 @@ my $SOURCES = File::Spec->catdir($TMPDIR, 'sources');
 my $JSON = JSON::XS->new->utf8->allow_nonref;
 
 my %JOBS;    # pid => job
-
-sub _loadAE {
-	return 1 if $AnyEvent;
-	$AnyEvent       = _load('AnyEvent');
-	$AnyEventHandle = _load('AnyEvent::Handle');
-	return $AnyEvent && $AnyEventHandle;
-}
-
-sub _load {
-	my ($mod) = @_;
-	my $file = $mod;
-	$file =~ s{::}{/}g;
-	eval { require "$file.pm"; 1 } or do {
-		$log->error("LxMusic Helper: cannot load $mod: $@");
-		return undef;
-	};
-	return $mod;
-}
 
 # ---------- init ----------
 sub init {
@@ -142,7 +123,6 @@ sub request {
 	my ($class, %args) = @_;
 
 	my $cb = $args{cb} or return;
-	_loadAE() or do { $cb->(_err('AnyEvent unavailable')); return };
 
 	my $source = $args{source};
 	my $action = $args{action};
@@ -156,17 +136,16 @@ sub request {
 		$JSON->encode({ source => ($args{sourceId} // ''), info => ($args{info} // {}) });
 	} or do { $cb->(_err('bad info json')); return };
 
-	pipe(my $rh, my $wh) or do { $cb->(_err("pipe: $!")); return };
-	$wh->autoflush(1);
+	# 子进程输出落盘（不走管道：达菲主循环不驱动 fd 事件）
+	my $outfile = File::Spec->catfile($TMPDIR,
+		'job.' . time() . '.' . $$ . '.' . int(rand(1_000_000)) . '.out');
 
 	my $pid = fork();
-	if (!defined $pid) { close $rh; close $wh; $cb->(_err("fork: $!")); return; }
+	if (!defined $pid) { $cb->(_err("fork: $!")); return; }
 
 	if ($pid == 0) {                         # ---- child ----
-		close $rh;
-		open(STDOUT, '>&', POSIX::fileno(qualify_to_ref($wh))) or POSIX::_exit(127);
-		open(STDERR, '>&', POSIX::fileno(qualify_to_ref($wh)));   # stderr 并入 stdout（按前缀过滤）
-		close $wh;
+		open(STDOUT, '>', $outfile) or POSIX::_exit(127);
+		open(STDERR, '>&', \*STDOUT) or POSIX::_exit(127);
 		$ENV{PATH} = '/usr/bin:/bin:/usr/sbin:/sbin';   # curl 定位
 		chdir('/');
 		exec($QJS, $SHIM, $source, $action, $infoJson);
@@ -174,40 +153,51 @@ sub request {
 	}
 
 	# ---- parent ----
-	close $wh;
-
 	my $job = {
-		pid => $pid, cb => $cb, buf => '', done => 0,
-		started => time(), timeout => $timeout,
+		pid     => $pid,
+		cb      => $cb,
+		out     => $outfile,
+		started => time(),
+		timeout => $timeout,
+		done    => 0,
 	};
 	$JOBS{$pid} = $job;
 
-	$job->{timer} = AnyEvent->timer(after => $timeout, cb => sub {
-		$log->warn("LxMusic Helper: job $pid ($action) timed out after ${timeout}s");
-		kill 'KILL', $pid;
-		_finish($job, 'timeout');
-	});
-
-	$job->{h} = AnyEvent::Handle->new(
-		fh      => $rh,
-		on_read => sub {
-			my ($h) = @_;
-			$job->{buf} .= $h->{rbuf};
-			$h->{rbuf} = '';
-		},
-		on_eof   => sub { _finish($job, 'ok') },
-		on_error => sub { _finish($job, 'io') },
-	);
+	$log->info("LxMusic Helper: job $pid ($action) started, timeout ${timeout}s");
+	Slim::Utils::Timers::setTimer($job, time() + 0.25, \&_poll);
 
 	return $pid;
+}
+
+# 0.25s 轮询：进程退出(或被系统回收)即收结果；超时 KILL
+sub _poll {
+	my ($job) = @_;
+	return if $job->{done};
+
+	my $gone = waitpid($job->{pid}, POSIX::WNOHANG());
+	if ($gone == $job->{pid} || $gone == -1) {
+		_finish($job, 'ok');
+		return;
+	}
+	if (time() - $job->{started} >= $job->{timeout}) {
+		$log->warn("LxMusic Helper: job $job->{pid} timed out after $job->{timeout}s, killing");
+		kill 'KILL', $job->{pid};
+		waitpid($job->{pid}, 0);
+		_finish($job, 'timeout');
+		return;
+	}
+	Slim::Utils::Timers::setTimer($job, time() + 0.25, \&_poll);
+	return;
 }
 
 # ---------- shutdown ----------
 sub shutdown {
 	my ($class) = @_;
 	for my $pid (keys %JOBS) {
+		my $job = $JOBS{$pid};
+		Slim::Utils::Timers::killTimers($job, \&_poll);
 		kill 'KILL', $pid;
-		_finish($JOBS{$pid}, 'shutdown');
+		_finish($job, 'shutdown');
 	}
 	rmtree($TMPDIR);
 	return 1;
@@ -217,10 +207,19 @@ sub shutdown {
 sub _finish {
 	my ($job, $why) = @_;
 	return if $job->{done}++;
-	$job->{timer} = undef;                   # AE watcher 解引用即取消
+	Slim::Utils::Timers::killTimers($job, \&_poll);
 	delete $JOBS{$job->{pid}};
-	waitpid($job->{pid}, 0) if $job->{pid};
-	my ($ok, $data, $err, $logs, $alerts) = _parse($job->{buf});
+	waitpid($job->{pid}, 0) if $job->{pid};   # 已回收时返回 -1，无害
+
+	my $buf = '';
+	if (open(my $fh, '<', $job->{out})) {
+		local $/;
+		$buf = <$fh> // '';
+		close $fh;
+	}
+	unlink($job->{out});
+
+	my ($ok, $data, $err, $logs, $alerts) = _parse($buf);
 
 	if ($why ne 'ok') {
 		$ok   = 0;
@@ -235,6 +234,7 @@ sub _finish {
 		alerts => $alerts,
 		why    => $why,
 	});
+	return;
 }
 
 # stdout 协议解析（纯函数，便于单测）
