@@ -440,6 +440,7 @@ function main(std, os) {
 		currentScriptInfo: null,
 		version: '2.0.0',
 		env: 'desktop',
+		env: 'desktop',
 	};
 
 	// ---------- 解析参数 ----------
@@ -470,6 +471,7 @@ function main(std, os) {
 	while ((mm = metaRe.exec(head))) meta[mm[1]] = mm[2].trim();
 
 	globalThis.lx.currentScriptInfo = {
+		rawScript: sourceCode,
 		name: meta.name || '',
 		version: meta.version || '',
 		author: meta.author || '',
