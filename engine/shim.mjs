@@ -286,6 +286,7 @@ function main(std) {
 		print('RESULT ' + JSON.stringify({ ok: false, error: 'cannot read source: ' + e }));
 		std.exit(1);
 	}
+	print('LOG src len=' + (sourceCode ? sourceCode.length : -1) + ' head=' + JSON.stringify(String(sourceCode || '').slice(0, 120)));
 
 	const meta = {};
 	const head = String(sourceCode).slice(0, 2048);
@@ -304,11 +305,15 @@ function main(std) {
 	};
 
 	try {
-		(0, eval)(sourceCode);
+		// 以函数作用域执行源脚本，显式注入 lx（等价 sloppy 全局脚本语义）
+		const runSrc = new Function('lx', '"use strict"; return (function() {' + sourceCode + '\n})();');
+		runSrc(globalThis.lx);
 	} catch (e) {
 		print('RESULT ' + JSON.stringify({ ok: false, error: 'source load failed: ' + String((e && e.message) || e) }));
 		std.exit(1);
 	}
+
+	print('LOG handlers after load: ' + JSON.stringify(Object.keys(handlers)));
 
 	if (typeof handlers[EVENT_NAMES.request] !== 'function') {
 		print('RESULT ' + JSON.stringify({ ok: false, error: 'source did not register request handler' }));
