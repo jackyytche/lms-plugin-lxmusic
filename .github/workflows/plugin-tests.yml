@@ -1,7 +1,8 @@
 name: Plugin tests (perl)
 
-# Helper.pm 存根回归：协议解析 / 源安装 / 引擎复制与自检。
+# Helper.pm 存根回归 + 全模块语法检查（stub LMS 树）。
 # ubuntu 原生 perl + LMS 同款依赖（AnyEvent、JSON::XS）。
+# 诊断输出同步上传 artifact（日志 API 偶发 404 时的第二通道）。
 
 on:
   push:
@@ -27,23 +28,30 @@ jobs:
           cd plugin
           mkdir -p t_build/Plugins/LxMusic
           cp LxMusic/*.pm t_build/Plugins/LxMusic/
-          for m in URI::Escape MIME::Base64 JSON::XS Encode HTML::Entities Time::HiRes POSIX; do
-            perl -M"$m" -e1 2>&1 && echo "DEP OK: $m" || echo "DEP FAIL: $m"
-          done
-          python3 - <<'EOF'
+          {
+            for m in URI::Escape MIME::Base64 JSON::XS Encode HTML::Entities Time::HiRes POSIX; do
+              perl -M"$m" -e1 2>&1 && echo "DEP OK: $m" || echo "DEP FAIL: $m"
+            done
+            python3 - <<'EOF'
 import io
 src = io.open('LxMusic/ProtocolHandler.pm', encoding='utf-8').read()
 lines = src.split('\n')
-# H1: everything up to and incl. PH-G probe (compile header only)
 g = next(i for i, l in enumerate(lines) if 'PH-G' in l)
 io.open('t_build/Plugins/LxMusic/H1.pm', 'w', encoding='utf-8').write('\n'.join(lines[:g+2]) + '\n1;\n')
-# H2: header prologue + rest after PH-G
-io.open('t_build/Plugins/LxMusic/H2.pm', 'w', encoding='utf-8').write('\n'.join(lines[:g+2] + ['sub __dummy { 1 }'] + lines[g+2:]) )
+io.open('t_build/Plugins/LxMusic/H2.pm', 'w', encoding='utf-8').write('\n'.join(lines[:g+2] + ['sub __dummy { 1 }'] + lines[g+2:]))
 print('slices written')
 EOF
-          perl -I t -I t_build -c t_build/Plugins/LxMusic/H1.pm 2>&1 || echo "FAIL_H1 rc=$?"
-          perl -I t -I t_build -c t_build/Plugins/LxMusic/H2.pm 2>&1 || echo "FAIL_H2 rc=$?"
-          perl -I t -I t_build -c t_build/Plugins/LxMusic/Helper.pm 2>&1 || echo "FAIL_HELPER rc=$?"
-          perl -I t -I t_build -c t_build/Plugins/LxMusic/ProtocolHandler.pm 2>&1 || echo "FAIL_PROTO rc=$?"
-          perl -I t -I t_build -c t_build/Plugins/LxMusic/Plugin.pm 2>&1 || echo "FAIL_PLUGIN rc=$?"
-          echo "SYNTAX CHECK DONE"
+            perl -I t -I t_build -c t_build/Plugins/LxMusic/H1.pm 2>&1 || echo "FAIL_H1 rc=$?"
+            perl -I t -I t_build -c t_build/Plugins/LxMusic/H2.pm 2>&1 || echo "FAIL_H2 rc=$?"
+            perl -I t -I t_build -c t_build/Plugins/LxMusic/Helper.pm 2>&1 || echo "FAIL_HELPER rc=$?"
+            perl -I t -I t_build -c t_build/Plugins/LxMusic/ProtocolHandler.pm 2>&1 || echo "FAIL_PROTO rc=$?"
+            perl -I t -I t_build -c t_build/Plugins/LxMusic/Plugin.pm 2>&1 || echo "FAIL_PLUGIN rc=$?"
+            echo "SYNTAX CHECK DONE"
+          } | tee syntax-diag.txt
+
+      - name: Upload syntax diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: syntax-diag
+          path: plugin/syntax-diag.txt
