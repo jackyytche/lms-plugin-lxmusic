@@ -1,13 +1,15 @@
 name: Plugin tests (perl)
 
 # Helper.pm 存根回归 + 全模块语法检查（stub LMS 树）。
-# 诊断采用独立 step：jobs API 的 step 粒度红绿即结果。
-# H1/H2 切片由本地预生成并随仓库提交（避免 CI 内嵌脚本）。
+# 回归日志由 CI 直接 commit 回仓库（日志 API 不可靠时的固定取证通道）。
 
 on:
   push:
     branches: [main]
   workflow_dispatch: {}
+
+permissions:
+  contents: write
 
 jobs:
   test:
@@ -19,41 +21,30 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libanyevent-perl libjson-xs-perl
 
       - name: Helper regression
-        run: cd plugin && perl t/helper-test.pl
+        run: |
+          cd plugin
+          set -o pipefail
+          perl t/helper-test.pl 2>&1 | tee helper-test.log
+          exit ${PIPESTATUS[0]}
+
+      - name: Publish regression log back to repo
+        if: always()
+        run: |
+          cd plugin
+          git config user.email ci@localhost
+          git config user.name ci-bot
+          git add -f helper-test.log
+          git commit -m "ci: regression log [skip ci]" || echo "no change"
+          git push || echo "push skipped"
 
       - name: Build stub tree
         run: |
           cd plugin
           mkdir -p t_build/Plugins/LxMusic
           cp LxMusic/*.pm t_build/Plugins/LxMusic/
-          cp ../t_diag/H1.pm ../t_diag/H3.pm ../t_diag/H4a0.pm ../t_diag/H4a1.pm ../t_diag/H4a2.pm ../t_diag/H4b.pm ../t_diag/H4c.pm ../t_diag/H5.pm t_build/Plugins/LxMusic/
 
       - name: DEPS all core modules loadable
         run: perl -MURI::Escape -MMIME::Base64 -MJSON::XS -MEncode -MHTML::Entities -MTime::HiRes -MPOSIX -e1
-
-      - name: CHECK H1 header-only
-        run: cd plugin && perl -I t -I t_build -c t_build/Plugins/LxMusic/H1.pm
-
-      - name: CHECK H3 flags-and-url-subs
-        run: cd plugin && perl -I t -I t_build -c t_build/Plugins/LxMusic/H3.pm
-
-      - name: CHECK H4a0 empty-shell control
-        run: cd plugin && perl -I t -I t_build -c t_build/Plugins/LxMusic/H4a0.pm
-
-      - name: CHECK H4a1 scanUrl-prelude
-        run: cd plugin && perl -I t -I t_build -c t_build/Plugins/LxMusic/H4a1.pm
-
-      - name: CHECK H4a2 scanUrl-request-block
-        run: cd plugin && perl -I t -I t_build -c t_build/Plugins/LxMusic/H4a2.pm
-
-      - name: CHECK H4b new
-        run: cd plugin && perl -I t -I t_build -c t_build/Plugins/LxMusic/H4b.pm
-
-      - name: CHECK H4c explodePlaylist
-        run: cd plugin && perl -I t -I t_build -c t_build/Plugins/LxMusic/H4c.pm
-
-      - name: CHECK H5 metadata-subs
-        run: cd plugin && perl -I t -I t_build -c t_build/Plugins/LxMusic/H5.pm
 
       - name: CHECK Helper.pm
         run: cd plugin && perl -I t -I t_build -c t_build/Plugins/LxMusic/Helper.pm
@@ -63,21 +54,3 @@ jobs:
 
       - name: CHECK Plugin.pm
         run: cd plugin && perl -I t -I t_build -c t_build/Plugins/LxMusic/Plugin.pm
-
-      - name: Collect compile diagnostics
-        if: always()
-        run: |
-          cd plugin
-          for f in H1 H3 H4a0 H4a1 H4a2 H4b H4c H5 Helper ProtocolHandler Plugin; do
-            echo "=== $f ===" >> diag.txt
-            perl -I t -I t_build -c t_build/Plugins/LxMusic/$f.pm 2>&1 | tail -15 >> diag.txt
-            echo "" >> diag.txt
-          done
-          echo collected
-
-      - name: Upload diagnostics
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: diag
-          path: plugin/diag.txt
