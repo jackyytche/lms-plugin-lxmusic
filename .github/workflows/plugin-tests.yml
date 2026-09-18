@@ -30,6 +30,8 @@ jobs:
           for m in URI::Escape MIME::Base64 JSON::XS Encode HTML::Entities Time::HiRes POSIX; do
             perl -M"$m" -e1 2>&1 && echo "DEP OK: $m" || echo "DEP FAIL: $m"
           done
+          perl -I t -I t_build -e 'print "s1\n"; require Slim::Utils::Log; print "s2\n"; require Slim::Music::Info; print "s3\n"; require Slim::Player::Protocols::HTTP; print "s4\n"; require Slim::Player::ProtocolHandlers; print "s5\n"; require Plugins::LxMusic::Helper; print "s6\n";' 2>&1 || echo "FAIL_SEQ rc=$?"
+          perl -I t -I t_build -e 'print "p1\n"; require Slim::Player::Protocols::HTTP; print "p2\n"; use MIME::Base64 (); print "p3\n"; use URI::Escape (); print "p4\n"; use base qw(Slim::Player::Protocols::HTTP); print "p5-base\n";' 2>&1 || echo "FAIL_BASE rc=$?"
           perl -I t -I t_build -e 'use Plugins::LxMusic::ProtocolHandler; print "PROTO LOADED\n"' 2>&1 || echo "FAIL_PROTO_LOAD rc=$?"
           perl -I t -I t_build -e 'use Plugins::LxMusic::Plugin; print "PLUGIN LOADED\n"' 2>&1 || echo "FAIL_PLUGIN_LOAD rc=$?"
           perl -I t -I t_build -c t_build/Plugins/LxMusic/Helper.pm 2>&1 || echo "FAIL_HELPER rc=$?"
