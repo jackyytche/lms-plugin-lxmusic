@@ -1,0 +1,46 @@
+name: Build QuickJS (linux-x86_64)
+
+# 自编译 bellard 原版 quickjs（自带 std/os 模块 + js_std_loop Promise 作业驱动）。
+# 产物 qjs 静态二进制挂到本仓库 release（tag: qjs-v*），
+# 由洛雪音乐插件打包流程下载放入 Bin/x86_64-linux/。
+# 触发：手动 (workflow_dispatch) 或推 qjs-v* tag。
+
+on:
+  workflow_dispatch: {}
+  push:
+    tags:
+      - 'qjs-v*'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Clone upstream bellard/quickjs
+        run: |
+          git clone --depth 1 https://github.com/bellard/quickjs.git qjs-src
+          cd qjs-src
+          git rev-parse HEAD > ../upstream_commit.txt
+
+      - name: Build qjs (static)
+        run: |
+          cd qjs-src
+          make qjs LDFLAGS="-static" -j4
+          strip qjs
+          file qjs
+          ./qjs -e "print('qjs ok, scriptArgs=' + typeof scriptArgs)"
+
+      - name: Smoke test std/os modules
+        run: |
+          cd qjs-src
+          ./qjs -e "import('std').then(m=>print('STD:', Object.keys(m).join(',')))"
+          ./qjs -e "import('os').then(m=>print('OS:', Object.keys(m).join(',')))"
+
+      - name: Release binary (tag name = qjs-v*)
+        if: startsWith(github.ref, 'refs/tags/qjs-v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd qjs-src
+          gh release create "$GITHUB_REF_NAME" qjs --title "$GITHUB_REF_NAME" --notes "Static qjs (bellard quickjs) for linux-x86_64. Built by CI from upstream commit $(cat ../upstream_commit.txt)." --repo "$GITHUB_REPOSITORY"
