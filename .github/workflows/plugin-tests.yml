@@ -1,7 +1,8 @@
 name: Plugin tests (perl)
 
 # Helper.pm 存根回归 + 全模块语法检查（stub LMS 树）。
-# 诊断采用独立 step：jobs API 的 step 粒度红绿即结果（日志 API 偶发 404 时的结果通道）。
+# 诊断采用独立 step：jobs API 的 step 粒度红绿即结果。
+# H1/H2 切片由本地预生成并随仓库提交（避免 CI 内嵌脚本）。
 
 on:
   push:
@@ -18,31 +19,17 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libanyevent-perl libjson-xs-perl
 
       - name: Helper regression
-        run: |
-          cd plugin
-          perl t/helper-test.pl
+        run: cd plugin && perl t/helper-test.pl
 
-      - name: Prepare stub build tree
+      - name: Build stub tree
         run: |
           cd plugin
           mkdir -p t_build/Plugins/LxMusic
           cp LxMusic/*.pm t_build/Plugins/LxMusic/
-          python3 - <<'EOF'
-import io
-src = io.open('LxMusic/ProtocolHandler.pm', encoding='utf-8').read()
-lines = src.split('\n')
-g = next(i for i, l in enumerate(lines) if 'PH-G' in l)
-io.open('t_build/Plugins/LxMusic/H1.pm', 'w', encoding='utf-8').write('\n'.join(lines[:g+2]) + '\n1;\n')
-io.open('t_build/Plugins/LxMusic/H2.pm', 'w', encoding='utf-8').write('\n'.join(lines[:g+2] + ['sub __dummy { 1 }'] + lines[g+2:]))
-print('slices written H1/H2')
-EOF
+          cp ../t_diag/H1.pm ../t_diag/H2.pm t_build/Plugins/LxMusic/
 
-      - name: DEPS all modules loadable
-        run: |
-          for m in URI::Escape MIME::Base64 JSON::XS Encode HTML::Entities Time::HiRes POSIX; do
-            perl -M"$m" -e1 || exit 1
-          done
-          echo deps ok
+      - name: DEPS all core modules loadable
+        run: perl -MURI::Escape -MMIME::Base64 -MJSON::XS -MEncode -MHTML::Entities -MTime::HiRes -MPOSIX -e1
 
       - name: CHECK H1 header-only
         run: cd plugin && perl -I t -I t_build -c t_build/Plugins/LxMusic/H1.pm
