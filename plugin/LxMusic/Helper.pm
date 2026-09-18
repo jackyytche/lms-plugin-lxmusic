@@ -144,8 +144,19 @@ sub request {
 	if (!defined $pid) { $cb->(_err("fork: $!")); return; }
 
 	if ($pid == 0) {                         # ---- child ----
-		open(STDOUT, '>', $outfile) or POSIX::_exit(127);
-		open(STDERR, '>&', \*STDOUT) or POSIX::_exit(127);
+		# 达菲把 STDOUT/STDERR tie 成 Slim::Utils::Log::Trapper——
+		# perl 层 open(STDOUT,...) 会在 tie 上调 OPEN 而死。改用 POSIX
+		# dup2 直接替换 fd 1/2（纯 syscall，绕开 tie 与 OO 句柄层）。
+		my $fd = POSIX::open($outfile,
+			POSIX::O_WRONLY() | POSIX::O_CREAT() | POSIX::O_TRUNC(), 0644);
+		if (defined $fd && $fd >= 0) {
+			POSIX::dup2($fd, 1);
+			POSIX::dup2(1, 2);
+			POSIX::close($fd) if $fd > 2;
+		}
+		else {
+			POSIX::_exit(127);
+		}
 		$ENV{PATH} = '/usr/bin:/bin:/usr/sbin:/sbin';   # curl 定位
 		chdir('/');
 		exec($QJS, $SHIM, $source, $action, $infoJson);
@@ -225,6 +236,18 @@ sub _finish {
 		$ok   = 0;
 		$err  = defined $err ? "$why: $err" : $why;
 		$data = undef;
+	}
+
+	# 诊断增强：失败时回显子进程原始输出尾部（页面 logs 区直接可见）
+	if (!$ok) {
+		my @raw = grep { defined && length } split(/\r?\n/, $buf);
+		push @$logs, '--- child stdout tail ---';
+		if (@raw) {
+			push @$logs, @raw > 10 ? @raw[-10 .. -1] : @raw;
+		}
+		else {
+			push @$logs, '(empty - child produced no output at all)';
+		}
 	}
 	$job->{cb}->({
 		ok     => $ok ? 1 : 0,
