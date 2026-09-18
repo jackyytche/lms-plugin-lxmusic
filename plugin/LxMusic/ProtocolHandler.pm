@@ -100,19 +100,19 @@ sub scanUrl {
 
 	my $info = $class->parseUrl($url);
 	unless ($info) {
-		$log->error("LxMusic: cannot parse $url");
+		$log->error('LxMusic: cannot parse request url');
 		$cb->(undef);
 		return;
 	}
 
 	my $sourcePath = Plugins::LxMusic::Helper->currentSourcePath();
 	unless ($sourcePath) {
-		$log->error('LxMusic: no source imported — import a subscription first');
+		$log->error('LxMusic: no source imported yet');
 		$cb->(undef);
 		return;
 	}
 
-	main::INFOLOG && $log->info('LxMusic: resolving musicUrl src=' . $info->{src} . ' type=' . $info->{type});
+	$log->info('LxMusic: resolving musicUrl src=' . $info->{src} . ' type=' . $info->{type});
 
 	Plugins::LxMusic::Helper->request(
 		source   => $sourcePath,
@@ -126,13 +126,13 @@ sub scanUrl {
 			my $direct = $res->{data};
 			unless ($res->{ok} && $direct && !ref($direct) && $direct =~ /^https?:/) {
 				my $why = $res->{error} || ($res->{ok} ? 'handler returned no url' : 'unknown');
-				$log->error("LxMusic: musicUrl failed: $why");
+				$log->error('LxMusic: musicUrl failed: ' . ($why // 'unknown'));
 				$class->cache_metadata($url, { title => $info->{name}, error => $why });
 				$cb->(undef);
 				return;
 			}
 
-			main::INFOLOG && $log->info("LxMusic: resolved => $direct");
+			$log->info('LxMusic: resolved ' . substr($direct, 0, 80));
 
 			# now-playing 元数据：标题 + 音质（如实显示）
 			my $qLabel = $class->qualityLabel($info->{type});

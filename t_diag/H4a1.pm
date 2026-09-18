@@ -40,19 +40,19 @@ sub scanUrl {
 
 	my $info = $class->parseUrl($url);
 	unless ($info) {
-		$log->error("LxMusic: cannot parse $url");
+		$log->error('LxMusic: cannot parse request url');
 		$cb->(undef);
 		return;
 	}
 
 	my $sourcePath = Plugins::LxMusic::Helper->currentSourcePath();
 	unless ($sourcePath) {
-		$log->error('LxMusic: no source imported — import a subscription first');
+		$log->error('LxMusic: no source imported yet');
 		$cb->(undef);
 		return;
 	}
 
-	main::INFOLOG && $log->info('LxMusic: resolving musicUrl src=' . $info->{src} . ' type=' . $info->{type});
+	$log->info('LxMusic: resolving musicUrl src=' . $info->{src} . ' type=' . $info->{type});
 
 }
 
