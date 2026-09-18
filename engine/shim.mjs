@@ -331,8 +331,18 @@ function main(std) {
 	const source = info.source || '';
 	const infoArg = info.info || info;
 
-	const ret = handlers[EVENT_NAMES.request]({ source, action, info: infoArg });
+	print('LOG h0 calling handler, action=' + action);
+	let ret;
+	try {
+		ret = handlers[EVENT_NAMES.request]({ source, action, info: infoArg });
+	} catch (e) {
+		print('RESULT ' + JSON.stringify({ ok: false, error: 'handler sync throw: ' + String((e && e.message) || e) }));
+		std.exit(1);
+	}
+	print('LOG h1 ret=' + (ret && ret.then ? 'promise' : typeof ret));
+
 	Promise.resolve(ret).then(r => {
+		print('LOG h2 then fired');
 		print('RESULT ' + JSON.stringify({ ok: true, data: r == null ? null : r }));
 		std.out.flush();
 		std.exit(0);
@@ -341,4 +351,5 @@ function main(std) {
 		std.out.flush();
 		std.exit(1);
 	});
+	print('LOG h3 promise chain armed, entering job loop');
 }
