@@ -113,6 +113,15 @@ function main(std) {
 	}
 
 	function httpOnce(url, options) {
+		// —— urlGet 能力诊断（临时）——
+		try {
+			const rb = std.urlGet(url);
+			log('diagBARE urlGet keys=' + JSON.stringify(Object.keys(rb || {})) +
+				' status=' + (rb && rb.status) +
+				' respType=' + (rb ? typeof rb.response : 'n/a') +
+				' respLen=' + (rb ? (typeof rb.response === 'string' ? rb.response.length : (rb.response ? rb.response.byteLength : 0)) : 'n/a'));
+		} catch (e) { log('diagBARE throw: ' + String((e && e.message) || e)); }
+
 		const reqOpts = {
 			method: String(options.method || 'GET').toUpperCase(),
 			timeoutSec: Math.min(Math.max(Number(options.timeout) || 15, 1), 60),
@@ -133,6 +142,10 @@ function main(std) {
 		const t0 = Date.now();
 		const r = std.urlGet(url, reqOpts);
 		const elapsed = Date.now() - t0;
+		log('diagOPT reqOpts=' + JSON.stringify(reqOpts) +
+			' rkeys=' + JSON.stringify(Object.keys(r || {})) +
+			' status=' + (r && r.status) +
+			' respLen=' + (r ? (typeof r.response === 'string' ? r.response.length : (r.response ? r.response.byteLength : 0)) : 'n/a'));
 		const body = typeof r.response === 'string' ? r.response : utf8Decode(new Uint8Array(r.response || []));
 		const headerObj = {};
 		for (const k of Object.keys(r.headers || {})) headerObj[String(k).toLowerCase()] = String(r.headers[k]);
