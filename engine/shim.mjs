@@ -70,7 +70,7 @@ import('std').then(std => {
 function main(std) {
 	function log(...a) { print('LOG ' + a.join(' ')); }
 
-	// 读全文本文件（bellard std 无 readFile：open + getline 循环）
+	// 读全文本文件（bellard std 无 readFile：open + getline 循环；getline 不含换行，需补回）
 	function readTextFile(path) {
 		const f = std.open(path, 'r');
 		if (!f) throw new Error('cannot open ' + path);
@@ -78,7 +78,7 @@ function main(std) {
 		for (;;) {
 			const line = f.getline();
 			if (line === undefined || line === null) break;
-			s += line;
+			s += line + '\n';
 		}
 		f.close();
 		return s;
