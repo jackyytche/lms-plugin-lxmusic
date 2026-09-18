@@ -63,3 +63,21 @@ jobs:
 
       - name: CHECK Plugin.pm
         run: cd plugin && perl -I t -I t_build -c t_build/Plugins/LxMusic/Plugin.pm
+
+      - name: Collect compile diagnostics
+        if: always()
+        run: |
+          cd plugin
+          for f in H1 H3 H4a0 H4a1 H4a2 H4b H4c H5 Helper ProtocolHandler Plugin; do
+            echo "=== $f ===" >> diag.txt
+            perl -I t -I t_build -c t_build/Plugins/LxMusic/$f.pm 2>&1 | tail -15 >> diag.txt
+            echo "" >> diag.txt
+          done
+          echo collected
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diag
+          path: plugin/diag.txt
