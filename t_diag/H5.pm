@@ -32,6 +32,7 @@ BEGIN { print STDERR "PH-F\n"; }
 Slim::Player::ProtocolHandlers->registerHandler('lxm', __PACKAGE__);
 BEGIN { print STDERR "PH-G\n"; }
 my $JSON = JSON::XS->new->utf8->canonical;
+my %METADATA;
 sub cache_metadata {
 	my ($class, $url, $info) = @_;
 
