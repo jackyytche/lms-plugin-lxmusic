@@ -223,7 +223,13 @@ sub resolveTrack {
 				my ($res) = @_;
 				my $url = $res->{data};
 				unless ($res->{ok} && defined $url && !ref($url) && $url =~ m{^https?://}) {
-					push @tries, { source => $src->{name}, quality => $q, why => ($res->{error} // 'no url') };
+					# 把子进程日志尾部并进 why：否则像 "no RESULT line" 这种失败在现场完全无痕
+					# （qjs 子进程最后几行才是真正原因，M0.9 现场吃了这个亏）
+					my @tail = grep { defined && length } @{ $res->{logs} || [] };
+					@tail = @tail[ -2 .. -1 ] if @tail > 2;
+					my $why = ($res->{error} // 'no url')
+						. (@tail ? ' {' . join(' | ', map { substr($_, 0, 100) } @tail) . '}' : '');
+					push @tries, { source => $src->{name}, quality => $q, why => $why };
 					return $next->();
 				}
 				my $done = sub {
@@ -555,7 +561,10 @@ sub _parse {
 	return (
 		$dec->{ok} ? 1 : 0,
 		$dec->{ok} ? $dec->{data} : $dec->{error},
-		$dec->{ok} ? undef : $dec->{error},
+		# 失败时把子进程给的堆栈拼进 error：'not a function' 这类错误只有栈能定位到源的第几行，
+		# 而父进程的页面日志块不总是可达（M0.9 现场：只能靠判决行带出来）
+		$dec->{ok} ? undef
+			: ($dec->{error} . ((defined $dec->{stack} && length $dec->{stack}) ? ' || ' . substr($dec->{stack}, 0, 200) : '')),
 		\@logs, \@alerts,
 	);
 }

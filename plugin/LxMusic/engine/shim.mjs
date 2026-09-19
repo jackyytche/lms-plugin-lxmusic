@@ -73,6 +73,17 @@ import('std').then(std => {
 });
 
 async function main(std, os) {
+	// stdout/stderr 被 Helper 重定向到文件 ⇒ glibc 全缓冲 ⇒ 子进程被 timeout KILL 时
+	// 缓冲里的 LOG/RESULT 全部丢失（现象：父进程只看到 "no RESULT line" 且日志区空白）。
+	// 这里把 print 包一层、每条都 flush：诊断现场就不再"无痕"。
+	try {
+		const __rawPrint = globalThis.print;
+		globalThis.print = function () {
+			try { __rawPrint.apply(null, arguments); } catch (e) {}
+			try { std.out.flush(); } catch (e) {}
+		};
+	} catch (e) {}
+
 	function log(...a) { print('LOG ' + a.join(' ')); }
 
 	// 读全文本文件（bellard std 无 readFile：open + getline 循环；getline 不含换行，需补回）
@@ -99,18 +110,29 @@ async function main(std, os) {
 		updateAlert: 'updateAlert',
 	});
 
+	// lx.on / lx.send 必须返回 **Promise**（权威实现：desktop-preload.js:243-272 里
+	// send/on 都 return new Promise / Promise.resolve）。返回 undefined 时，源里的
+	// `lx.on('request', h).then(...)`、`await lx.send('inited', ...).then(...)` 会直接
+	// 抛 "not a function"——实测就是 ikun/huibq/huanyin/juhe 一类源的失败原因。
 	function on(name, handler) {
-		if (typeof handler !== 'function') throw new TypeError('lx.on: handler must be function');
+		if (typeof handler !== 'function') return Promise.reject(new TypeError('lx.on: handler must be function'));
+		if (name !== EVENT_NAMES.request) return Promise.reject(new Error('The event is not supported: ' + name));
 		print('LOG on: ' + String(name) + ' fnHead=' + JSON.stringify(String(handler).slice(0, 120)));
 		handlers[name] = handler;
+		return Promise.resolve();
 	}
 
 	function send(name, data) {
 		print('LOG send: ' + String(name) + ' data=' + JSON.stringify(data == null ? null : data).slice(0, 400));
 		if (name === EVENT_NAMES.updateAlert) {
 			print('ALERT ' + JSON.stringify(data == null ? {} : data));
+			return Promise.resolve();
 		}
-		if (name === EVENT_NAMES.inited) __inited = true;
+		if (name === EVENT_NAMES.inited) {
+			__inited = true;
+			return Promise.resolve();
+		}
+		return Promise.reject(new Error('The event is not supported: ' + name));
 	}
 
 	// ---------- HTTP（std.urlGet + 手动 3xx 跟随） ----------
@@ -170,8 +192,13 @@ async function main(std, os) {
 			try { os_.remove(p); } catch (e) {}
 		}
 
-		const sig = typeof wstatus === 'number' ? (wstatus & 0x7f) : 0;
-		const exitCode = typeof wstatus === 'number' ? (wstatus >> 8) : 0;
+		// qjs（bellard）block exec 返回的是**纯退出码**，不是 wait status（HANDOFF §5.1 实测）。
+		// 早先按 wait status 解析（sig = status & 0x7f）把 curl 的 exit 35（SSL 连接错误）
+		// 误报成 "killed by signal 35"，还让 `exit 28 = 超时` 的专用分支变成死代码。
+		// 兼容：>255 的值只可能来自"原始 wait status"形态（node sim stub 旧约定）。
+		const raw = typeof wstatus === 'number' ? wstatus : 0;
+		const sig = raw > 255 ? (raw & 0x7f) : 0;
+		const exitCode = raw > 255 ? (raw >> 8) : raw;
 		if (sig !== 0) throw new Error('curl killed by signal ' + sig);
 		if (exitCode === 28) throw new Error('timeout after ' + timeout + 's');
 		if (exitCode !== 0 && rawHdr === '') throw new Error('curl exit ' + exitCode + ' (' + elapsed + 'ms)');
@@ -234,6 +261,9 @@ async function main(std, os) {
 			print('LOG req ERR: ' + msg);
 			callback(msg);
 		}
+		// 权威实现返回"取消函数"（desktop-preload.js:238-241）；源可能保存它并调用，
+		// 返回 undefined 会 "not a function"。我们的 HTTP 是同步 curl，取消是空操作。
+		return function cancelRequest() { print('LOG req: cancel (noop)'); };
 	}
 
 	// ---------- MD5（RFC 1321 纯 JS） ----------
@@ -333,13 +363,16 @@ async function main(std, os) {
 	// rconfig 回调之后的 then 链（注册 handler + send(inited)）才有机会跑。
 	async function drainUntilInited() {
 		let rounds = 0;
-		while (!__inited && rounds < 200) {
+		// 上限从 200 提到 1500：混淆大源（如六音 333 KB）初始化更慢；同时每 200 轮打点，
+		// 配合下面的 print 强制 flush，被 Helper 超时 KILL 时也能留下"卡在第几轮"的证据。
+		while (!__inited && rounds < 1500) {
 			rounds++;
 			const batch = __timers.splice(0, __timers.length);
 			for (const t of batch) {
 				try { t.fn.apply(null, t.args); }
 				catch (e) { print('LOG timer ERR: ' + String((e && e.message) || e)); }
 			}
+			if (rounds % 200 === 0) print('LOG drain progress: rounds=' + rounds + ' pending=' + __timers.length);
 			await null;
 		}
 		print('LOG drain: rounds=' + rounds + ' inited=' + __inited + ' pending=' + __timers.length);
@@ -406,13 +439,25 @@ async function main(std, os) {
 	};
 	globalThis.setImmediate = globalThis.setTimeout;
 	globalThis.clearImmediate = globalThis.clearTimeout;
-	globalThis.console = {
-		log: (...a) => print('LOG console.log: ' + a.map(x => typeof x === 'string' ? x : JSON.stringify(x)).join(' ')),
-		info: (...a) => print('LOG console.info: ' + a.map(x => typeof x === 'string' ? x : JSON.stringify(x)).join(' ')),
-		warn: (...a) => print('LOG console.warn: ' + a.map(x => typeof x === 'string' ? x : JSON.stringify(x)).join(' ')),
-		error: (...a) => print('LOG console.error: ' + a.map(x => typeof x === 'string' ? x : JSON.stringify(x)).join(' ')),
-		debug: (...a) => print('LOG console.debug: ' + a.map(x => typeof x === 'string' ? x : JSON.stringify(x)).join(' ')),
-	};
+	// console 必须"全套"：源里一句 console.group / console.table 缺失就会 TypeError，
+	// 整个源当场废掉（M0.9 实测：ikun 第 121 行只调了 console.group 就挂了）。
+	// 全部落到 LOG 行（缩进体现 group 层级），不认识的方法一律给个空实现。
+	globalThis.console = (() => {
+		const fmt = (a) => a.map(x => typeof x === 'string' ? x
+			: (x === undefined ? 'undefined' : (() => { try { return JSON.stringify(x); } catch (e) { return String(x); } })())).join(' ');
+		let depth = 0;
+		const out = (tag) => (...a) => print('LOG console.' + tag + ': ' + '  '.repeat(depth) + fmt(a));
+		const c = {
+			log: out('log'), info: out('info'), warn: out('warn'), error: out('error'), debug: out('debug'),
+			trace: out('trace'), dir: out('dir'), table: out('table'), assert: () => {},
+			group: (...a) => { out('group')(...a); depth++; },
+			groupCollapsed: (...a) => { out('group')(...a); depth++; },
+			groupEnd: () => { depth = Math.max(0, depth - 1); },
+			time: () => {}, timeEnd: () => {}, timeLog: () => {},
+			count: () => {}, countReset: () => {}, clear: () => {},
+		};
+		return c;
+	})();
 	globalThis.require = function (name) {
 		print('LOG require called: ' + String(name));
 		throw new Error('shim: require("' + String(name) + '") not available');
@@ -854,7 +899,15 @@ async function main(std, os) {
 	try {
 		ret = handlers[EVENT_NAMES.request]({ source, action, info: infoArg });
 	} catch (e) {
-		print('RESULT ' + JSON.stringify({ ok: false, error: 'handler sync throw: ' + String((e && e.message) || e) }));
+		// 把源自己的 **堆栈** 一并吐出：`not a function` 这类错误只有栈能定位到源的第几行
+		// （M0.9：ikun 等源调用了宿主未实现的成员，仅凭 message 无法定位）
+		const stk = String((e && e.stack) || '').replace(/\s+/g, ' ').slice(0, 500);
+		print('LOG handler throw stack: ' + stk);
+		print('RESULT ' + JSON.stringify({
+			ok: false,
+			error: 'handler sync throw: ' + String((e && e.message) || e),
+			stack: stk,
+		}));
 		std.exit(1);
 	}
 	const fn = handlers[EVENT_NAMES.request];
