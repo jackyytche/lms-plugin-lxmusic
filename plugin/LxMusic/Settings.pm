@@ -11,6 +11,7 @@ use warnings;
 
 use base qw(Slim::Web::Settings);
 
+use Encode ();
 use Slim::Utils::Log;
 use Slim::Utils::Prefs;
 
@@ -22,6 +23,26 @@ my $prefs = preferences('plugin.lxmusic');
 sub name { 'LX Music' }
 
 sub page { 'plugins/LxMusic/settings/basic.html' }
+
+# 设置页模板是「纯 ASCII + 数字实体」（见 basic.html 头注，由 tmp/mk_settings_template.py 生成）：
+# LMS 的 Template 对象没有 ENCODING（Slim/Web/Template/SkinManager.pm 的 Template->new），
+# 传进模板的 UTF-8 字节串会被当 latin-1 再编码 ⇒ 浏览器双重编码乱码（设备实测）。
+# 这里把非 ASCII 与 HTML 敏感字符一次转成数字实体，输出纯 ASCII —— 管道里任何
+# 编码环节都改不坏，也不依赖服务器语言（EN 的达菲同样显示中文）。
+sub _ent {
+	my ($s) = @_;
+	return '' unless defined $s;
+	my $u = utf8::is_utf8($s) ? $s : eval { Encode::decode('UTF-8', $s, Encode::FB_CROAK()) };
+	$u = $s unless defined $u;      # 非法 UTF-8 字节：原样按 latin1 处理，至少不崩
+	my $out = '';
+	for my $c (split //, $u) {
+		my $o = ord $c;
+		$out .= ($o > 127 || $c eq '&' || $c eq '<' || $c eq '>' || $c eq '"' || $c eq "'")
+			? '&#' . $o . ';'
+			: $c;
+	}
+	return $out;
+}
 
 # 由 Slim::Web::Settings 基类负责存取；表单字段名 = pref_<name>
 sub prefs {
@@ -55,7 +76,7 @@ sub handler {
 			# URL 形式：插件侧 curl 拉取（与工具页 _handleImport 同一条实现）
 			my ($body, $err) = Plugins::LxMusic::Plugin::_fetch($content);
 			if ($err || !defined $body) {
-				$params->{lxMessage} = '订阅源下载失败：' . ($err || 'empty');
+				$params->{lxMessage} = _ent('订阅源下载失败：' . ($err || 'empty'));
 			}
 			else {
 				$name    = ($content =~ m{([^/?#]+)(?:[?#].*)?$})[0] || 'downloaded';
@@ -66,7 +87,7 @@ sub handler {
 			$params->{lxMessage} = _installSource($content, $name);
 		}
 		else {
-			$params->{lxMessage} = '订阅源内容为空（粘贴源内容或源 URL）';
+			$params->{lxMessage} = _ent('订阅源内容为空（粘贴源内容或源 URL）');
 		}
 	}
 	elsif ($params->{saveSettings} && $action eq 'clear') {
@@ -74,7 +95,7 @@ sub handler {
 		$prefs->set('sourceName',    '');
 		my $path = Plugins::LxMusic::Helper->currentSourcePath;
 		unlink($path) if $path && -f $path;
-		$params->{lxMessage} = '已清除订阅源（播放取直链将不可用，直到重新导入）';
+		$params->{lxMessage} = _ent('已清除订阅源（播放取直链将不可用，直到重新导入）');
 		$log->info('LxMusic settings: source cleared');
 	}
 
@@ -83,18 +104,18 @@ sub handler {
 	my $srcPath = Plugins::LxMusic::Helper->currentSourcePath;
 	if ($src->{installed} && $srcPath) {
 		my $size = -s $srcPath;
-		$params->{lxSourceStatus} = '已安装：' . ($prefs->get('sourceName') || 'current.js')
-			. '（' . (defined $size ? $size : 0) . ' 字节）';
+		$params->{lxSourceStatus} = _ent('已安装：' . ($prefs->get('sourceName') || 'current.js')
+			. '（' . (defined $size ? $size : 0) . ' 字节）');
 	}
 	else {
-		$params->{lxSourceStatus} = '未安装订阅源';
+		$params->{lxSourceStatus} = _ent('未安装订阅源');
 	}
-	$params->{lxVersion}    = Plugins::LxMusic::Helper->pluginVersion;
-	$params->{lxEngine}     = Plugins::LxMusic::Helper->engineStatus;
-	$params->{lxSourcePath} = $srcPath || '(none)';
+	$params->{lxVersion}    = _ent(Plugins::LxMusic::Helper->pluginVersion);
+	$params->{lxEngine}     = _ent(Plugins::LxMusic::Helper->engineStatus);
+	$params->{lxSourcePath} = _ent($srcPath || '(none)');
 
 	my $logLevel = eval { Slim::Utils::Log->logLevelForCategory('plugin.lxmusic') } || $prefs->get('logLevel') || '?';
-	$params->{lxLogLevel} = $logLevel;
+	$params->{lxLogLevel} = _ent($logLevel);
 
 	return $class->SUPER::handler($client, $params, $callback, $httpClient, $response);
 }
@@ -104,8 +125,8 @@ sub _installSource {
 	my ($content, $name) = @_;
 
 	$content =~ s/^\s+|\s+$//g;
-	return '订阅源内容为空' unless length $content;
-	return '内容过短（< 50 字节），不像是洛雪订阅源' if length($content) < 50;
+	return _ent('订阅源内容为空') unless length $content;
+	return _ent('内容过短（< 50 字节），不像是洛雪订阅源') if length($content) < 50;
 
 	# v6 源多为混淆版，明文特征有限：认 SERVER_SCRIPT_CONFIG / @name 头 / 通用挂载
 	my $looksOk = ($content =~ /SERVER_SCRIPT_CONFIG/
@@ -117,14 +138,14 @@ sub _installSource {
 	$safe =~ s/\.js$//i;
 
 	my $path = Plugins::LxMusic::Helper->installSource($safe . '.js', $content);
-	return '订阅源导入失败（写盘错误，见 server.log）' unless $path;
+	return _ent('订阅源导入失败（写盘错误，见 server.log）') unless $path;
 
 	$prefs->set('sourceContent', $content);
 	$prefs->set('sourceName',    $safe);
 	$log->info("LxMusic settings: source imported: $safe.js (" . length($content) . ' bytes)');
 
-	return ($looksOk ? '' : '（警告：内容不像洛雪订阅源，可能无法取链）')
-		. '已导入订阅源：' . $safe . '.js（' . length($content) . ' 字节）';
+	return _ent(($looksOk ? '' : '（警告：内容不像洛雪订阅源，可能无法取链）')
+		. '已导入订阅源：' . $safe . '.js（' . length($content) . ' 字节）');
 }
 
 1;
