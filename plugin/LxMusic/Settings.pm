@@ -32,8 +32,7 @@ sub page { 'plugins/LxMusic/settings/basic.html' }
 sub _ent {
 	my ($s) = @_;
 	return '' unless defined $s;
-	my $u = utf8::is_utf8($s) ? $s : eval { Encode::decode('UTF-8', $s, Encode::FB_CROAK()) };
-	$u = $s unless defined $u;      # 非法 UTF-8 字节：原样按 latin1 处理，至少不崩
+	my $u = _chars($s);
 	my $out = '';
 	for my $c (split //, $u) {
 		my $o = ord $c;
@@ -42,6 +41,15 @@ sub _ent {
 			: $c;
 	}
 	return $out;
+}
+
+# 统一把"原始 UTF-8 字节串"变成旗标字符串（已是字符则原样）。
+# 用途：URL 下载来的 body 是字节；直接塞给 prefs/installSource 会被二次编码。
+sub _chars {
+	my ($s) = @_;
+	return $s if !defined $s || utf8::is_utf8($s);
+	my $u = eval { Encode::decode('UTF-8', $s, Encode::FB_CROAK()) };
+	return defined $u ? $u : $s;    # 非法 UTF-8 字节：原样处理，至少不崩
 }
 
 # 由 Slim::Web::Settings 基类负责存取；表单字段名 = pref_<name>
@@ -70,20 +78,21 @@ sub handler {
 	if ($params->{saveSettings} && $action eq 'import') {
 		my $content = $params->{sourceContent} || '';
 		my $name    = $params->{sourceName} || 'current.js';
-		$content =~ s/^\s+|\s+$//g;
+		my $probe   = $content;
+		$probe =~ s/^\s+|\s+$//g;   # 只用来判形态；正文一律原样落盘（差一个字节都会改掉源签名）
 
-		if ($content =~ m{^https?://\S+$}i) {
+		if ($probe =~ m{^https?://\S+$}i) {
 			# URL 形式：插件侧 curl 拉取（与工具页 _handleImport 同一条实现）
-			my ($body, $err) = Plugins::LxMusic::Plugin::_fetch($content);
+			my ($body, $err) = Plugins::LxMusic::Plugin::_fetch($probe);
 			if ($err || !defined $body) {
 				$params->{lxMessage} = _ent('订阅源下载失败：' . ($err || 'empty'));
 			}
 			else {
-				$name    = ($content =~ m{([^/?#]+)(?:[?#].*)?$})[0] || 'downloaded';
+				$name    = ($probe =~ m{([^/?#]+)(?:[?#].*)?$})[0] || 'downloaded';
 				$params->{lxMessage} = _installSource($body, $name);
 			}
 		}
-		elsif (length $content) {
+		elsif (length $probe) {
 			$params->{lxMessage} = _installSource($content, $name);
 		}
 		else {
@@ -114,7 +123,8 @@ sub handler {
 	$params->{lxEngine}     = _ent(Plugins::LxMusic::Helper->engineStatus);
 	$params->{lxSourcePath} = _ent($srcPath || '(none)');
 
-	my $logLevel = eval { Slim::Utils::Log->logLevelForCategory('plugin.lxmusic') } || $prefs->get('logLevel') || '?';
+	my $logLevel = eval { Slim::Utils::Log->allCategories()->{'plugin.lxmusic'} }
+		|| '默认 ERROR（可在「高级 → 日志」调整）';
 	$params->{lxLogLevel} = _ent($logLevel);
 
 	return $class->SUPER::handler($client, $params, $callback, $httpClient, $response);
@@ -124,9 +134,13 @@ sub handler {
 sub _installSource {
 	my ($content, $name) = @_;
 
-	$content =~ s/^\s+|\s+$//g;
-	return _ent('订阅源内容为空') unless length $content;
+	# 注意：这里绝不能再裁剪首尾空白——lx 源的完整性签名基于原版字节，
+	# 多/少一个换行都会让 qjs 端 rawScript hash 与官方不一致（实测差 1 字节）。
+	# 空内容判定用 /\S/，长度校验只是防呆。
+	return _ent('订阅源内容为空') unless defined $content && $content =~ /\S/;
 	return _ent('内容过短（< 50 字节），不像是洛雪订阅源') if length($content) < 50;
+
+	$content = _chars($content);   # URL 下载是字节串 → 落 prefs/落盘前统一成字符
 
 	# v6 源多为混淆版，明文特征有限：认 SERVER_SCRIPT_CONFIG / @name 头 / 通用挂载
 	my $looksOk = ($content =~ /SERVER_SCRIPT_CONFIG/
@@ -142,10 +156,12 @@ sub _installSource {
 
 	$prefs->set('sourceContent', $content);
 	$prefs->set('sourceName',    $safe);
-	$log->info("LxMusic settings: source imported: $safe.js (" . length($content) . ' bytes)');
+	my $bytes = -s $path;    # 报"磁盘上的字节数"（字符数会被多字节中文误导）
+	$bytes = length($content) unless defined $bytes;
+	$log->info("LxMusic settings: source imported: $safe.js ($bytes bytes)");
 
 	return _ent(($looksOk ? '' : '（警告：内容不像洛雪订阅源，可能无法取链）')
-		. '已导入订阅源：' . $safe . '.js（' . length($content) . ' 字节）');
+		. '已导入订阅源：' . $safe . '.js（' . $bytes . ' 字节）');
 }
 
 1;

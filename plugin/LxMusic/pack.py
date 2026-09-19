@@ -3,6 +3,7 @@
 import hashlib
 import os
 import re
+import time
 import zipfile
 
 SRC = os.path.dirname(os.path.abspath(__file__))
@@ -15,6 +16,22 @@ BASE = os.environ.get('LX_REPO_BASE', GH_BASE)
 # zip 名带版本号（喜马拉雅同款）：LMS 对同名 zip 有 DownloadedPlugins 缓存/摘要校验，
 # 复用 LxMusic.zip 会在连续升级时出现"下载了却不安装"（0.4.5 现场踩到）
 ZIP_TMPL = 'LxMusic-{version}.zip'
+
+
+def _stamp():
+    """zip 条目时间戳：必须"每次打包都变新"。
+
+    LMS 用 Archive::Zip::extractTree 解压并**保留 zip 里的 mtime**，而 Template
+    Toolkit 按 mtime 判编译缓存（COMPILE_DIR=<cachedir>/templates，STAT_TTL=3600）。
+    曾经这里写死 (2026,9,18)，于是版本间模板 mtime 完全相同 —— 0.6.1 改了设置页模板，
+    设备却仍渲染 0.6.0 的编译结果（页面逐字节相同，现场踩到）。用打包时刻即可；
+    需要可复现构建时设 SOURCE_DATE_EPOCH（秒）。
+    """
+    epoch = os.environ.get('SOURCE_DATE_EPOCH')
+    t = time.gmtime(int(epoch)) if epoch else time.gmtime()
+    if t.tm_year < 1980:                     # DOS 时间下限
+        t = time.gmtime(315532800)
+    return (t.tm_year, t.tm_mon, t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec)
 
 
 def main():
@@ -45,8 +62,9 @@ def main():
     entries.sort(key=lambda t: t[1])
 
     with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as z:
+        stamp = _stamp()
         for full, rel in entries:
-            zi = zipfile.ZipInfo(rel, date_time=(2026, 9, 18, 0, 0, 0))
+            zi = zipfile.ZipInfo(rel, date_time=stamp)
             # qjs 必须带 0755 执行位（PluginDownloader 只剥 0022，其余保留）
             zi.external_attr = ((0o100755 if rel.endswith('/qjs') else 0o100644) << 16)
             zi.compress_type = zipfile.ZIP_DEFLATED

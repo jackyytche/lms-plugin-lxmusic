@@ -22,6 +22,7 @@ use strict;
 use warnings;
 
 use Config ();
+use Encode ();
 use File::Copy qw(copy);
 use File::Path qw(mkpath rmtree);
 use File::Spec;
@@ -158,6 +159,18 @@ sub installSource {
 	# 浏览器 textarea 提交把换行规范成 CRLF；lx 源的完整性签名基于原版 LF 内容，
 	# 必须在落盘前统一回 LF，否则 qjs 端 rawScript hash 与官方不一致（服务端 403）。
 	$content =~ s/\r\n/\n/g;
+
+	# 落盘统一用 :encoding(UTF-8)，所以这里必须是"字符"串：
+	#   - 浏览器粘贴路径：LMS 已 utf8decode（旗标串）→ 原样
+	#   - URL 下载路径（_fetch/curl）：拿到的是原始 UTF-8 字节 → 必须解码，
+	#     否则每个非 ASCII 字节被再编码一次（设备实测：64094 B 的源落盘成 72249 B，
+	#     源文件被改坏 ⇒ 签名握手失败、取不到直链）
+	#   - 非法 UTF-8 字节（二进制）：保留原值，尽量不改动用户给的内容
+	if (!utf8::is_utf8($content)) {
+		my $decoded = eval { Encode::decode('UTF-8', $content, Encode::FB_CROAK()) };
+		$content = $decoded if defined $decoded;
+	}
+
 	$name =~ s/\.{2,}/_/g;                   # 收敛连续点（防穿越）
 	$name =~ s/[^\w.-]/_/g;                  # 防非法字符
 	$name =~ s/^[.\-]+//;                    # 首字符须为字母数字下划线

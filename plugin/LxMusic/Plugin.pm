@@ -208,7 +208,9 @@ sub testHandler {
 sub _u {
 	my ($s) = @_;
 	return $s if !defined $s || utf8::is_utf8($s);
-	return Encode::decode('UTF-8', $s);
+	# FB_CROAK + 回退原值：非法 UTF-8 字节宁可原样传递，也不要被替换成 U+FFFD（丢内容）
+	my $u = eval { Encode::decode('UTF-8', $s, Encode::FB_CROAK()) };
+	return defined $u ? $u : $s;
 }
 
 # XMLBrowser passthrough 语义（slimserver XMLBrowser.pm L521）：
@@ -692,6 +694,10 @@ sub _handleImport {
 	return ('import failed: ' . encode_entities($err)) if $err;
 	return 'import failed: empty content'
 		unless $content && $content =~ /\S/ && length($content) > 50;
+
+	# URL 下载拿到的是原始字节；prefs 与 installSource 都要求"字符"串，
+	# 不解码就会被二次编码（源文件被改坏）。粘贴路径 LMS 已解码，_u 是幂等的。
+	$content = _u($content);
 
 	# v6 源多为混淆版，明文特征有限：认 SERVER_SCRIPT_CONFIG / @name 头 / 通用挂载
 	my $looksOk = ($content =~ /SERVER_SCRIPT_CONFIG/
