@@ -148,7 +148,12 @@ XMLBrowser 菜单 / 网页  →  Plugin.pm（feed handlers / webHandler）
 2. **M0.6 候选**：常驻 qjs worker（把冷解析 2.3s 降到 ~0，桌面版体感）；搜索渐进式出结果；kw 榜单（上游签名已失效，需重新逆向或放弃）。
 3. **遗留清理**：`repo/plugin/helper-test.log`、页面硬编码版本号字符串、`tmp/` 诊断脚本归置。
 4. **PAT 撤销**：本轮发布用的 token 由用户提供，**用完提醒用户撤销**。
-5. **发布**：GitHub `jackyytche/lms-plugin-lxmusic`（本轮已推 main + Release；后续版本沿用 pack.py 的 GH_BASE 生成 repo.xml 资产）。
+5. **发布（✅ 2026-09-19 已完成）**：GitHub `jackyytche/lms-plugin-lxmusic`
+   - main 已推：`a5af529..2b28c48`（快进；`2b28c48` = 0.3.0→0.5.9 + 设置页 WIP 单一提交，含 vendored sdk 树 0.23MB 以便复现）
+   - **Release `v0.5.9`**（id `392124985`）：资产 `LxMusic-0.5.9.zip`（1231509 B，SHA1 `c0959eb82a8f5d968c3e51de8e160c9cb4875180`）+ `repo.xml`（GH 基址）；终验 `releases/latest/download/repo.xml` 版本正确、zip sha 与本地打包**逐字节一致**
+   - 发布用 PAT 由用户提供，**用完请撤销**（本轮已用完）
+   - 发布命令备忘：`curl -X POST https://api.github.com/repos/<owner>/<repo>/releases`（Bearer token）+ `uploads.github.com/.../assets?name=…`；推送用 `git push https://x-access-token:<token>@github.com/… main`（token 仅命令行内联，不落盘）
+   - **注意**：`dist/LxMusic-0.5.9.zip` 在设置页改动后被重新打包，内容 ≠ 设备上正在运行的 0.5.9（同名同版本，设备不会自动重装，无风险）；下个 session 完成后应 bump **0.6.0** 再发版
 
 ---
 
