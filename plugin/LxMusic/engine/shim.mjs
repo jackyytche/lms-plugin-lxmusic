@@ -915,7 +915,11 @@ async function main(std, os) {
 		+ ' fnCtor=' + (fn.constructor && fn.constructor.name) + ' fnParams=' + fn.length
 		+ ' thenPresent=' + !!(ret && typeof ret.then === 'function'));
 
+	// ---------- 看门狗：源的 promise 若不 settle，宿主会"静默退出"（父进程只看到 no RESULT line）----------
+	// 这里在 armed 之后继续泵定时器/微任务；到上限仍未 settle 就显式报错，并带上轮数/待处理定时器数。
+	let settled = false;
 	Promise.resolve(ret).then(r => {
+		settled = true;
 		print('LOG t1 type=' + typeof r);
 		print('LOG t2 keys=' + (r ? Object.keys(r).join(',') : 'null'));
 		const s = JSON.stringify({ ok: true, data: r == null ? null : r });
@@ -926,9 +930,35 @@ async function main(std, os) {
 		print('LOG t5 flushed, exiting');
 		std.exit(0);
 	}).catch(e => {
+		settled = true;
 		print('RESULT ' + JSON.stringify({ ok: false, error: String((e && e.message) || e) }));
 		std.out.flush();
 		std.exit(1);
 	});
 	print('LOG h3 promise chain armed, entering job loop');
+
+	let wd = 0;
+	while (!settled && wd < 3000) {
+		wd++;
+		const batch = __timers.splice(0, __timers.length);
+		for (const t of batch) {
+			try { t.fn.apply(null, t.args); }
+			catch (e) { print('LOG timer ERR: ' + String((e && e.message) || e)); }
+		}
+		if (wd % 200 === 0) {
+			print('LOG watchdog: rounds=' + wd + ' pendingTimers=' + __timers.length + ' settled=' + settled);
+		}
+		await null;
+	}
+	if (!settled) {
+		// 典型成因：源 await 了一个永不 resolve 的 Promise（内部 HTTP 没回调、或吞掉了异常）。
+		// pendingTimers=0 说明它连定时器都没挂——纯等外部事件，宿主侧已无能为力，必须显式报错。
+		print('RESULT ' + JSON.stringify({
+			ok: false,
+			error: 'source handler promise never settled (watchdog ' + wd + ' rounds, pendingTimers='
+				+ __timers.length + '; source awaits something that never resolves)',
+		}));
+		std.out.flush();
+		std.exit(2);
+	}
 }

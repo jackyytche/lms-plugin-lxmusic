@@ -106,7 +106,8 @@ XMLBrowser 菜单 / 网页  →  Plugin.pm（feed handlers / webHandler）
 | 0.9.1 / 0.9.2 | 失败时把源自身 **`e.stack`** 拼进 error/判决行（M0.9 靠它定位到"源第 121 行调用缺失成员"） |
 | 0.9.3 | **`console` 全套补齐**（group/groupEnd/table/trace/assert/time…）——实测 ikun 只因缺 `console.group` 就整个源报废 |
 | 0.9.4 | 修 `httpOnce` 的 **wait-status 误解析**：qjs block exec 返回纯退出码，旧代码 `&0x7f` 把 curl `exit 35`(SSL) 误报成"signal 35"，还让 `exit 28`(超时) 分支成死代码 |
-| **0.9.5（当前设备）** | 失败尝试的**子进程日志尾部并入 `tries`**（否则 "no RESULT line" 现场无痕；正是它暴露出六音的真因） |
+| **0.9.5** | 失败尝试的**子进程日志尾部并入 `tries`**（否则 "no RESULT line" 现场无痕；正是它暴露出六音的真因） |
+| **0.9.6（当前设备）** | **job loop 看门狗**：源 promise 不 settle 时显式报错（不再静默退出），并打印轮数/待处理定时器数 |
 
 ---
 
@@ -244,10 +245,15 @@ XMLBrowser 菜单 / 网页  →  Plugin.pm（feed handlers / webHandler）
     把 curl 的 `exit 35`(SSL 连接错误) 误报成 `killed by signal 35`，同时让 `exit 28`(curl 超时) 的
     专用分支永不触发（死代码）。判据：>255 才可能是原始 wait status。
 46. **失败必须带上子进程的最后两行日志**：把 `$res->{logs}` 尾部并进 resolveTrack 的 `tries[].why` 之后，
-    六音的真因才显形 —— `handler promise never settled`（源返回了 promise 但永不成 settle ⇒ 子进程
-    **静默退出**、没打 RESULT）。**M0.9 下一步**：给 job loop 加看门狗，未 settle 时显式报错。
-    M0.9 剩余源的当前准确原因（0.9.5 实测）：ikun `curl exit 35`(TLS)、Huibq `curl exit 56`(连接被重置)、
-    六音 promise 不 settle、其余见 §八。
+    真因才显形。**M0.9 结论（0.9.6 实测全部 10 个源）**：契约/诊断修完后，剩下 7 个源**没有一个是"缺宿主 API"**，
+    全部卡在**它们自己的上游 HTTP**：
+    - 六音 `failed {LOG resp: code=403 ... <title>403 Forbidden</title>}` ⇒ 上游拒绝本设备（源侧/上游侧）
+    - ikun `curl exit 35`（SSL 连接错误）⇒ 上游 TLS 不可达
+    - Huibq `unknow error` / `curl exit 56`（连接被重置）
+    - 幻音 `verify: no response`（取回的直链根本连不上）
+    - 野花/野草/聚合API `Error`（源自己的通用报错，上游不可用）
+    ⇒ **M0.9 目标达成**：引擎侧不再是瓶颈，且失败可自证；要救活它们得等上游恢复或换源。
+    job loop 看门狗（0.9.6）已就位：promise 不 settle 时显式报错 + 带轮数/待处理定时器数。
 
 ### 5.9 订阅源实测与校验探测（3 条）
 47. **取链校验必须跟随重定向**：探测用 `curl -I` 不跟 `-L` 时，301/302 会被判成"不可播"。
@@ -299,14 +305,12 @@ XMLBrowser 菜单 / 网页  →  Plugin.pm（feed handlers / webHandler）
 2. **M0.7 剩余候选**：每源失败冷却（连续点歌不反复撞死源）；**不喜欢歌曲规则**（`歌曲名@艺术家` 三态过滤，
    PC 端最契合服务端的一项）；搜索排序可选增强（PC 算法下"歌手名越短得分越高"⇒ 是否加"完全同名优先 / 优先某源"）；
    `common.sourceNameType` real/alias；繁简转换；歌词三开关；代理；热门搜索；直链缓存上限语义。
-3. **M0.9 续做（当前重点）**：
-   - ✅ 已完成（0.9.0~0.9.5）：`on/send` Promise 化、`request` 返回取消函数、**console 全套**、print 强制 flush、
-     wait-status 误解析修正、失败带子进程日志尾部 + 源堆栈。
-   - ⬜ **job loop 看门狗**：源 promise 不 settle 时显式报错（现在静默退出 ⇒ 父进程只看到 `no RESULT line`）。
-   - ⬜ **按失败样本继续补**：ikun `curl exit 35`（TLS：查设备 CA/curl 版本，或源的上游被墙）；
-     Huibq `curl exit 56`（连接被重置）；六音 promise 不 settle（大概率也是上游不可达，看门狗报错后即可判定）。
-   - 目标：把 `pdone/lx-music-source` 里"其实没坏、只是我们跑不动"的源救活（六音 333 KB 通常覆盖面最大）。
-4. **M0.10 候选**：常驻 qjs worker（冷解析 ~2.3s → ~0）；kw 榜单（上游签名失效）。
+3. **M0.9（✅ 完成，0.9.0~0.9.6）**：宿主 API 契约对齐（`on/send` Promise、`request` 取消函数、**console 全套**）、
+   print 强制 flush、wait-status 误解析修正、失败带源堆栈 + 子进程日志尾部、**job loop 看门狗**。
+   结论：10 个源里 7 个的失败**都是上游 HTTP 问题**（403/TLS/重置/无响应），引擎侧不再是瓶颈（详见 §5.8.46）。
+   —— 要救活它们只能等上游恢复/换源，不建议再投入引擎侧改造。
+4. **M0.10 候选**：常驻 qjs worker（冷解析 ~2.3s → ~0）；kw 榜单（上游签名失效）；
+   长青 `kg flac24bit ~48kbps` 试听片段的自适应处置（换源？降档？只告警——现为告警）。
 4. **遗留清理**：`repo/plugin/helper-test.log`；`tmp/` 脚本（本轮新增 6 个，建议全留）；`dist/lx-6.js`、`dist/qdy.js`。
 6. **发布历史（✅ 2026-09-19）**：GitHub `jackyytche/lms-plugin-lxmusic`
    - main 已推：`a5af529..2b28c48`（`2b28c48` = 0.3.0→0.5.9 + 设置页 WIP 单一提交，含 vendored sdk 树 0.23MB 以便复现）
@@ -316,22 +320,25 @@ XMLBrowser 菜单 / 网页  →  Plugin.pm（feed handlers / webHandler）
 
 ## 八、现场状态与凭据
 
-- **设备**：达菲 `192.168.2.111`（LMS 9.0.3 / perl 5.40；Web `:9000`，CGI `:80`）；运行 **0.9.5**。
-- **通道**：达菲订阅 = **LAN** `http://192.168.2.68:8765/repo.xml?v=56`（8765 常驻 `python -m http.server` 指向 `dist/`；**进程易失**，掉线就在 `dist/` 重启；`?v=N` 是 LMS 仓库缓存的破除参数，每次装机 +1）。
-- **设备侧现状**：订阅源 **2 个（都启用，顺序即优先级）**：
-  1. `独家音源`（在线 `http://192.168.2.68:8765/lx-6.js`，64094 B，= 官方 `lx/latest.js`）——实测 **5/5** 平台（kw/tx flac 1647kbps、wy 1612、mg 1032）
-  2. `长青SVIP音源`（在线 `https://raw.githubusercontent.com/pdone/lx-music-source/main/changqing/latest.js`，27645 B，v1.3.0）——实测 **5/5** 平台（kw/tx flac 1647、wy 1612、mg 128k；但 `kg flac24bit` 曾回 ~48kbps 的疑似试听片段 ⇒ 见 §5.8.43）
+- **设备**：达菲 `192.168.2.111`（LMS 9.0.3 / perl 5.40；Web `:9000`，CGI `:80`）；运行 **0.9.6**。
+- **通道**：达菲订阅 = **LAN** `http://192.168.2.68:8765/repo.xml?v=60`（8765 常驻 `python -m http.server` 指向 `dist/`；**进程易失**，掉线就在 `dist/` 重启；`?v=N` 是 LMS 仓库缓存的破除参数，每次装机 +1）。
+- ⚠️ **本机 IP 会飘（2026-09-21 实测漂到 .131 又回到 .68）**：IP 一变，设备就取不到 LAN 仓库（表现为"POST 成功但版本不变"、源导入报 `empty download`）。处理：`ipconfig` 看当前 IP → `$env:LX_REPO_BASE='http://<当前IP>:8765'` 重新 pack → 装机时 `--repos=http://<当前IP>:8765/repo.xml?v=<N+1>` 把设备指过来；tmp 脚本已统一读环境变量 `LX_LAN`（别硬编码）。
+- **设备侧现状**：订阅源 **2 个（都启用，顺序即优先级；都已改用官方 URL，不再依赖本机 LAN）**：
+  1. `长青SVIP音源`（`https://raw.githubusercontent.com/pdone/lx-music-source/main/changqing/latest.js`，27645 B，v1.3.0）——实测 **5/5** 平台（kw/tx flac 1647、wy 1612、mg 128k）
+  2. `独家音源`（`https://raw.githubusercontent.com/pdone/lx-music-source/main/lx/latest.js`，64094 B，v6）——实测 **4~5/5**（wy 偶发）
+  - 最近一次取链：`[长青SVIP音源] flac ~1647kbps verified`（0.96s）
   - prefs 默认（quality 320k / bridgeTimeout 7 / helperConcurrency 2 / resolveTtl 600 / coverProxy on / boards 全 on / qualityFallback on / verifyUrl on / autoSkipOnError on）；`plugin.lxmusic` 日志级别 = **ERROR**。
-  - **`pdone/lx-music-source` 10 个源实测矩阵**（2026-09-21，逐源隔离 × 逐平台取链 + HEAD 校验）：
-    | 源 | 覆盖 | 结论 |
+  - **`pdone/lx-music-source` 10 个源实测矩阵**（2026-09-21，逐源隔离 × 逐平台取链 + HEAD 校验；0.9.6 后的准确原因）：
+    | 源 | 覆盖 | 真实原因 |
     |---|---|---|
-    | lx（独家音源） | **5/5** | 保留（已在用） |
-    | changqing（长青SVIP） | **5/5** | **保留（新导入，官方 URL）** |
-    | qdy（全豆要[聚合音源]） | 2/5（kw,wy） | 曾报 HTTP 410 死链；已删 |
-    | flower（野花）/ grass（野草） | 0~3/5，仅 128k | 已删 |
-    | sixyin（六音，333 KB） | 0/5 | `no RESULT line` = 引擎侧（子进程挂/崩）；已删 |
-    | huibq / huanyin / ikun / juhe | 0/5 | `handler sync throw: not a function` 等，引擎侧缺 API；已删 |
-  - 附带结论：**设备能直连 `raw.githubusercontent.com`**（长青就是从官方原链导入的），所以源可以填官方地址而不用 ghproxy 加速链。
+    | changqing（长青SVIP） | **5/5** | 保留（官方 URL） |
+    | lx（独家音源） | **4~5/5** | 保留（官方 URL） |
+    | sixyin（六音 333 KB） | 0/5 | 上游 **403 Forbidden**（源侧，非引擎） |
+    | ikun | 0/5 | `curl exit 35` TLS 不可达 |
+    | Huibq | 0/5 | `unknow error` / `curl exit 56` 连接重置 |
+    | huanyin（幻音） | 0/5 | `verify: no response`（直链连不上） |
+    | flower / grass / juhe / qdy | 0~3/5 | 源自身 `Error` / 410 死链 / 仅 128k |
+  - 附带结论：**设备能直连 `raw.githubusercontent.com`**（两个源都从官方原链导入），不必用 ghproxy 加速链。
 - **本机 IP/仓库基址**：`192.168.2.68:8765`（**DHCP 可能变化**，变了要同步 `dist/repo.xml` 的 URL 与 pack.py 的 `LAN_BASE`）。
 - **GitHub**：`jackyytche/lms-plugin-lxmusic`；PAT 由用户在需要时提供（**勿写入文件**；撤销提醒见 §七.4）。
 - **订阅源样本**：`refs/samples/lx-6.js`（= `lx-music-source-v6-fixed.js` = `lx-latest.js`，64094 B，与 pdone/lx-music-source 官方 `lx/6.js` 逐字节一致；`dist/lx-6.js` 是给设备做 URL 导入测试的 LAN 副本）。
