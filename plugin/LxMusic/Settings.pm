@@ -20,7 +20,9 @@ use Plugins::LxMusic::Helper;
 my $log   = Slim::Utils::Log->logger('plugin.lxmusic');
 my $prefs = preferences('plugin.lxmusic');
 
-sub name { 'LX Music' }
+# 必须是 strings.txt 的 token（LMS 的 `name` 契约就是"字符串 token"）：设置下拉/
+# 页面标题都用 `| string` 渲染它，返回显示串会渲染成空白行（0.6.3 现场踩到）。
+sub name { 'PLUGIN_LXMUSIC' }
 
 sub page { 'plugins/LxMusic/settings/basic.html' }
 

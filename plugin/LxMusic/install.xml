@@ -1,19 +1,22 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <extension>
 	<id>8f4e2a91-6c3d-4b7e-a5d8-2f9c1e7b4a36</id>
-	<name>LX Music</name>
-	<title>洛雪音乐</title>
+	<!-- name/description 必须是 strings.txt 里的 token：LMS 的插件列表/设置下拉都用
+	     `| string` 渲染它们，写显示串会渲染成空白（0.6.3 现场：设置下拉里 LX Music 是空行） -->
+	<name>PLUGIN_LXMUSIC</name>
 	<module>Plugins::LxMusic::Plugin</module>
-	<version>0.6.3</version>
-	<description>Play music from LX Music custom-source subscriptions on Daphile. Import a subscription, browse charts, search across 5 music sources and stream with quality selection (built-in musicSdk).</description>
+	<version>0.6.4</version>
+	<description>PLUGIN_LXMUSIC_DESC</description>
 	<creator>jackyytche</creator>
 	<email>noreply@example.com</email>
 	<category>musicservices</category>
 	<defaultState>enabled</defaultState>
+	<!-- 设置入口：设置 → 插件 里那一行的 Settings 链接就是这里来的（漏了就没入口） -->
+	<optionsURL>plugins/LxMusic/settings/basic.html</optionsURL>
 	<type>2</type>
 	<homepage URL="https://github.com/jackyytche/lms-plugin-lxmusic"/>
 	<targetApplication>
-		<name>Lyrion Music Server</name>
+		<id>Lyrion Music Server</id>
 		<minVersion>7.7</minVersion>
 		<maxVersion>*</maxVersion>
 	</targetApplication>

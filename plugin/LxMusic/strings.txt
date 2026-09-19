@@ -1,0 +1,16 @@
+# String file for the LX Music plugin (EN + ZH_CN)
+# 只有插件元数据用 token（install.xml 的 name/description + Settings::name 都必须是 token，
+# LMS 用 `| string` 渲染它们）。设置页模板刻意不用 token：它走"纯 ASCII + 数字实体"，
+# 达菲是 EN 语言也照显示中文（见 HANDOFF §5.5.26）。
+
+PLUGIN_LXMUSIC
+	EN	LX Music
+	ZH_CN	洛雪音乐
+
+PLUGIN_LXMUSIC_DESC
+	EN	Play music from LX Music custom sources: import a subscription source, browse platform charts, search songs and playlists across sources, and stream with selectable quality.
+	ZH_CN	洛雪音乐自定义音源：导入订阅源，浏览各平台榜单，跨源搜索歌曲/歌单，按音质档位播放。
+
+PLUGIN_LXMUSIC_TITLE
+	EN	LX Music / 洛雪音乐
+	ZH_CN	洛雪音乐
