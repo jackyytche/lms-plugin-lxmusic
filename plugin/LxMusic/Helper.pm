@@ -228,9 +228,16 @@ sub resolveTrack {
 				}
 				my $done = sub {
 					my ($verified, $kbps) = @_;
-					push @tries, { source => $src->{name}, quality => $q, ok => 1, verified => $verified, kbps => $kbps };
+					# 码率异常低 ⇒ 很可能是试听片段/残缺文件（实测：长青 kg flac24bit 只有 ~48kbps）
+					my $suspect = ($kbps && $kbps < 64) ? 1 : 0;
+					if ($suspect) {
+						$log->warn("LxMusic resolve: SUSPECT short/preview file ([" . ($src->{name} // '?')
+							. "] type=$q -> ~${kbps}kbps) — 可能是试听片段或残缺文件");
+					}
+					push @tries, { source => $src->{name}, quality => $q, ok => 1, verified => $verified,
+						kbps => $kbps, suspect => $suspect };
 					$log->warn("LxMusic resolve OK: [" . $src->{name} . "] type=$q verified=$verified"
-						. (defined $kbps ? " ~${kbps}kbps" : ''));
+						. (defined $kbps ? " ~${kbps}kbps" : '') . ($suspect ? ' (SUSPECT)' : ''));
 					$cb->({
 						ok         => 1,
 						url        => $url,
@@ -239,6 +246,7 @@ sub resolveTrack {
 						quality    => $q,
 						verified   => $verified,
 						actualKbps => $kbps,
+						suspect    => $suspect,
 						tries      => \@tries,
 					});
 				};

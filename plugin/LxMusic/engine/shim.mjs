@@ -492,8 +492,10 @@ async function main(std, os) {
 		const base = ((os.getenv && os.getenv('LX_TMP')) || '/tmp') + '/lxp_' + Date.now() + '_' + Math.floor(Math.random() * 1e6);
 		const hdrF = base + '.hdr';
 		const run = (extra) => {
-			const a = ['curl', '-sS', '--max-time', String(tmo), '-o', '/dev/null', '-D', hdrF,
-				'-A', 'Mozilla/5.0'];
+			// 必须 -L 跟随重定向：真实播放链路会跟随（binHttp 也是手动跟 3 跳），
+			// 不跟随就会把 301/302 误判成不可播（0.8.5 现场：长青音源的直链是 301，被误杀）
+			const a = ['curl', '-sS', '-L', '--max-redirs', '3', '--max-time', String(tmo),
+				'-o', '/dev/null', '-D', hdrF, '-A', 'Mozilla/5.0'];
 			for (const x of extra) a.push(x);
 			a.push(url);
 			try { os.exec(a, { block: true }); } catch (e) {}
@@ -513,10 +515,14 @@ async function main(std, os) {
 			method = 'RANGE';
 			m = text.match(/^HTTP\/[\d.]+\s+(\d{3})/m);
 		}
+		// -L 会保留中间跳的响应头块：只看最后一个块（否则会读到 301 而不是最终 200）
+		const blocks = text.split(/\r?\n\r?\n/).filter(b => /^HTTP\//m.test(b));
+		const final = blocks.length ? blocks[blocks.length - 1] : text;
 		const hdr = (name) => {
-			const r = text.match(new RegExp('^' + name + '\\s*:\\s*(.*)$', 'mi'));
+			const r = final.match(new RegExp('^' + name + '\\s*:\\s*(.*)$', 'mi'));
 			return r ? r[1].trim() : '';
 		};
+		m = final.match(/^HTTP\/[\d.]+\s+(\d{3})/m);
 		const status = m ? Number(m[1]) : 0;
 		const out = {
 			status, method,

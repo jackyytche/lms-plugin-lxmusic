@@ -1307,7 +1307,8 @@ sub _webPreview {
 				my $u = encode_entities($res->{url});
 				my $via = encode_entities(sprintf('[%s] %s%s', $res->{source} // '?', $res->{quality} // '?',
 					(defined $res->{actualKbps} ? " ~$res->{actualKbps}kbps" : '')
-					. ($res->{verified} ? ' verified' : '')));
+					. ($res->{verified} ? ' verified' : '')
+					. ($res->{suspect} ? ' ⚠ 码率异常低，疑似试听片段' : '')));
 				$html = '<div class="msg">OK (' . $elapsed . 's) ' . $title . ' — ' . $via
 					. '</div><p><audio controls src="' . $u . '" style="width:100%"></audio></p>'
 					. '<p><a href="' . $u . '">direct link</a> · <a href="?q=' . encode_entities($params->{q} || $track->{name} || '') . '">back to search</a></p>';
