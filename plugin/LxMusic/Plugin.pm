@@ -34,6 +34,7 @@ use Slim::Player::Client;
 
 use Plugins::LxMusic::Helper;
 use Plugins::LxMusic::ProtocolHandler;
+use Plugins::LxMusic::Sources;
 
 # 注册日志分类（LMS 调试页才会列出并可调级别；不注册则 warn/info 静默丢失——排障断腿）
 my $log = Slim::Utils::Log->addLogCategory({
@@ -53,7 +54,7 @@ sub initPlugin {
 		sourceContent  => '',
 		sourceName     => '',
 		quality        => '320k',
-		# ---- M0.5 设置页（0.6.0）新增 ----
+		# ---- 0.6.x 设置页 ----
 		bridgeTimeout  => 7,     # 桥级 per-request 超时（秒；migu 内部再打 3 折）
 		helperConcurrency => 2,  # Helper 并发子进程上限（整单入队风暴防护）
 		resolveTtl     => 600,   # 解析缓存 TTL（秒）
@@ -62,16 +63,19 @@ sub initPlugin {
 		boardsTx       => 1,
 		boardsWy       => 1,
 		boardsMg       => 1,
+		# ---- M0.6 多订阅源 / 音质 ----
+		sourcesJson    => '',    # 多订阅源注册表（JSON：顺序/启用/来源/元数据）
+		qualityFallback => 1,    # 源没有所选档位时自动降档（对齐 PC getPlayQuality）
+		verifyUrl      => 1,     # 取链后 HEAD 校验可播（挡掉 403/HTML 错误页 = 防"无声"）
 	});
 
 	unless (Plugins::LxMusic::Helper->init) {
 		$log->error('LxMusic: engine init FAILED, check server.log');
 	}
 
-	if (my $content = $prefs->get('sourceContent')) {
-		my $name = $prefs->get('sourceName') || 'current';
-		my $path = Plugins::LxMusic::Helper->installSource($name . '.js', $content);
-		$log->info('LxMusic: source restored: ' . ($path || 'FAILED'));
+	# 老版本（<=0.6.4）的单订阅源迁移到多源注册表（幂等，只在有老数据且注册表为空时动作）
+	if (Plugins::LxMusic::Sources->migrateLegacy) {
+		$log->warn('LxMusic: legacy single source migrated into the source registry');
 	}
 
 	if (main::WEBUI) {
@@ -660,10 +664,10 @@ sub webHandler {
 	}
 
 	my $src    = Plugins::LxMusic::Helper->sourceInfo;
-	my $status = $src->{installed}
-		? 'installed: ' . encode_entities($prefs->get('sourceName') || 'current.js')
-		  . ' (' . length($prefs->get('sourceContent') || '') . ' bytes)'
-		: 'no source imported';
+	my $status = $src->{enabled}
+		? 'sources: ' . $src->{enabled} . '/' . $src->{total} . ' enabled ('
+			. encode_entities(join(', ', @{ Plugins::LxMusic::Sources->status->{names} })) . ')'
+		: 'no source imported (' . $src->{total} . ' registered, none enabled)';
 
 	my $msgBlock = $msg ? '<div class="msg">' . $msg . '</div>' : '';
 	my $testBlock = $testHtml ? '<div class="msg">' . $testHtml . '</div>' : '';
@@ -705,48 +709,39 @@ sub _handleImport {
 		|| $content =~ /EVENT_NAMES/
 		|| $content =~ /lx\s*\.\s*on/);
 	my $safe = _safeName($name);
-	$prefs->set('sourceContent', $content);
-	$prefs->set('sourceName', $safe);
-	Plugins::LxMusic::Helper->installSource($safe . '.js', $content);
+	# M0.6：走多源注册表（installSource 已改为登记一条源；prefs 的 sourceContent/sourceName 退役）
+	my $path = Plugins::LxMusic::Helper->installSource($safe, $content);
+	return 'import failed: write error (see server.log)' unless $path;
 
+	my $st = Plugins::LxMusic::Sources->status;
 	return 'imported ' . ($looksOk ? '' : '(WARNING: does not look like an lx source) ')
-		. $safe . '.js, ' . length($content) . ' bytes';
+		. ($st->{names}[-1] // $safe) . ', ' . length($content) . ' bytes'
+		. "  [sources: $st->{enabled}/$st->{total} enabled]";
 }
 
 sub _testMusicUrl {
 	my ($mid, $client, $params, $callback, $httpClient, $response) = @_;
 
-	my $sourcePath = Plugins::LxMusic::Helper->currentSourcePath();
-	unless ($sourcePath) {
-		my $body = _page('no source imported', '', '');
-		$response->code(200);
-		$response->header('Content-Type' => 'text/html; charset=utf-8');
-		$callback->($client, $params, \$body, $httpClient, $response);
-		return;
-	}
-
 	my $started = time();
-	Plugins::LxMusic::Helper->request(
-		source   => $sourcePath,
-		action   => 'musicUrl',
-		sourceId => 'kw',
-		info     => {
-			musicInfo => { songmid => $mid },
-			type      => ($prefs->get('quality') || '320k'),
-		},
+	Plugins::LxMusic::Helper->resolveTrack(
+		music    => { songmid => $mid },
+		src      => 'kw',
+		type     => ($prefs->get('quality') || '320k'),
 		timeout  => 20,
 		cb       => sub {
 			my ($res) = @_;
 			my $elapsed = sprintf('%.2f', time() - $started);
 			my $text;
-			if ($res->{ok} && $res->{data} && !ref($res->{data})) {
-				$text = 'OK (' . $elapsed . 's): <a href="'
-					. encode_entities($res->{data}) . '">'
-					. encode_entities(substr($res->{data}, 0, 120)) . '</a>';
+			if ($res->{ok} && $res->{url}) {
+				$text = 'OK (' . $elapsed . 's) via [' . encode_entities($res->{source} // '?') . '] '
+					. encode_entities($res->{quality} // '?')
+					. (defined $res->{actualKbps} ? ' ~' . $res->{actualKbps} . 'kbps' : '')
+					. ($res->{verified} ? ' verified' : ' (未校验)')
+					. ': <a href="' . encode_entities($res->{url}) . '">'
+					. encode_entities(substr($res->{url}, 0, 120)) . '</a>';
 			}
 			else {
-				$text = 'FAIL (' . $elapsed . 's): '
-					. encode_entities($res->{error} || 'unknown');
+				$text = 'FAIL (' . $elapsed . 's): ' . encode_entities($res->{error} || 'unknown');
 				my $logs = join("\n", map { encode_entities($_) } @{ $res->{logs} || [] });
 				$text .= '<pre>' . $logs . '</pre>' if $logs;
 			}
@@ -1123,31 +1118,34 @@ sub _webPreview {
 
 	my $src     = $track->{source} || 'kw';
 	my $started = time();
-	Plugins::LxMusic::Helper->request(
-		source   => Plugins::LxMusic::Helper->currentSourcePath(),
-		action   => 'musicUrl',
-		sourceId => $src,
-		info     => {
-			musicInfo => $track,
-			type      => ($prefs->get('quality') || '320k'),
-		},
+	Plugins::LxMusic::Helper->resolveTrack(
+		music    => $track,
+		src      => $src,
+		type     => ($prefs->get('quality') || '320k'),
 		timeout  => 20,
 		cb       => sub {
 			my ($res) = @_;
 			my $elapsed = sprintf('%.2f', time() - $started);
 			my $title = encode_entities(($track->{name} || '?') . ($track->{singer} ? ' - ' . $track->{singer} : ''));
 			my $html;
-			if ($res->{ok} && $res->{data} && !ref($res->{data})) {
-				my $u = encode_entities($res->{data});
-				$html = '<div class="msg">OK (' . $elapsed . 's) ' . $title
+			if ($res->{ok} && $res->{url}) {
+				my $u = encode_entities($res->{url});
+				my $via = encode_entities(sprintf('[%s] %s%s', $res->{source} // '?', $res->{quality} // '?',
+					(defined $res->{actualKbps} ? " ~$res->{actualKbps}kbps" : '')
+					. ($res->{verified} ? ' verified' : '')));
+				$html = '<div class="msg">OK (' . $elapsed . 's) ' . $title . ' — ' . $via
 					. '</div><p><audio controls src="' . $u . '" style="width:100%"></audio></p>'
 					. '<p><a href="' . $u . '">direct link</a> · <a href="?q=' . encode_entities($params->{q} || $track->{name} || '') . '">back to search</a></p>';
 			}
 			else {
 				my $logs = join("\n", map { encode_entities($_) } @{ $res->{logs} || [] });
+				my $tries = join('; ', map {
+					encode_entities(($_->{source} // '?') . '@' . ($_->{quality} // '?') . ': ' . ($_->{why} // 'ok'))
+				} @{ $res->{tries} || [] });
 				$html = '<div class="msg">FAIL (' . $elapsed . 's) ' . $title . ': '
 					. encode_entities($res->{error} || 'unknown')
-					. '<br><b>note:</b> 取直链需已导入订阅源（lxm 源负责 musicUrl）'
+					. ($tries ? "<br><b>tries:</b> " . $tries : '')
+					. '<br><b>note:</b> 取直链需已导入并启用至少一个订阅源'
 					. ($logs ? "<pre>$logs</pre>" : '') . '</div>';
 			}
 			_respondPage($client, $params, $callback, $httpClient, $response, _page('', '', $html));

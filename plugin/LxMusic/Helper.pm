@@ -33,6 +33,8 @@ use Slim::Utils::Log;
 use Slim::Utils::Prefs;
 use Slim::Utils::Timers;
 
+use Plugins::LxMusic::Sources;
+
 my $log   = Slim::Utils::Log->logger('plugin.lxmusic');
 my $prefs = preferences('plugin.lxmusic');
 
@@ -91,6 +93,174 @@ sub pluginVersion {
 	return $PLUGIN_VERSION;
 }
 
+# ---------- M0.6 多订阅源解析（音质裁剪 + 顺序聚合 + 取链校验）----------
+# 对齐 PC 端语义（refs/lx-music-desktop）：
+#   · 音质：core/music/utils.ts:223-235 getPlayQuality()——从用户档位往下，取第一个
+#     「该曲目有 && 该源支持」的档位，一个都没有才退 128k；**只降不升**
+#   · 失败换源：core/music/utils.ts:291-334——逐源重试（429 不换源）
+#   · 实际码率：PC 端拿不到（源回传的 type 就是请求值，见 preload.js:83），
+#     我们用 HEAD 的 Content-Length ÷ 时长反推，避免"以为在听 flac 其实是 128k"
+my @QUALITY_LADDER = qw(flac24bit flac 320k 128k);   # PC: TRY_QUALITYS_LIST + 128k 兜底
+
+sub _pref { my ($k, $d) = @_; my $v = $prefs->get($k); return defined $v ? $v : $d }
+
+# 返回"该试哪些档位"（有序）——多源时外层按音质、内层按源，优先保音质
+sub qualityLadder {
+	my ($class, $want, $track, $declared) = @_;
+	$want = '320k' unless defined $want && length $want;
+	return ($want) unless _pref('qualityFallback', 1);
+
+	my $idx;
+	for my $i (0 .. $#QUALITY_LADDER) { $idx = $i, last if $QUALITY_LADDER[$i] eq $want }
+	my @list = defined $idx ? @QUALITY_LADDER[ $idx .. $#QUALITY_LADDER ] : ($want, '128k');
+
+	# 曲目实际具备的档位（搜索结果 types，对应 PC 的 musicInfo.meta._qualitys）
+	my %have = (ref($track->{types}) eq 'ARRAY')
+		? map { ($_->{type} => 1) } grep { ref $_ eq 'HASH' && $_->{type} } @{ $track->{types} }
+		: ();
+	# 源声明支持的档位（运行时探测；未知则不裁剪）
+	my %decl = ($declared && ref $declared eq 'ARRAY') ? map { ($_ => 1) } @$declared : ();
+
+	my @out = grep { (!%have || $have{$_}) && (!%decl || $decl{$_}) } @list;
+	my %seen;
+	@out = grep { !$seen{$_}++ } @out;
+	return @out ? @out : ('128k');
+}
+
+# 'mm:ss' / 'hh:mm:ss' / 秒数 -> 秒（与 Plugin::_secsOf 同语义）
+sub _secsOf {
+	my ($t) = @_;
+	my $iv = $t->{interval} // $t->{duration};
+	return undef unless defined $iv && $iv ne '';
+	return int($iv) if $iv =~ /^\d+$/;
+	my @p = split(/:/, $iv);
+	return undef unless @p;
+	my $s = 0;
+	$s = $s * 60 + ($_ || 0) for @p;
+	return $s > 0 ? $s : undef;
+}
+
+# 直链可播性探测（走 shim 的 probe：curl -I，不允许 HEAD 时退 Range 0-0）
+sub probeUrl {
+	my ($class, $url, $cb) = @_;
+	$class->request(
+		action  => 'probe',
+		info    => { url => $url, timeout => 8 },
+		timeout => 15,
+		cb      => sub {
+			my ($res) = @_;
+			my $d    = (ref($res->{data}) eq 'HASH') ? $res->{data} : {};
+			my $code = $d->{status} || 0;
+			my $type = lc($d->{type} // '');
+			# 只要不是 text/*（HTML 错误页）就放行：CDN 常用 octet-stream / 空 type
+			my $ok = $res->{ok} && $code >= 200 && $code < 300
+				&& ($type eq '' || $type =~ m{^(?:audio/|video/|application/(?:octet-stream|x-))});
+			$cb->({
+				ok     => $ok ? 1 : 0,
+				status => $code,
+				type   => $d->{type},
+				length => $d->{length},
+				method => $d->{method},
+				error  => $ok ? undef : ($code ? "HTTP $code" : ($res->{error} // 'no response'))
+					. ($type ne '' ? " type=$type" : ''),
+			});
+		},
+	);
+}
+
+# 多源解析：resolveTrack(music=>{}, src=>'kw', type=>'320k', cb=>sub{...})
+# cb 收到 { ok, url, source, quality, verified, actualKbps, tries=>[{source,quality,why|ok}] }
+sub resolveTrack {
+	my ($class, %a) = @_;
+	my $cb = $a{cb} or return;
+
+	my $track = (ref($a{music}) eq 'HASH') ? $a{music} : {};
+	my $wantVerify = defined $a{verify} ? $a{verify} : _pref('verifyUrl', 1);
+
+	my $sources = Plugins::LxMusic::Sources->enabled;
+	unless (@$sources) {
+		return $cb->({
+			ok    => 0,
+			error => '没有可用的订阅源（设置 → 插件 → LX Music → 订阅源）',
+			tries => [],
+		});
+	}
+
+	my @ladder = $class->qualityLadder($a{type}, $track, $a{declaredQualitys});
+	# 外层音质、内层源：优先保音质，同档位再依次换源（PC 只换源不降档，我们两者都做）
+	my @cand;
+	for my $q (@ladder) {
+		for my $s (@$sources) { push @cand, [ $q, $s ] }
+	}
+
+	my @tries;
+	my $next;
+	$next = sub {
+		my $cand = shift @cand;
+		unless ($cand) {
+			my @last = @tries > 3 ? @tries[ -3 .. -1 ] : @tries;
+			my $why = join('; ', map {
+				($_->{source} // '?') . '@' . ($_->{quality} // '?') . ': ' . ($_->{why} // '?')
+			} @last);
+			$why = '无候选' unless length $why;
+			$log->warn('LxMusic resolve FAILED after ' . scalar(@tries) . " tries: $why");
+			return $cb->({ ok => 0, error => "全部订阅源都取不到直链（$why）", tries => \@tries });
+		}
+		my ($q, $src) = @$cand;
+		my $path = Plugins::LxMusic::Sources->pathFor($src->{id});
+		unless ($path && -f $path) {
+			push @tries, { source => $src->{name}, quality => $q, why => 'file missing' };
+			return $next->();
+		}
+		$log->warn("LxMusic resolve: try [" . $src->{name} . "] type=$q");
+		$class->request(
+			source   => $path,
+			action   => 'musicUrl',
+			sourceId => ($a{src} // ''),
+			info     => { musicInfo => $track, type => $q },
+			timeout  => ($a{timeout} || 20),
+			cb       => sub {
+				my ($res) = @_;
+				my $url = $res->{data};
+				unless ($res->{ok} && defined $url && !ref($url) && $url =~ m{^https?://}) {
+					push @tries, { source => $src->{name}, quality => $q, why => ($res->{error} // 'no url') };
+					return $next->();
+				}
+				my $done = sub {
+					my ($verified, $kbps) = @_;
+					push @tries, { source => $src->{name}, quality => $q, ok => 1, verified => $verified, kbps => $kbps };
+					$log->warn("LxMusic resolve OK: [" . $src->{name} . "] type=$q verified=$verified"
+						. (defined $kbps ? " ~${kbps}kbps" : ''));
+					$cb->({
+						ok         => 1,
+						url        => $url,
+						source     => $src->{name},
+						sourceId   => $src->{id},
+						quality    => $q,
+						verified   => $verified,
+						actualKbps => $kbps,
+						tries      => \@tries,
+					});
+				};
+				return $done->(0) unless $wantVerify;
+				$class->probeUrl($url, sub {
+					my ($pi) = @_;
+					if ($pi->{ok}) {
+						my $secs = _secsOf($track);
+						my $kbps = ($pi->{length} && $secs) ? int($pi->{length} * 8 / 1000 / $secs) : undef;
+						return $done->(1, $kbps);
+					}
+					push @tries, { source => $src->{name}, quality => $q, why => 'verify: ' . ($pi->{error} // '?') };
+					$log->warn("LxMusic resolve: verify rejected [" . $src->{name} . "] $q: " . ($pi->{error} // '?'));
+					$next->();
+				});
+			},
+		);
+	};
+	$next->();
+	return;
+}
+
 # ---------- init ----------
 sub init {
 	my ($class) = @_;
@@ -143,55 +313,41 @@ sub init {
 # ---------- 订阅源安装 ----------
 my $CURRENT_SOURCE = File::Spec->catfile($SOURCES, 'current.js');
 
-# 当前生效的订阅源路径（导入/启动时装好；无源返回 undef）
+# 当前生效的订阅源路径 = 注册表里第一个"已启用"的源（M0.6 起多源，顺序即优先级）
+# 保留本方法名：工具页/试听/预取等"单源"调用点继续可用
 sub currentSourcePath {
 	my ($class) = @_;
-	return (-f $CURRENT_SOURCE) ? $CURRENT_SOURCE : undef;
+	return Plugins::LxMusic::Sources->firstEnabledPath;
 }
 
 sub sourceInfo {
 	my ($class) = @_;
-	return { installed => -f $CURRENT_SOURCE ? 1 : 0, path => $CURRENT_SOURCE };
+	my $st = Plugins::LxMusic::Sources->status;
+	return {
+		installed => ($st->{enabled} ? 1 : 0),
+		path      => $class->currentSourcePath,
+		total     => $st->{total},
+		enabled   => $st->{enabled},
+		dir       => $st->{dir},
+	};
 }
 
+# 兼容入口：M0.6 起"导入源"= 往多订阅源注册表加一条记录
+# （元数据落 prefs `sourcesJson`，正文落持久目录 <prefsdir>/lxmusic/sources/<id>.js）。
+# 旧语义是"写 /tmp 的 current.js"，现在多源并存，current.js 概念取消。
+# 返回落盘路径（老调用点按 "path or undef" 判定成功）。
 sub installSource {
 	my ($class, $name, $content) = @_;
-	# 浏览器 textarea 提交把换行规范成 CRLF；lx 源的完整性签名基于原版 LF 内容，
-	# 必须在落盘前统一回 LF，否则 qjs 端 rawScript hash 与官方不一致（服务端 403）。
-	$content =~ s/\r\n/\n/g;
-
-	# 落盘统一用 :encoding(UTF-8)，所以这里必须是"字符"串：
-	#   - 浏览器粘贴路径：LMS 已 utf8decode（旗标串）→ 原样
-	#   - URL 下载路径（_fetch/curl）：拿到的是原始 UTF-8 字节 → 必须解码，
-	#     否则每个非 ASCII 字节被再编码一次（设备实测：64094 B 的源落盘成 72249 B，
-	#     源文件被改坏 ⇒ 签名握手失败、取不到直链）
-	#   - 非法 UTF-8 字节（二进制）：保留原值，尽量不改动用户给的内容
-	if (!utf8::is_utf8($content)) {
-		my $decoded = eval { Encode::decode('UTF-8', $content, Encode::FB_CROAK()) };
-		$content = $decoded if defined $decoded;
-	}
-
-	$name =~ s/\.{2,}/_/g;                   # 收敛连续点（防穿越）
-	$name =~ s/[^\w.-]/_/g;                  # 防非法字符
-	$name =~ s/^[.\-]+//;                    # 首字符须为字母数字下划线
-	mkpath($SOURCES);
-	my $path = File::Spec->catfile($SOURCES, $name);
-	open(my $fh, '>:encoding(UTF-8)', $path) or do {
-		$log->error("LxMusic Helper: write source $path: $!");
+	my ($rec, $err) = Plugins::LxMusic::Sources->addContent(
+		content => $content,
+		name    => $name,
+		origin  => 'import',
+	);
+	unless ($rec) {
+		$log->error("LxMusic Helper: installSource failed: $err");
 		return undef;
-	};
-	print {$fh} $content;
-	close $fh;
-	# current.js = 当前生效源（request 固定用它，简化协议处理器）
-	if ($path ne $CURRENT_SOURCE) {
-		open(my $cf, '>:encoding(UTF-8)', $CURRENT_SOURCE) or do {
-			$log->error("LxMusic Helper: write current source: $!");
-			return undef;
-		};
-		print {$cf} $content;
-		close $cf;
 	}
-	return $path;
+	return Plugins::LxMusic::Sources->pathFor($rec->{id});
 }
 
 # ---------- 异步请求 ----------
@@ -208,7 +364,11 @@ sub request {
 	$action or do { $cb->(_err('action required')); return };
 
 	# sdk 模式（vendored musicSdk）：第一个参数是 sdk.bundle.js，无需订阅源
-	if ($action eq 'search' || $action eq 'boards' || $action eq 'boardlist'
+	# probe 模式：只需要 shim + 系统 curl（探测直链是否真的可播），也不需要源
+	if ($action eq 'probe') {
+		$source = $SHIM;
+	}
+	elsif ($action eq 'search' || $action eq 'boards' || $action eq 'boardlist'
 		|| $action eq 'songlist' || $action eq 'songlistdetail') {
 		-f $SDK or do { $cb->(_err('sdk bundle not installed (search/browse disabled)')); return };
 		$source = $SDK;

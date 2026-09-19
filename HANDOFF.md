@@ -2,7 +2,10 @@
 
 > **下个 session 恢复方式**：直接说「继续 lx-music 插件，先读 HANDOFF.md」。
 > **权威事实源**：本文档 + 磁盘（`plugin/` 源码、`repo/` 发布仓、`dist/` 打包产物、`refs/` 参考克隆、`tmp/` 工具）。
-> **一句话现状**（2026-09-20）：**M0.1~M0.5 全部完工并由用户设备实测验收**，设备运行 **0.6.4**。M0.5 设置页 8 个分区全部渲染（纯 ASCII+数字实体，零乱码），诊断块显示版本/引擎/日志级别/源路径与字节数；**逐项保存验证通过**：音质 320k↔flac 立即生效、超时/并发/TTL 落 prefs、榜单源开关改菜单（count 8↔7）、封面代理开关改列表 image（代理 URL ↔ CDN 直链）、订阅源 **粘贴/URL 导入（64094 B 精确落盘）+ 清除 + 重启从 prefs 恢复 + 取直链 OK**。**设置入口已补齐**（0.6.4：install.xml `<optionsURL>` → 插件行 Settings 链接；`strings.txt`+token `name()` → 设置下拉显示 "LX Music" 而非空白行）。**代码尚未发到 GitHub（远端仍只有 v0.5.9）**——要发版：GH 基址 pack → release v0.6.4（需用户提供 PAT）。
+> **一句话现状**（2026-09-20 晚）：**M0.1~M0.5 完工并验收；M0.6（多订阅源 + 音质降级/校验）已实现并上机验证**，设备运行 **0.7.2**。
+> M0.6 交付：`Sources.pm` 多源注册表（元数据进 prefs `sourcesJson`、正文落**持久目录** `<prefsdir>/lxmusic/sources/`）、设置页重构为「在线订阅 / 本地导入（服务器文件选择器读路径）/ 源列表（启用·排序·重拉·删除）/ 音质（上限+自动降级+HEAD 校验）」、解析链改为 **外层音质内层源** 的聚合兜底 + `curl -I` 校验 + **实测码率上报**。
+> 设备实测：URL 导入/去重/目录导入/启停/排序/删除全通；取链 `OK (2.4s) [独家音源] 320k ~320kbps verified`。**内置源兜底不可行**（vendor 的 `api-source.js` 里 `allApi={}`）——取直链必须至少 1 个启用源。
+> 代码仍未发 GitHub（远端只有 v0.5.9）：要发版就 GH 基址 pack → release **v0.7.2**（需用户 PAT）。设计/调研见 `docs/m0.6-source-management-and-quality-design.md` 与 `docs/lx-desktop-settings-forensics.md`。
 
 ---
 
@@ -27,7 +30,9 @@
 | **M0.4** 体验对齐桌面版（封面/视图/分页/提速/封面兜底） | ✅ | 0.5.9 | 用户实测：**网格/列表切换 ✓、kw 封面 ✓、mg 封面 ✓、速度可接受**；kg 封面经代理修复（设备侧 200/image-jpeg） |
 | **M0.5** 设置页 | ✅ | **0.6.4** | 入口：设置 → 插件 的 LX Music 行有 **Settings** 链接（`<optionsURL>`）+ 设置下拉有条目 `label="LX Music"` 且 `selected`；页面 100% ASCII 实体渲染（非 ASCII 字节 0、乱码 0，8 个分区标签齐全）；诊断块 = 版本 / 引擎 ok（qjs+shim+sdk 就绪）/ 日志级别 / 源路径 / 源 64094 B；保存验证：quality 320k↔flac（工具页同步读到）、bridgeTimeout 9 / concurrency 3 / TTL 300 落盘后复原、boardsWy 关闭后菜单 count 8→7 且只剩 kg/tx/mg、coverProxy 关闭后列表 image 由 `/plugins/LxMusic/cover?u=` 变 `imge.kugou.com` 直链、导入(URL+粘贴)/清除/重启恢复 + 取直链 OK 2.2s |
 
-**设备现状**：达菲 192.168.2.111 运行 **0.6.4**（页面 `/plugins/LxMusic/index.html` 显示的版本号＝运行中代码版本，由 `Helper::pluginVersion` 直读 install.xml，是唯一可靠判据）。
+**设备现状**：达菲 192.168.2.111 运行 **0.7.2**（页面 `/plugins/LxMusic/index.html` 显示的版本号＝运行中代码版本，由 `Helper::pluginVersion` 直读 install.xml，是唯一可靠判据）。
+
+| **M0.6** 多源/音质 | ✅ | **0.7.2** | 设备实测：老单源自动迁移进注册表（独家音源 64094 B）；URL 导入成功 + 同内容去重 + 目录导入逐个判重；行内启用/上移下移/删除均持久；取链 `OK (2.4s) [独家音源] 320k ~320kbps verified`（音质裁剪 + HEAD 校验 + **实测码率**）；无源时页面红字提示且取链报明确错误（不再静默无声）。设置页 100% ASCII 实体、`selectFile/selectFolder` 文件选择器字段就位 |
 
 ---
 
@@ -85,7 +90,10 @@ XMLBrowser 菜单 / 网页  →  Plugin.pm（feed handlers / webHandler）
 | 0.6.1 | 修设置页两处：模板 `params.X`→顶层变量（诊断值原本全空）、模板中文双重编码 → 改纯 ASCII+数字实体（生成器） |
 | 0.6.2 | pack.py 固定 zip 时间戳 → TT 编译缓存永不失效（0.6.1 的模板改动根本没生效）；改为打包时刻 |
 | **0.6.3** | 订阅源编码两修：URL 下载字节串必须 decode（64094→72249 的二次编码）、导入不得裁剪首尾空白（少 1 字节就改签名）；`_u()` 改 FB_CROAK+回退；日志级别改用 `allCategories()` |
-| **0.6.4（当前设备）** | 补设置入口：install.xml `<optionsURL>`（插件行 Settings 链接）+ `strings.txt` 与 token 化 `name`/`description`（设置下拉不再是空白行） |
+| **0.6.4（上一轮设备版）** | 补设置入口：install.xml `<optionsURL>`（插件行 Settings 链接）+ `strings.txt` 与 token 化 `name`/`description`（设置下拉不再是空白行） |
+| 0.7.0 | M0.6 主体：`Sources.pm` 多源注册表 + 设置页重构（在线订阅/本地导入/源列表/音质）+ `Helper::resolveTrack`（音质裁剪·多源聚合·HEAD 校验）+ shim `probe` action + 老单源迁移 |
+| 0.7.1 | 工具页两条取链（试听/Play test）也切到 resolveTrack，页面显示 `[源] 档位 ~实测码率 verified` |
+| **0.7.2（当前设备）** | 修"混旗标串"双重编码（设置页消息乱码，见 §5.5.34）；install.xml 中文注释被 PowerShell `Set-Content` 写坏后复原（§5.5.36） |
 
 ---
 
@@ -170,6 +178,20 @@ XMLBrowser 菜单 / 网页  →  Plugin.pm（feed handlers / webHandler）
     - 注意：chooser 的 URL 跳转表是**按注册值生成**的，所以漏 token 时导航 case 仍在（`case "LX Music"`），
       症状只表现为"看不见/点不了"——别被"JS 里有 case"误导。
 
+### 5.6 多源 / 音质 / 编码（M0.6 现场，3 条）
+34. **"混旗标串"会把中文字面量按字节逐个转义 ⇒ 双重编码乱码**：本插件的 `.pm` 中文字面量是**字节串**，
+    而 JSON 解出的值（源名/路径）是**旗标串**；`'已添加在线订阅：' . $rec->{name}` 一拼，整串变旗标串，
+    字面量的每个字节被当成一个字符 ⇒ 上层 `_ent`/`encode_entities` 逐字节转义 ⇒ 页面显示 `å·²æ·»å `。
+    **修法：拼文案一律走 `_m(@parts)`（先把每个片段 `_chars` 归一，再 join）**，`Settings.pm` 与 `Sources.pm`
+    各有一份。同族坑见 §5.3.19（join 分隔符）。判据：消息里出现"部分中文正常、部分乱码"就是它。
+35. **prefs 里存 JSON 不要用 `JSON::XS->utf8`**：`utf8` 模式产出的是"含高位字节的字节串"，
+    落到 `YAML::XS::Dump`（`Prefs/Namespace.pm:327`）会出二进制/乱码风险。用**字符模式**（非 ASCII 转 `\uXXXX`，
+    落盘纯 ASCII，读写往返稳定）。另：`plugin/t_local/JSON/XS.pm` 原来是手写假实现（不转义非 ASCII、
+    decode 直接喂 decode_json），会把"存进去读不出来"这类问题在本地测试里静默掩盖——已换成 **JSON::PP 薄封装**。
+36. **`Set-Content` 又写坏了一次中文**（install.xml 注释，第四次）：改文件**只用 write/edit 工具**，
+    连"只改个版本号"也别用 PowerShell（`-replace | Set-Content` 会按 ANSI 读、UTF8 写）。
+    另：改 `.pm` 里中文时若用脚本批量替换，替换后务必 `perl -c` + 跑一次设备页面验收。
+
 ---
 
 ## 六、自主开发闭环（下个 session 直接复用）
@@ -191,6 +213,7 @@ XMLBrowser 菜单 / 网页  →  Plugin.pm（feed handlers / webHandler）
    - `tmp/mk_settings_template.py` — 设置页模板生成器（改文案改这里，生成纯 ASCII 实体模板）。
    - 编码取证脚本：`tmp/probe_mojibake.py`、`tmp/probe_surfaces.py`、`tmp/probe_template_gen.py`（判定"渲染的是哪一代模板"）。
    - 入口取证脚本：`tmp/probe_settings_entry.py`（设置下拉条目 + 插件行 Settings 链接 + selected）、`tmp/probe_chooser_option.py`、`tmp/probe_chooser_js.py`、`tmp/probe_plugin_row_text.py`。
+   - M0.6 新增：`tmp/verify_sources_page.py`（源列表/导入字段/音质控件体检）、`tmp/m0_6_acceptance.py`（多源全流程验收：导入/去重/目录/启停/排序/删除/取链）、`tmp/restore_source.py`（把设备源复原成样本源）、`tmp/test_sources.pl`（Sources.pm 单测）、`tmp/probe_url_playable.py`（HEAD/Range 可播性）、`tmp/probe_source_info.py`（源脚本头/平台能力）。
    - `tmp/lx_set_loglevel.py [LEVEL]` — 查看/整表回放设置某个日志类别级别（带 `persist=1`，重启仍生效）。
 
 **播放器**：HiBy FC4 `5a:78:10:59:c7:74`（用户主用，验证目标）；HD-Audio Generic `5a:bf:86:1b:a6:ff`（本机声卡）；小爱音箱 squeezelite `bb:bb:69:a9:cf:23`（**会出声，勿用**）。
@@ -199,15 +222,19 @@ XMLBrowser 菜单 / 网页  →  Plugin.pm（feed handlers / webHandler）
 
 ## 七、下个 session 待办（按序）
 
-1. **发版 v0.6.4（待定，需用户提供 PAT）**——远端 GitHub 目前只有 v0.5.9，本轮 0.6.0~0.6.4 全在本地。
-   - 步骤：不设 `LX_REPO_BASE` 跑 `pack.py`（生成 GH 基址 zip + repo.xml）→ `dist/LxMusic-0.6.4.zip` + `repo.xml` 作为 `v0.6.4` release 资产 → 终验 `releases/latest/download/repo.xml` 版本号与 zip sha 逐字节一致。
+1. **发版 v0.7.2（待定，需用户提供 PAT）**——远端 GitHub 目前只有 v0.5.9，本轮 0.6.0~0.7.2 全在本地。
+   - 步骤：不设 `LX_REPO_BASE` 跑 `pack.py`（生成 GH 基址 zip + repo.xml）→ `dist/LxMusic-0.7.2.zip` + `repo.xml` 作为 `v0.7.2` release 资产 → 终验 `releases/latest/download/repo.xml` 版本号与 zip sha 逐字节一致。
    - 新装用户注意：`pack.py` 已保证每次打包 zip 时间戳变新（见 §5.5.30），否则改模板不生效。
-   - 推送：本地 `repo/` 未配 remote，用 `git push https://x-access-token:<token>@github.com/jackyytche/lms-plugin-lxmusic main`（token 只内联，不落盘）；main 本地已领先远端 5 个提交，是快进推送。
-   - 发布命令备忘：`curl -X POST https://api.github.com/repos/<owner>/<repo>/releases`（Bearer token）+ `uploads.github.com/.../assets?name=…`；`tmp/gh_release_create.py` 已封装。
-2. **M0.6 候选**：常驻 qjs worker（把冷解析 ~2.3s 降到接近 0，桌面版体感）；搜索渐进式出结果；kw 榜单（上游签名已失效，需重新逆向或放弃）。
-3. **遗留清理**：`repo/plugin/helper-test.log`、`tmp/` 脚本归置（本轮新增 6 个验收脚本，建议保留）；`dist/lx-6.js`（LAN 供 URL 导入测试的样本，可留可删）。
-4. **PAT 撤销**：本轮未用 PAT；下轮发布用完**立即提醒用户撤销**。
-5. **设备侧收尾（✅ 本 session 已完成）**：`plugin.lxmusic` 日志级别已从 DEBUG 调回 **ERROR** 并验证重启后仍为 ERROR。改法：`_research/lx-music-daphile-plugin/tmp/lx_set_loglevel.py ERROR`（整表回放调试页表单，**必须带 `persist=1`**，不带则重启失效）；只想看当前值就不带参数跑。
+   - 推送：本地 `repo/` 未配 remote，用 `git push https://x-access-token:<token>@github.com/jackyytche/lms-plugin-lxmusic main`（token 只内联，不落盘）；main 本地已领先远端，快进推送即可。
+2. **M0.6 收尾候选（见 `docs/m0.6-source-management-and-quality-design.md` §四.2）**：
+   - 每源"最近失败冷却"（连续点歌时不反复撞死源；PC 端是"服务器繁忙不换源 + 随机 2–6s 重试"）
+   - **不喜欢歌曲规则**（`歌曲名@艺术家` 三态，出搜索结果前过滤）——PC 端最契合服务端的一项
+   - **多平台聚合搜索 + 相似度重排**（PC `store/search/music/action.ts`）——比"源聚合"更影响体感
+   - `autoSkipOnError`（全源失败后交给 LMS 跳下一曲的开关）、直链缓存上限语义、繁简转换、代理、热门搜索
+3. **M0.7 候选**：常驻 qjs worker（把冷解析 ~2.3s 降到接近 0）；kw 榜单（上游签名失效，需重新逆向或放弃）。
+4. **遗留清理**：`repo/plugin/helper-test.log`、`tmp/` 脚本归置（本轮新增 6 个验收脚本，建议保留）；`dist/lx-6.js`、`dist/qdy.js`（LAN 供导入测试的样本）。
+5. **PAT 撤销**：本轮未用 PAT；下轮发布用完**立即提醒用户撤销**。
+6. **设备侧现状**：`plugin.lxmusic` 日志级别 = **ERROR**（§七 上一轮已调回）；源 = 「独家音源」（在线订阅 `http://192.168.2.68:8765/lx-6.js`，64094 B，启用）。
 6. **发布历史（✅ 2026-09-19）**：GitHub `jackyytche/lms-plugin-lxmusic`
    - main 已推：`a5af529..2b28c48`（`2b28c48` = 0.3.0→0.5.9 + 设置页 WIP 单一提交，含 vendored sdk 树 0.23MB 以便复现）
    - **Release `v0.5.9`**（id `392124985`）：资产 `LxMusic-0.5.9.zip`（1231509 B，SHA1 `c0959eb82a8f5d968c3e51de8e160c9cb4875180`）+ `repo.xml`（GH 基址）

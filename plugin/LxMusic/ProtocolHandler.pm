@@ -197,21 +197,19 @@ sub _prefetch_next {
 	return if _cache_get($nextUrl);            # 已有缓存不必再取
 
 	my $ninfo = eval { $class->parseUrl($nextUrl) } or return;
-	my $sourcePath = Plugins::LxMusic::Helper->currentSourcePath() or return;
 
 	$log->info('LxMusic: prefetch next (' . ($ninfo->{name} || '') . ')');
-	Plugins::LxMusic::Helper->request(
-		source   => $sourcePath,
-		action   => 'musicUrl',
-		sourceId => $ninfo->{src},
-		info     => { musicInfo => $ninfo->{music}, type => $ninfo->{type} },
-		timeout  => 20,
-		cb       => sub {
+	Plugins::LxMusic::Helper->resolveTrack(
+		music   => $ninfo->{music},
+		src     => $ninfo->{src},
+		type    => $ninfo->{type},
+		timeout => 20,
+		verify  => 0,                       # 预取只预热：不额外花一次 HEAD
+		cb      => sub {
 			my ($res) = @_;
-			my $direct = $res->{data};
-			if ($res->{ok} && $direct && !ref($direct) && $direct =~ /^https?:/) {
-				_cache_put($nextUrl, $direct);
-				$log->info('LxMusic: prefetched ok');
+			if ($res->{ok} && $res->{url}) {
+				_cache_put($nextUrl, $res->{url});
+				$log->info('LxMusic: prefetched ok via [' . ($res->{source} // '?') . ']');
 			}
 			else {
 				$log->debug('LxMusic: prefetch failed: ' . ($res->{error} || 'unknown'));
@@ -235,21 +233,18 @@ sub warmTracks {
 		next if _cache_get($u);
 
 		my $info = eval { $class->parseUrl($u) } or next;
-		my $sourcePath = Plugins::LxMusic::Helper->currentSourcePath() or last;
 
 		$n++;
 		$log->info('LxMusic: warm ' . $n . ' (' . ($info->{name} || '') . ')');
-		Plugins::LxMusic::Helper->request(
-			source   => $sourcePath,
-			action   => 'musicUrl',
-			sourceId => $info->{src},
-			info     => { musicInfo => $info->{music}, type => $info->{type} },
-			timeout  => 20,
-			cb       => sub {
+		Plugins::LxMusic::Helper->resolveTrack(
+			music   => $info->{music},
+			src     => $info->{src},
+			type    => $info->{type},
+			timeout => 20,
+			verify  => 0,                   # 预热不校验（真正播放时还会走一次带校验的解析）
+			cb      => sub {
 				my ($res) = @_;
-				my $direct = $res->{data};
-				_cache_put($u, $direct)
-					if $res->{ok} && $direct && !ref($direct) && $direct =~ /^https?:/;
+				_cache_put($u, $res->{url}) if $res->{ok} && $res->{url};
 			},
 		);
 	}
@@ -341,35 +336,39 @@ sub scanUrl {
 		return;
 	}
 
-	my $sourcePath = Plugins::LxMusic::Helper->currentSourcePath();
-	unless ($sourcePath) {
-		$log->error('LxMusic: no source imported yet');
-		$cb->(undef);
-		return;
-	}
+	# M0.6：多订阅源聚合 + 音质降级链 + 取链后校验（Helper::resolveTrack）
+	# 以前的"无源就 cb(undef) 静默失败"改成把原因写进元数据，客户端/日志都看得见
+	$log->info('LxMusic: resolving src=' . $info->{src} . ' want=' . $info->{type});
 
-	$log->info('LxMusic: resolving musicUrl src=' . $info->{src} . ' type=' . $info->{type});
-
-	Plugins::LxMusic::Helper->request(
-		source   => $sourcePath,
-		action   => 'musicUrl',
-		sourceId => $info->{src},
-		info     => { musicInfo => $info->{music}, type => $info->{type} },
-		timeout  => 20,
-		cb       => sub {
+	Plugins::LxMusic::Helper->resolveTrack(
+		music   => $info->{music},
+		src     => $info->{src},
+		type    => $info->{type},
+		timeout => 20,
+		cb      => sub {
 			my ($res) = @_;
 
-			my $direct = $res->{data};
-			unless ($res->{ok} && $direct && !ref($direct) && $direct =~ /^https?:/) {
-				my $why = $res->{error} || ($res->{ok} ? 'handler returned no url' : 'unknown');
-				$log->error('LxMusic: musicUrl failed: ' . ($why // 'unknown'));
+			unless ($res->{ok} && $res->{url}) {
+				my $why = $res->{error} || 'unknown';
+				$log->error('LxMusic: resolve failed: ' . $why);
 				$class->cache_metadata($url, { title => $info->{name}, error => $why });
 				$cb->(undef);
 				return;
 			}
 
-			$log->info('LxMusic: resolved ' . substr($direct, 0, 80));
+			my $direct = $res->{url};
+			$log->info(sprintf('LxMusic: resolved via [%s] type=%s verified=%s%s',
+				$res->{source} // '?', $res->{quality} // '?', $res->{verified} ? 1 : 0,
+				(defined $res->{actualKbps} ? " ~$res->{actualKbps}kbps" : '')));
 			_cache_put($url, $direct);
+
+			# 实际档位/码率如实进队列元数据（PC 端拿不到这个信息，我们靠 HEAD 反推）
+			$class->cache_metadata($url, {
+				title     => $info->{name},
+				source    => $res->{source},
+				quality   => $res->{quality},
+				kbps      => $res->{actualKbps},
+			});
 
 			# 直链是实际流地址；playlist 里保持稳定的 lxm:// URL
 			$class->_finish_resolve($song, $url, $info, $direct, $args, $cb);

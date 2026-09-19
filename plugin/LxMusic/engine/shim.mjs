@@ -474,6 +474,64 @@ async function main(std, os) {
 	}
 	const [sourcePath, action, infoJson] = args;
 
+	// ---------- probe 模式：直链可播性探测（M0.6"取链后校验"）----------
+	// qjs shim.mjs <任意存在的文件> probe {"url":"...","timeout":8}
+	//   → RESULT { ok, data:{ status, method, type, length, range, acceptRanges } }
+	// 先 HEAD；CDN 不允许 HEAD（403/405）时退 Range 0-0（只传 1 字节）。
+	// 目的：把 403/HTML 错误页挡在播放器之外——那是"选了 flac 却无声"的常见成因。
+	if (action === 'probe') {
+		let payload = {};
+		try { payload = JSON.parse(infoJson || '{}') || {} } catch (e) {}
+		if (payload && payload.info && typeof payload.info === 'object') payload = payload.info;
+		const url = String(payload.url || '');
+		if (!/^https?:\/\//i.test(url)) {
+			print('RESULT ' + JSON.stringify({ ok: false, error: 'probe: bad url' }));
+			std.exit(1);
+		}
+		const tmo = Math.max(3, Math.min(20, Number(payload.timeout) || 8));
+		const base = ((os.getenv && os.getenv('LX_TMP')) || '/tmp') + '/lxp_' + Date.now() + '_' + Math.floor(Math.random() * 1e6);
+		const hdrF = base + '.hdr';
+		const run = (extra) => {
+			const a = ['curl', '-sS', '--max-time', String(tmo), '-o', '/dev/null', '-D', hdrF,
+				'-A', 'Mozilla/5.0'];
+			for (const x of extra) a.push(x);
+			a.push(url);
+			try { os.exec(a, { block: true }); } catch (e) {}
+			let text = '';
+			try {
+				const f = std.open(hdrF, 'r');
+				if (f) { for (;;) { const l = f.getline(); if (l == null) break; text += l + '\n'; } f.close(); }
+			} catch (e) {}
+			try { os.remove(hdrF); } catch (e) {}
+			return text;
+		};
+		let text = run(['-I']);
+		let method = 'HEAD';
+		let m = text.match(/^HTTP\/[\d.]+\s+(\d{3})/m);
+		if (!m || Number(m[1]) >= 400) {
+			text = run(['-r', '0-0']);
+			method = 'RANGE';
+			m = text.match(/^HTTP\/[\d.]+\s+(\d{3})/m);
+		}
+		const hdr = (name) => {
+			const r = text.match(new RegExp('^' + name + '\\s*:\\s*(.*)$', 'mi'));
+			return r ? r[1].trim() : '';
+		};
+		const status = m ? Number(m[1]) : 0;
+		const out = {
+			status, method,
+			type: hdr('content-type'),
+			length: Number(hdr('content-length')) || 0,
+			range: hdr('content-range'),
+			acceptRanges: hdr('accept-ranges'),
+		};
+		const ok = status >= 200 && status < 300;
+		print('LOG probe ' + JSON.stringify(out));
+		print('RESULT ' + JSON.stringify({ ok, data: out, error: ok ? undefined : (status ? 'HTTP ' + status : 'no response') }));
+		std.out.flush();
+		std.exit(ok ? 0 : 1);
+	}
+
 	// ---------- SDK 模式（vendored musicSdk，无需订阅源） ----------
 	// qjs shim.mjs <sdk.bundle.js> <search|boards|boardlist|songlist|songlistdetail> <payloadJSON>
 	//   search    payload = { query, source?, page?, limit? }
