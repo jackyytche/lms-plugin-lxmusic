@@ -178,6 +178,7 @@ XMLBrowser 菜单 / 网页  →  Plugin.pm（feed handlers / webHandler）
    - `tmp/test_ent.pl` — `Settings::_ent()` 单测（字节串/旗标串都要出纯 ASCII 实体）。
    - `tmp/mk_settings_template.py` — 设置页模板生成器（改文案改这里，生成纯 ASCII 实体模板）。
    - 编码取证脚本：`tmp/probe_mojibake.py`、`tmp/probe_surfaces.py`、`tmp/probe_template_gen.py`（判定"渲染的是哪一代模板"）。
+   - `tmp/lx_set_loglevel.py [LEVEL]` — 查看/整表回放设置某个日志类别级别（带 `persist=1`，重启仍生效）。
 
 **播放器**：HiBy FC4 `5a:78:10:59:c7:74`（用户主用，验证目标）；HD-Audio Generic `5a:bf:86:1b:a6:ff`（本机声卡）；小爱音箱 squeezelite `bb:bb:69:a9:cf:23`（**会出声，勿用**）。
 
@@ -192,7 +193,7 @@ XMLBrowser 菜单 / 网页  →  Plugin.pm（feed handlers / webHandler）
 2. **M0.6 候选**：常驻 qjs worker（把冷解析 ~2.3s 降到接近 0，桌面版体感）；搜索渐进式出结果；kw 榜单（上游签名已失效，需重新逆向或放弃）。
 3. **遗留清理**：`repo/plugin/helper-test.log`、`tmp/` 脚本归置（本轮新增 6 个验收脚本，建议保留）；`dist/lx-6.js`（LAN 供 URL 导入测试的样本，可留可删）。
 4. **PAT 撤销**：本轮未用 PAT；下轮发布用完**立即提醒用户撤销**。
-5. **设备侧收尾（可选）**：`plugin.lxmusic` 日志级别仍为上一 session 排障留下的 **DEBUG**（会持续写 server.log）；不需要时在「高级 → 日志」调回 ERROR（`_research/ximalaya-daphile-plugin/m0/diag_settings_form.py` 可整表回放）。
+5. **设备侧收尾（✅ 本 session 已完成）**：`plugin.lxmusic` 日志级别已从 DEBUG 调回 **ERROR** 并验证重启后仍为 ERROR。改法：`_research/lx-music-daphile-plugin/tmp/lx_set_loglevel.py ERROR`（整表回放调试页表单，**必须带 `persist=1`**，不带则重启失效）；只想看当前值就不带参数跑。
 6. **发布历史（✅ 2026-09-19）**：GitHub `jackyytche/lms-plugin-lxmusic`
    - main 已推：`a5af529..2b28c48`（`2b28c48` = 0.3.0→0.5.9 + 设置页 WIP 单一提交，含 vendored sdk 树 0.23MB 以便复现）
    - **Release `v0.5.9`**（id `392124985`）：资产 `LxMusic-0.5.9.zip`（1231509 B，SHA1 `c0959eb82a8f5d968c3e51de8e160c9cb4875180`）+ `repo.xml`（GH 基址）
@@ -203,7 +204,7 @@ XMLBrowser 菜单 / 网页  →  Plugin.pm（feed handlers / webHandler）
 
 - **设备**：达菲 `192.168.2.111`（LMS 9.0.3 / perl 5.40；Web `:9000`，CGI `:80`）；运行 **0.6.3**。
 - **通道**：达菲订阅 = **LAN** `http://192.168.2.68:8765/repo.xml?v=37`（8765 常驻 `python -m http.server` 指向 `dist/`；**进程易失**，掉线就在 `dist/` 重启；`?v=N` 是 LMS 仓库缓存的破除参数，每次装机 +1）。
-- **设备侧现状**：订阅源 = `current`（**64094 B**，内容 = `refs/samples/lx-6.js`，字节精确；名字仅显示用）；prefs 全默认（quality 320k / bridgeTimeout 7 / helperConcurrency 2 / resolveTtl 600 / coverProxy on / boards 全 on）；`plugin.lxmusic` 日志级别 = DEBUG（见 §七.5）。
+- **设备侧现状**：订阅源 = `current`（**64094 B**，内容 = `refs/samples/lx-6.js`，字节精确；名字仅显示用）；prefs 全默认（quality 320k / bridgeTimeout 7 / helperConcurrency 2 / resolveTtl 600 / coverProxy on / boards 全 on）；`plugin.lxmusic` 日志级别 = **ERROR**（本轮已从 DEBUG 调回并验证持久）。
 - **本机 IP/仓库基址**：`192.168.2.68:8765`（**DHCP 可能变化**，变了要同步 `dist/repo.xml` 的 URL 与 pack.py 的 `LAN_BASE`）。
 - **GitHub**：`jackyytche/lms-plugin-lxmusic`；PAT 由用户在需要时提供（**勿写入文件**；撤销提醒见 §七.4）。
 - **订阅源样本**：`refs/samples/lx-6.js`（= `lx-music-source-v6-fixed.js` = `lx-latest.js`，64094 B，与 pdone/lx-music-source 官方 `lx/6.js` 逐字节一致；`dist/lx-6.js` 是给设备做 URL 导入测试的 LAN 副本）。
