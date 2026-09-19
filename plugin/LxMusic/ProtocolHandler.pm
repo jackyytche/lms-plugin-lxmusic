@@ -314,6 +314,54 @@ sub _publish_cover {
 	return 0;
 }
 
+# ---------- 播放失败自动跳下一曲（pref autoSkipOnError，对齐 PC player.autoSkipOnError）----------
+my %SKIPPED;      # url => ts      同一 URL 60s 内只跳一次
+my %SKIP_BURST;   # clientid => [ts,...]
+
+sub _auto_skip {
+	my ($class, $song, $url, $why) = @_;
+	return 0 unless $prefs->get('autoSkipOnError');
+
+	# PC 语义：服务器繁忙（429 / too many requests）不换歌，等重试——这里同样不跳
+	if (($why // '') =~ /429|too ?many|toomany/i) {
+		$log->warn('LxMusic: rate-limited resolve failure, NOT auto-skipping: ' . $why);
+		return 0;
+	}
+
+	my $now = time();
+	return 0 if $SKIPPED{$url} && $now - $SKIPPED{$url} < 60;
+	$SKIPPED{$url} = $now;
+
+	my $client = eval { $song->master } or return 0;
+	eval { require Slim::Player::Playlist; require Slim::Player::Source; 1 };
+	my $cid = eval { $client->id } // '?';
+
+	# 防连跳风暴：同一客户端 60s 内最多自动跳 3 次（整队全坏时不要无限跳下去）
+	my @burst = grep { $now - $_ < 60 } @{ $SKIP_BURST{$cid} || [] };
+	push @burst, $now;
+	$SKIP_BURST{$cid} = \@burst;
+	if (@burst > 3) {
+		$log->error("LxMusic: too many auto-skips in 60s, stopping playback ($cid)");
+		eval { $client->execute(['stop']) };
+		return 0;
+	}
+
+	my $count = eval { Slim::Player::Playlist::count($client) } || 0;
+	my $idx   = eval { Slim::Player::Source::playingSongIndex($client) };
+	$idx = -1 unless defined $idx;
+	my $next = $idx + 1;
+	if ($count && $next >= $count) {
+		$log->warn('LxMusic: failed on the last track, nothing to skip to (' . ($why // '') . ')');
+		eval { $client->execute(['stop']) };
+		return 0;
+	}
+
+	$log->warn("LxMusic: auto-skip to next track (index $idx -> $next of $count; why=$why)");
+	eval { $client->execute([ 'playlist', 'jump', $next ]) };
+	eval { $client->execute(['play']) };
+	return 1;
+}
+
 # ---------- 播放解析 ----------
 sub scanUrl {
 	my ($class, $url, $args) = @_;
@@ -352,6 +400,7 @@ sub scanUrl {
 				my $why = $res->{error} || 'unknown';
 				$log->error('LxMusic: resolve failed: ' . $why);
 				$class->cache_metadata($url, { title => $info->{name}, error => $why });
+				$class->_auto_skip($song, $url, $why);      # pref autoSkipOnError（默认开）
 				$cb->(undef);
 				return;
 			}

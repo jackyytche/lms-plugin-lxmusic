@@ -67,6 +67,8 @@ sub initPlugin {
 		sourcesJson    => '',    # 多订阅源注册表（JSON：顺序/启用/来源/元数据）
 		qualityFallback => 1,    # 源没有所选档位时自动降档（对齐 PC getPlayQuality）
 		verifyUrl      => 1,     # 取链后 HEAD 校验可播（挡掉 403/HTML 错误页 = 防"无声"）
+		# ---- M0.7 ----
+		autoSkipOnError => 1,    # 全源失败后交给 LMS 跳下一曲（对齐 PC player.autoSkipOnError）
 	});
 
 	unless (Plugins::LxMusic::Helper->init) {
@@ -220,6 +222,65 @@ sub _u {
 # XMLBrowser passthrough 语义（slimserver XMLBrowser.pm L521）：
 #   coderef->($client, $cb, \%args, @passthrough_flat)
 
+# ---------- M0.7 聚合搜索 + 相似度重排 ----------
+# 对齐 PC 端：
+#   · 相似度 = 归一化编辑距离（refs/lx-music-desktop src/common/utils/common.ts:137 similar()：
+#     把短串当 a、长串当 b，返回 1 - 距离/长串长度）
+#   · 聚合 = 各源结果合并后去重（PC store/search/music/action.ts:48 deduplicationList 按 id，
+#     跨平台不合并），再按 "与关键词的相似度" 降序（同文件:23-32 handleSortList）
+sub _sim {
+	my ($a, $b) = @_;
+	$a = _u($a // '');
+	$b = _u($b // '');
+	return 0 unless length($a) && length($b);
+	($a, $b) = ($b, $a) if length($a) > length($b);      # 保证 a 更短（PC 同款）
+	my @a = split //, $a;
+	my @b = split //, $b;
+	my @prev = (0 .. scalar @b);
+	for my $i (1 .. scalar @a) {
+		my @cur = ($i);
+		my $ai  = $a[ $i - 1 ];
+		for my $j (1 .. scalar @b) {
+			my $cost = ($ai eq $b[ $j - 1 ]) ? 0 : 1;
+			my $ins  = $cur[ $j - 1 ] + 1;
+			my $del  = $prev[$j] + 1;
+			my $sub  = $prev[ $j - 1 ] + $cost;
+			my $min  = $ins < $del ? $ins : $del;
+			$min = $sub if $sub < $min;
+			$cur[$j] = $min;
+		}
+		@prev = @cur;
+	}
+	return 1 - ($prev[ scalar @b ] / scalar @b);
+}
+
+# 多源结果 -> 去重 -> 相似度降序；顺带把来源写回 track 的 `_src`
+sub _mergeRank {
+	my ($groups, $q, $limit) = @_;
+	my (@all, %seen);
+	my $i = 0;
+	for my $grp (@$groups) {
+		next unless $grp && ref $grp eq 'HASH' && $grp->{list};
+		my $src = $grp->{source} || '?';
+		for my $t (@{ $grp->{list} }) {
+			next unless ref $t eq 'HASH';
+			my $key = join('|', $src, ($t->{id} // ''), ($t->{songmid} // ''), ($t->{hash} // ''), ($t->{name} // ''));
+			next if $seen{$key}++;
+			$t->{_src}  = $src;
+			$t->{_tot}  = $grp->{total};
+			push @all, {
+				t     => $t,
+				src   => $src,
+				score => _sim($q, _u(($t->{name} // '') . ' ' . ($t->{singer} // ''))),
+				ord   => $i++,
+			};
+		}
+	}
+	@all = sort { $b->{score} <=> $a->{score} || $a->{ord} <=> $b->{ord} } @all;
+	splice(@all, $limit) if $limit && @all > $limit;
+	return \@all;
+}
+
 my %BOARDS_CACHE;    # source => [ {id,name,bangid,...} ]
 
 # 搜索入口：XMLBrowser type=search → $args->{search}
@@ -243,12 +304,12 @@ sub sdkSearchHandler {
 				$cb->({ items => [ { name => _u('搜索失败: ') . ($res->{error} || 'unknown'), type => 'text' } ] });
 				return;
 			}
-			my @items;
-			for my $grp (@{ $res->{data} }) {
-				next unless $grp && $grp->{list} && @{ $grp->{list} };
-				my $srcName = $grp->{source} || '?';
-				push @items, @{ _trackItems([ @{ $grp->{list} }[0 .. 11] ], "[$srcName] ") };
-			}
+			# 跨源聚合：合并去重 + 相似度降序（PC store/search/music/action.ts 语义），来源标在每行前缀
+			my $ranked = _mergeRank($res->{data}, $q, 80);
+			my @items = @$ranked
+				? @{ _trackItems([ map { $_->{t} } @$ranked ], '',
+					sub { '[' . ($_[0]{_src} // '?') . '] ' }) }
+				: ();
 			@items = @items[ 0 .. 79 ] if @items > 80;
 			$cb->({ items => @items ? \@items : [ { name => _u('无结果'), type => 'text' } ] });
 		},
@@ -336,9 +397,9 @@ sub sdkBoardTracksHandler {
 	return;
 }
 
-# track(search/boardlist 产出) -> lxm:// audio 项
+# track(search/boardlist 产出) -> lxm:// audio 项（$prefixOf 可按曲给不同前缀，如聚合搜索的来源标签）
 sub _trackItems {
-	my ($list, $prefix) = @_;
+	my ($list, $prefix, $prefixOf) = @_;
 	$prefix ||= '';
 	my $q     = $prefs->get('quality') || '320k';
 	my @items;
@@ -346,6 +407,7 @@ sub _trackItems {
 	for my $t (@$list) {
 		next unless $t && ref($t) eq 'HASH';
 		$n++;
+		my $pfx    = $prefixOf ? ($prefixOf->($t) // '') : $prefix;
 		my $name   = _u($t->{name}   || '?');
 		my $singer = _u($t->{singer} || '');
 		my $url = Plugins::LxMusic::ProtocolHandler->buildUrl(
@@ -364,7 +426,7 @@ sub _trackItems {
 			quality => $q,
 		});
 		push @items, {
-			name => sprintf('%03d %s%s%s', $n, $prefix, $name, ($singer ne '' ? " - $singer" : '')),
+			name => sprintf('%03d %s%s%s', $n, $pfx, $name, ($singer ne '' ? " - $singer" : '')),
 			type => 'audio',
 			url  => $url,
 			(length $cover ? (image => $cover) : ()),
@@ -816,25 +878,37 @@ sub _webSearch {
 			my $html;
 			if ($res->{ok} && $res->{data}) {
 				my @rows;
-				my @groups = length($src) ? ($res->{data}) : @{ $res->{data} };
-				for my $grp (@groups) {
-					next unless $grp && $grp->{list};
-					for my $t (@{ $grp->{list} }) {
-						next unless $t && ref($t) eq 'HASH';
-						my $mj = encodeTrackJson($t);
-						next unless $mj;
-						my $types = join('/', map { $_->{type} || '' } @{ $t->{types} || [] });
-						my $link = '?track=' . encode_base64url($mj) . '&q=' . encode_entities($q)
-							. (length $src ? '&src=' . encode_entities($src) : '');
-						push @rows, sprintf(
-							'<li><a href="%s">%s</a> <span style="color:#888">%s · %s%s</span></li>',
-							$link,
-							encode_entities(($t->{name} || '?') . ($t->{singer} ? ' - ' . $t->{singer} : '')),
-							encode_entities($types),
-							encode_entities($t->{source} || '?'),
-							($grp->{total} ? ' · ' . encode_entities($grp->{total}) : ''),
-						);
+				# 单一源：保持原顺序（PC 端单源列表也不重排）；跨源：合并去重 + 相似度降序
+				# ⚠️ 单源时 shim 返回的是 **hashref**（一个分组），跨源才是 arrayref——
+				#    直接 @{$res->{data}} 会把单源路径打死（"Not an ARRAY reference" ⇒ 页面挂死）
+				my @groups = length $src ? ($res->{data}) : @{ $res->{data} };
+				my @flat;
+				if (length $src) {
+					for my $grp (@groups) {
+						next unless $grp && $grp->{list};
+						push @flat, map { { t => $_, src => ($grp->{source} || $src), tot => $grp->{total} } }
+							grep { ref($_) eq 'HASH' } @{ $grp->{list} };
 					}
+				}
+				else {
+					@flat = map { { t => $_->{t}, src => $_->{src}, tot => $_->{t}{_tot} } }
+						@{ _mergeRank(\@groups, $q, 120) };
+				}
+				for my $row (@flat) {
+					my $t = $row->{t};
+					my $mj = encodeTrackJson($t);
+					next unless $mj;
+					my $types = join('/', map { $_->{type} || '' } @{ $t->{types} || [] });
+					my $link = '?track=' . encode_base64url($mj) . '&q=' . encode_entities($q)
+						. (length $src ? '&src=' . encode_entities($src) : '');
+					push @rows, sprintf(
+						'<li><a href="%s">%s</a> <span style="color:#888">%s · %s%s</span></li>',
+						$link,
+						encode_entities(($t->{name} || '?') . ($t->{singer} ? ' - ' . $t->{singer} : '')),
+						encode_entities($types),
+						encode_entities($row->{src} || '?'),
+						($row->{tot} ? ' · ' . encode_entities($row->{tot}) : ''),
+					);
 				}
 				$html = @rows
 					? '<p class="status">"' . encode_entities($q) . '" ' . $elapsed . 's, '
