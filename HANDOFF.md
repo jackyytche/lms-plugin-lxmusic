@@ -2,7 +2,7 @@
 
 > **下个 session 恢复方式**：直接说「继续 lx-music 插件，先读 HANDOFF.md」。
 > **权威事实源**：本文档 + 磁盘（`plugin/` 源码、`repo/` 发布仓、`dist/` 打包产物、`refs/` 参考克隆、`tmp/` 工具）。
-> **一句话现状**（2026-09-20 深夜）：设备运行 **0.8.2**（稳定可用）。M0.1~M0.6 已完工验收；**M0.7 两项新功能已上线**：① 多平台**聚合搜索 + 相似度重排**（PC 的归一化编辑距离算法，实测排序严格单调不增）② 播放失败**自动跳下一曲**开关（`autoSkipOnError`）。qdy 源实测**取链产物是死链（HTTP 410）**，单独用它取不到直链。
+> **一句话现状**（2026-09-20 深夜）：设备运行 **0.8.3**（稳定可用）。M0.1~M0.6 已完工验收；**M0.7 两项新功能已上线**：① 多平台**聚合搜索 + 相似度重排**（PC 的归一化编辑距离算法，实测排序严格单调不增）② 播放失败**由插件立即跳下一曲**开关（`autoSkipOnError`，文案已注明 LMS 自身也会跳）。设备只保留 1 个可用源（qdy 源实测取链是死链 410，已按用户决定删除）。
 > ⚠️ 本轮出过一次**自伤事故**（0.8.0 编译失败仍打包上机 → LMS 加载失败并把插件从已安装列表摘掉 → 全部页面 404），已用 `tmp/repair_install.py` 完整恢复，并立了 `tmp/precheck.ps1` 打包门禁（详见 §5.7）。**代码仍未发 GitHub（远端只有 v0.5.9）**：要发版就 GH 基址 pack → release **v0.8.2**（需用户 PAT）。
 
 ---
@@ -94,7 +94,8 @@ XMLBrowser 菜单 / 网页  →  Plugin.pm（feed handlers / webHandler）
 | **0.7.2** | 修"混旗标串"双重编码（设置页消息乱码，见 §5.5.34）；install.xml 中文注释被 PowerShell `Set-Content` 写坏后复原（§5.5.36） |
 | 0.8.0 | ⚠️ **坏版本，勿用**：Plugin.pm 编译失败（`$src` 未声明）却被打包上机 → LMS 加载失败（详见 §5.7.37） |
 | 0.8.1 | 修 0.8.0 的编译错误；新增「播放行为」分区（`autoSkipOnError`）+ 聚合搜索重排；机上被 LMS 摘除后由 `repair_install.py` 恢复 |
-| **0.8.2（当前设备）** | 修单源搜索 die（`@{$res->{data}}` 对 hashref 解引用，§5.7.39）；聚合搜索 + 相似度重排实测排序严格单调不增；自动跳曲 + 防连跳风暴上线 |
+| **0.8.2** | 修单源搜索 die（`@{$res->{data}}` 对 hashref 解引用，§5.7.39）；聚合搜索 + 相似度重排实测排序严格单调不增；自动跳曲 + 防连跳风暴上线 |
+| **0.8.3（当前设备）** | 按用户决定：跳曲开关文案改清楚（明说"由插件立即跳"、限流不跳、防连跳）；删除死链源 qdy |
 
 ---
 
@@ -241,7 +242,7 @@ XMLBrowser 菜单 / 网页  →  Plugin.pm（feed handlers / webHandler）
    - 编码取证脚本：`tmp/probe_mojibake.py`、`tmp/probe_surfaces.py`、`tmp/probe_template_gen.py`（判定"渲染的是哪一代模板"）。
    - 入口取证脚本：`tmp/probe_settings_entry.py`（设置下拉条目 + 插件行 Settings 链接 + selected）、`tmp/probe_chooser_option.py`、`tmp/probe_chooser_js.py`、`tmp/probe_plugin_row_text.py`。
    - M0.6 新增：`tmp/verify_sources_page.py`（源列表/导入字段/音质控件体检）、`tmp/m0_6_acceptance.py`（多源全流程验收：导入/去重/目录/启停/排序/删除/取链）、`tmp/restore_source.py`（把设备源复原成样本源）、`tmp/test_sources.pl`（Sources.pm 单测）、`tmp/probe_url_playable.py`（HEAD/Range 可播性）、`tmp/probe_source_info.py`（源脚本头/平台能力）。
-   - M0.7 新增：**`tmp/precheck.ps1`（打包门禁，必用）**、**`tmp/repair_install.py`（插件被 LMS 摘除后的恢复/重装启用）**、`tmp/verify_search_rank.py`（聚合搜索排序单调性复算）、`tmp/test_autoskip.py`（自动跳曲开关 A/B 实测）、`tmp/check_qdy_source.py` / `tmp/probe_qdy_url.py`（订阅源可用性 + 直链真伪）、`tmp/decode_qdy_error.py`（把页面上的实体乱码还原成源的真实报错）。
+   - M0.7 新增：**`tmp/precheck.ps1`（打包门禁，必用）**、**`tmp/repair_install.py`（插件被 LMS 摘除后的恢复/重装启用）**、`tmp/verify_search_rank.py`（聚合搜索排序单调性复算）、`tmp/test_autoskip.py`（自动跳曲开关 A/B 实测）、`tmp/check_qdy_source.py` / `tmp/probe_qdy_url.py`（订阅源可用性 + 直链真伪）、`tmp/decode_qdy_error.py`（把页面上的实体乱码还原成源的真实报错）、`tmp/delete_source.py "名称子串"`（按名字删源）。
    - `tmp/lx_set_loglevel.py [LEVEL]` — 查看/整表回放设置某个日志类别级别（带 `persist=1`，重启仍生效）。
 
 **播放器**：HiBy FC4 `5a:78:10:59:c7:74`（用户主用，验证目标）；HD-Audio Generic `5a:bf:86:1b:a6:ff`（本机声卡）；小爱音箱 squeezelite `bb:bb:69:a9:cf:23`（**会出声，勿用**）。
@@ -250,19 +251,14 @@ XMLBrowser 菜单 / 网页  →  Plugin.pm（feed handlers / webHandler）
 
 ## 七、下个 session 待办（按序）
 
-1. **发版 v0.8.2（待定，需用户提供 PAT）**——远端 GitHub 目前只有 v0.5.9，本轮 0.6.0~0.8.2 全在本地。
-   - 步骤：不设 `LX_REPO_BASE` 跑 `pack.py`（生成 GH 基址 zip + repo.xml）→ `dist/LxMusic-0.8.2.zip` + `repo.xml` 作为 `v0.8.2` release 资产。
+1. **发版 v0.8.3（待定，需用户提供 PAT）**——远端 GitHub 目前只有 v0.5.9，本轮 0.6.0~0.8.3 全在本地。
+   - 步骤：不设 `LX_REPO_BASE` 跑 `pack.py`（生成 GH 基址 zip + repo.xml）→ `dist/LxMusic-0.8.3.zip` + `repo.xml` 作为 `v0.8.3` release 资产。
    - 推送：`git push https://x-access-token:<token>@github.com/jackyytche/lms-plugin-lxmusic main`（token 只内联，不落盘；本地 main 领先远端，快进即可）。
-2. **待用户决定的两件事**：
-   - **跳曲开关语义**：现在关掉开关也照样跳（LMS 自己会跳，§5.7.41）。要不要把它改成别的语义
-     （例如"失败时是否重试/换源次数"），或者干脆去掉这个开关？
-   - **qdy 订阅源**：实测取链产物是死链（HTTP 410，见 §八），保留（多一层兜底但每次失败浪费几秒）
-     还是删掉/换新版本？
-3. **M0.7 剩余候选**：每源失败冷却（连续点歌不反复撞死源）；**不喜欢歌曲规则**（`歌曲名@艺术家` 三态过滤）；
+2. **M0.7 剩余候选**：每源失败冷却（连续点歌不反复撞死源）；**不喜欢歌曲规则**（`歌曲名@艺术家` 三态过滤，
+   PC 端最契合服务端的一项）；搜索排序可选增强（PC 算法下"歌手名越短得分越高"⇒ 是否加"完全同名优先 / 优先某源"）；
    `common.sourceNameType` real/alias；繁简转换；歌词三开关；代理；热门搜索；直链缓存上限语义。
-4. **M0.8 候选**：常驻 qjs worker（冷解析 ~2.3s → ~0）；kw 榜单（上游签名失效）。
-5. **遗留清理**：`repo/plugin/helper-test.log`；`tmp/` 脚本（本轮新增 6 个，建议全留）；`dist/lx-6.js`、`dist/qdy.js`。
-6. **设备侧现状**：`plugin.lxmusic` 日志级别 = ERROR；两个源都启用：`独家音源`（可用）+ `全豆要[聚合音源]`（取链死链）。
+3. **M0.8 候选**：常驻 qjs worker（冷解析 ~2.3s → ~0）；kw 榜单（上游签名失效）。
+4. **遗留清理**：`repo/plugin/helper-test.log`；`tmp/` 脚本（本轮新增 6 个，建议全留）；`dist/lx-6.js`、`dist/qdy.js`。
 6. **发布历史（✅ 2026-09-19）**：GitHub `jackyytche/lms-plugin-lxmusic`
    - main 已推：`a5af529..2b28c48`（`2b28c48` = 0.3.0→0.5.9 + 设置页 WIP 单一提交，含 vendored sdk 树 0.23MB 以便复现）
    - **Release `v0.5.9`**（id `392124985`）：资产 `LxMusic-0.5.9.zip`（1231509 B，SHA1 `c0959eb82a8f5d968c3e51de8e160c9cb4875180`）+ `repo.xml`（GH 基址）
@@ -271,11 +267,10 @@ XMLBrowser 菜单 / 网页  →  Plugin.pm（feed handlers / webHandler）
 
 ## 八、现场状态与凭据
 
-- **设备**：达菲 `192.168.2.111`（LMS 9.0.3 / perl 5.40；Web `:9000`，CGI `:80`）；运行 **0.8.2**。
-- **通道**：达菲订阅 = **LAN** `http://192.168.2.68:8765/repo.xml?v=45`（8765 常驻 `python -m http.server` 指向 `dist/`；**进程易失**，掉线就在 `dist/` 重启；`?v=N` 是 LMS 仓库缓存的破除参数，每次装机 +1）。
-- **设备侧现状**：订阅源 2 个（见下），prefs 默认（quality 320k / bridgeTimeout 7 / helperConcurrency 2 / resolveTtl 600 / coverProxy on / boards 全 on / qualityFallback on / verifyUrl on / autoSkipOnError on）；`plugin.lxmusic` 日志级别 = **ERROR**。
-  - `独家音源`（`http://192.168.2.68:8765/lx-6.js`，64094 B）——**可用**，取链实测 `flac ~1647kbps verified` / `320k ~320kbps verified`
-  - `全豆要[聚合音源]`（`http://192.168.2.68:8765/qdy.js`，31090 B）——**取链产物是死链**：它对同一首歌回 `kw-er.kuwo.cn/...F000000bYDlc2XxKLs.flac?bitrate$2000&...`，HEAD/Range/带 Referer/换 UA 全是 **HTTP 410 Gone**（`tmp/probe_qdy_url.py` 实测）；注意 URL 里 `bitrate$2000`（`=` 被打成 `$`）是该源自己的构造问题。
+- **设备**：达菲 `192.168.2.111`（LMS 9.0.3 / perl 5.40；Web `:9000`，CGI `:80`）；运行 **0.8.3**。
+- **通道**：达菲订阅 = **LAN** `http://192.168.2.68:8765/repo.xml?v=46`（8765 常驻 `python -m http.server` 指向 `dist/`；**进程易失**，掉线就在 `dist/` 重启；`?v=N` 是 LMS 仓库缓存的破除参数，每次装机 +1）。
+- **设备侧现状**：订阅源 **1 个**：`独家音源`（在线 `http://192.168.2.68:8765/lx-6.js`，64094 B）——**可用**，取链实测 `flac ~1647kbps verified` / `320k ~320kbps verified`。prefs 默认（quality 320k / bridgeTimeout 7 / helperConcurrency 2 / resolveTtl 600 / coverProxy on / boards 全 on / qualityFallback on / verifyUrl on / autoSkipOnError on）；`plugin.lxmusic` 日志级别 = **ERROR**。
+  - 已删除的源：`全豆要[聚合音源]`（`qdy.js`）——它的取链产物是死链：回 `kw-er.kuwo.cn/...F000000bYDlc2XxKLs.flac?bitrate$2000&...`（`=` 被打成 `$` 是它自己的构造问题），HEAD/Range/带 Referer/换 UA 全是 **HTTP 410 Gone**（`tmp/probe_qdy_url.py` 实测）。`dist/qdy.js` 仍留着，将来拿它做多源测试很方便。
 - **本机 IP/仓库基址**：`192.168.2.68:8765`（**DHCP 可能变化**，变了要同步 `dist/repo.xml` 的 URL 与 pack.py 的 `LAN_BASE`）。
 - **GitHub**：`jackyytche/lms-plugin-lxmusic`；PAT 由用户在需要时提供（**勿写入文件**；撤销提醒见 §七.4）。
 - **订阅源样本**：`refs/samples/lx-6.js`（= `lx-music-source-v6-fixed.js` = `lx-latest.js`，64094 B，与 pdone/lx-music-source 官方 `lx/6.js` 逐字节一致；`dist/lx-6.js` 是给设备做 URL 导入测试的 LAN 副本）。
