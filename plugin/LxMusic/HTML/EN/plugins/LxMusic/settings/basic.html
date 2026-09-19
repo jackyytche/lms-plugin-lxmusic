@@ -1,0 +1,59 @@
+[% PROCESS settings/header.html %]
+
+	[% IF params.lxMessage %]
+		<div class="settingSection"><b>[% params.lxMessage | html %]</b></div>
+	[% END %]
+
+	[% WRAPPER setting title="订阅源" desc="当前生效的洛雪订阅源（JS）。可粘贴源内容后点「导入」，或清除。" %]
+		<div style="margin-bottom:6px"><b>[% params.lxSourceStatus | html %]</b></div>
+		<div style="margin-bottom:6px;color:#666">路径：[% params.lxSourcePath | html %]</div>
+		<input type="text" class="stdedit" name="sourceName" value="current.js" size="30" />
+		<textarea name="sourceContent" class="stdedit" rows="6" cols="80" placeholder="粘贴 .js 订阅源内容（留空则仅改设置）"></textarea>
+		<div style="margin-top:6px">
+			<button type="submit" name="lxAction" value="import">导入订阅源</button>
+			<button type="submit" name="lxAction" value="clear">清除订阅源</button>
+		</div>
+	[% END %]
+
+	[% WRAPPER setting title="音质档位" desc="播放请求的音质（取决于上游是否提供该档）" %]
+		<select name="pref_quality" class="stdedit">
+			<option value="128k"[% IF prefs.pref_quality == '128k' %] selected[% END %]>128 kbps</option>
+			<option value="320k"[% IF prefs.pref_quality == '320k' %] selected[% END %]>320 kbps（推荐）</option>
+			<option value="flac"[% IF prefs.pref_quality == 'flac' %] selected[% END %]>FLAC</option>
+			<option value="flac24bit"[% IF prefs.pref_quality == 'flac24bit' %] selected[% END %]>FLAC 24bit</option>
+		</select>
+	[% END %]
+
+	[% WRAPPER setting title="桥接超时" desc="单个上游请求的超时秒数（越大越慢但更耐抖动；migu 源自动取 3 折）" %]
+		<input type="number" min="2" max="30" name="pref_bridgeTimeout" value="[% prefs.pref_bridgeTimeout %]" class="stdedit" size="5" />
+	[% END %]
+
+	[% WRAPPER setting title="并发子进程" desc="同时运行的 qjs 解析进程数（整单入队时防风暴，1-4 建议 2）" %]
+		<input type="number" min="1" max="8" name="pref_helperConcurrency" value="[% prefs.pref_helperConcurrency %]" class="stdedit" size="5" />
+	[% END %]
+
+	[% WRAPPER setting title="解析缓存 TTL" desc="已解析直链的复用秒数（越大越省上游请求，但直链过期会播放失败）" %]
+		<input type="number" min="0" max="3600" name="pref_resolveTtl" value="[% prefs.pref_resolveTtl %]" class="stdedit" size="6" />
+	[% END %]
+
+	[% WRAPPER setting title="封面代理" desc="kg/kw 的封面需经插件中转才能在设备上显示（关掉可省一次中转，但这两源列表会无图）" %]
+		<input type="checkbox" name="pref_coverProxy" value="1"[% IF prefs.pref_coverProxy %] checked[% END %] />
+	[% END %]
+
+	[% WRAPPER setting title="榜单源" desc="浏览菜单里显示哪些平台的榜单（kw 榜单上游签名已失效，恒不显示）" %]
+		<label><input type="checkbox" name="pref_boardsKg" value="1"[% IF prefs.pref_boardsKg %] checked[% END %] /> 酷狗 kg</label>
+		<label style="margin-left:12px"><input type="checkbox" name="pref_boardsTx" value="1"[% IF prefs.pref_boardsTx %] checked[% END %] /> QQ tx</label>
+		<label style="margin-left:12px"><input type="checkbox" name="pref_boardsWy" value="1"[% IF prefs.pref_boardsWy %] checked[% END %] /> 网易 wy</label>
+		<label style="margin-left:12px"><input type="checkbox" name="pref_boardsMg" value="1"[% IF prefs.pref_boardsMg %] checked[% END %] /> 咪咕 mg</label>
+	[% END %]
+
+	[% WRAPPER setting title="诊断" desc="引擎与日志状态（日志级别请在「高级 → 日志」里设 plugin.lxmusic）" %]
+		<div>插件版本：<b>[% params.lxVersion | html %]</b></div>
+		<div>引擎自检：[% params.lxEngine | html %]</div>
+		<div>当前日志级别：<b>[% params.lxLogLevel | html %]</b></div>
+		<div style="margin-top:6px">
+			<a href="/plugins/LxMusic/index.html">打开工具页（搜索/试听/直链测试）</a>
+		</div>
+	[% END %]
+
+[% PROCESS settings/footer.html %]

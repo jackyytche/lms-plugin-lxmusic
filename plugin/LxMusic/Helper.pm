@@ -29,18 +29,46 @@ use JSON::XS ();
 use POSIX ();
 
 use Slim::Utils::Log;
+use Slim::Utils::Prefs;
 use Slim::Utils::Timers;
 
-my $log = Slim::Utils::Log->logger('plugin.lxmusic');
+my $log   = Slim::Utils::Log->logger('plugin.lxmusic');
+my $prefs = preferences('plugin.lxmusic');
 
 my $TMPDIR  = File::Spec->catdir(File::Spec->tmpdir(), 'LXMusic');
 my $QJS     = File::Spec->catfile($TMPDIR, 'qjs');
 my $SHIM    = File::Spec->catfile($TMPDIR, 'shim.mjs');
+my $SDK     = File::Spec->catfile($TMPDIR, 'sdk.bundle.js');
 my $SOURCES = File::Spec->catdir($TMPDIR, 'sources');
 
 my $JSON = JSON::XS->new->utf8->allow_nonref;
 
 my %JOBS;    # pid => job
+my @WAITQ;   # 超出并发闸的请求闭包队列（FIFO）
+
+# 并发上限改由设置页控制（每次判定读 prefs，改完立即生效）
+sub _maxChildren {
+	my $n = $prefs->get('helperConcurrency');
+	$n = 2 unless defined $n && $n >= 1 && $n <= 8;
+	return int($n);
+}
+
+# 桥级超时（秒）下发到子进程（shim 读 LX_BRIDGE_TIMEOUT）
+sub _bridgeTimeout {
+	my $n = $prefs->get('bridgeTimeout');
+	$n = 7 unless defined $n && $n >= 2 && $n <= 30;
+	return int($n);
+}
+
+# 设置页用的引擎状态
+sub engineStatus {
+	my ($class) = @_;
+	return 'qjs 缺失' unless -f $QJS;
+	return 'qjs 不可执行（+x 丢失）' unless -x $QJS;
+	return 'shim 缺失' unless -f $SHIM;
+	return 'sdk bundle 缺失（搜索/歌单不可用）' unless -f $SDK;
+	return 'ok（qjs + shim + sdk 就绪）';
+}
 
 # ---------- init ----------
 sub init {
@@ -62,9 +90,24 @@ sub init {
 	mkpath($TMPDIR) or do { $log->error("LxMusic Helper: mkpath $TMPDIR: $!"); return 0 };
 	mkpath($SOURCES);
 
-	copy($qjsSrc, $QJS)   or do { $log->error("LxMusic Helper: copy qjs: $!"); return 0 };
+	# shim/sdk 先拷（纯文本不会被 EBUSY 卡住）；qjs 最后、失败仅降级保留旧二进制，
+	# 绝不因 qjs 占用而 return 0 —— 那会让 shim 停在旧版（0.3.6 现场）
 	copy($shimSrc, $SHIM) or do { $log->error("LxMusic Helper: copy shim: $!"); return 0 };
-	chmod(0755, $QJS);                       # 关键：解压丢 +x，/tmp 里修复
+	my $sdkSrc = File::Spec->catfile($pluginDir, 'engine', 'sdk', 'sdk.bundle.js');
+	if (-f $sdkSrc) {
+		copy($sdkSrc, $SDK) or $log->warn("LxMusic Helper: copy sdk bundle: $!");
+	}
+	else {
+		$log->warn('LxMusic Helper: sdk bundle missing in plugin dir — search/browse disabled');
+	}
+	if (copy($qjsSrc, $QJS)) {
+		chmod(0755, $QJS);                   # 关键：解压丢 +x，/tmp 里修复
+	}
+	else {
+		# 旧 qjs 仍可执行（二进制兼容）；仅告警不失败
+		$log->warn('LxMusic Helper: copy qjs failed (busy?): ' . $! . ' — keeping existing binary');
+		-f $QJS && -x $QJS or do { $log->error('LxMusic Helper: no usable qjs in tmp'); return 0 };
+	}
 
 	# 引擎自检（阻塞但 <100ms，仅 init 一次）
 	my $out = _qx([$QJS, '-e', 'print("lx-engine-ok:"+(1+1))']);
@@ -129,9 +172,26 @@ sub request {
 
 	my $source = $args{source};
 	my $action = $args{action};
-	$source && $action or do { $cb->(_err('source/action required')); return };
-	-f $source or do { $cb->(_err("source missing: $source")); return };
+	$action or do { $cb->(_err('action required')); return };
+
+	# sdk 模式（vendored musicSdk）：第一个参数是 sdk.bundle.js，无需订阅源
+	if ($action eq 'search' || $action eq 'boards' || $action eq 'boardlist'
+		|| $action eq 'songlist' || $action eq 'songlistdetail') {
+		-f $SDK or do { $cb->(_err('sdk bundle not installed (search/browse disabled)')); return };
+		$source = $SDK;
+	}
+	else {
+		$source && -f $source or do { $cb->(_err('source missing: ' . ($source // '<undef>'))); return };
+	}
 	-f $QJS && -x _ or do { $cb->(_err('engine not initialised (call init)')); return };
+
+	# 并发闸（M0.3）：整单 m3u 入队时 LMS 会并发解析几十个 lxm://，全 fork 会打满设备 CPU
+	# 并拖垮上游（0.4.0 现场：全部 'timeout: no RESULT line'）。排队串行放行，max 2 并发。
+	if (scalar(keys %JOBS) >= _maxChildren()) {
+		push @WAITQ, sub { __PACKAGE__->request(%args) };
+		$log->debug('LxMusic Helper: request queued (' . scalar(@WAITQ) . ' waiting)');
+		return;
+	}
 
 	my $timeout = $args{timeout} || 20;
 	$timeout = 60 if $timeout > 60;          # lx 宿主 20s 硬超时同量级，上限 60
@@ -161,6 +221,7 @@ sub request {
 			POSIX::_exit(127);
 		}
 		$ENV{PATH} = '/usr/bin:/bin:/usr/sbin:/sbin';   # curl 定位
+		$ENV{LX_BRIDGE_TIMEOUT} = _bridgeTimeout();  # 设置页可调（shim 读它）
 		chdir('/');
 		exec($QJS, $SHIM, $source, $action, $infoJson);
 		POSIX::_exit(127);
@@ -266,6 +327,12 @@ sub _finish {
 		alerts => $alerts,
 		why    => $why,
 	});
+
+	# 并发闸放行：m3u 整单入队会瞬间排起几十个解析，串行小并发保护设备 CPU 与上游
+	while (@WAITQ && scalar(keys %JOBS) < _maxChildren()) {
+		my $next = shift @WAITQ;
+		$next->();
+	}
 	return;
 }
 

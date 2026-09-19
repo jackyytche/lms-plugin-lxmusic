@@ -12,7 +12,9 @@ GH_BASE = 'https://github.com/jackyytche/lms-plugin-lxmusic/releases/download/v{
 # 本地联调可切 LAN_BASE（达菲实证：repo.xml 必须在服务器根路径, lang="EN" 大写）
 LAN_BASE = 'http://192.168.2.68:8765'
 BASE = os.environ.get('LX_REPO_BASE', GH_BASE)
-ZIP_NAME = 'LxMusic.zip'
+# zip 名带版本号（喜马拉雅同款）：LMS 对同名 zip 有 DownloadedPlugins 缓存/摘要校验，
+# 复用 LxMusic.zip 会在连续升级时出现"下载了却不安装"（0.4.5 现场踩到）
+ZIP_TMPL = 'LxMusic-{version}.zip'
 
 
 def main():
@@ -20,9 +22,10 @@ def main():
         install = fh.read()
     version = re.search(r'<version>(.*?)</version>', install).group(1)
     base = BASE.replace('{version}', version)
+    zip_name = ZIP_TMPL.format(version=version)
 
     os.makedirs(OUT, exist_ok=True)
-    zip_path = os.path.join(OUT, ZIP_NAME)
+    zip_path = os.path.join(OUT, zip_name)
     if os.path.exists(zip_path):
         os.remove(zip_path)
 
@@ -34,6 +37,10 @@ def main():
                 continue
             full = os.path.join(root, f)
             rel = os.path.relpath(full, SRC).replace(os.sep, '/')
+            # 设备端只需要打包产物：sdk 源码树/shim 源/vendor 与本地测试文件不上机
+            if rel.startswith(('engine/sdk/renderer/', 'engine/sdk/shim/', 'engine/test/')) \
+                    or rel in ('harness_out.txt',):
+                continue
             entries.append((full, rel))
     entries.sort(key=lambda t: t[1])
 
@@ -65,7 +72,7 @@ def main():
 \t\t<plugin name="LxMusic" version="{version}" minTarget="7.7" maxTarget="*">
 \t\t\t<title lang="EN">LX Music / 洛雪音乐</title>
 \t\t\t<desc lang="EN">Play music from LX Music custom-source subscriptions: import a source, search and stream with quality selection.</desc>
-\t\t\t<url>{base}/{ZIP_NAME}</url>
+\t\t\t<url>{base}/{zip_name}</url>
 \t\t\t<sha>{sha1}</sha>
 \t\t\t<creator>jackyytche</creator>
 \t\t\t<email>noreply@example.com</email>

@@ -1,66 +1,173 @@
-﻿# HANDOFF — lx-music Daphile 插件开发快照
+# HANDOFF — lx-music Daphile 插件（洛雪音乐）
 
-## 当前状态（2026-09-18）
+> **下个 session 恢复方式**：直接说「继续 lx-music 插件，先读 HANDOFF.md」。
+> **权威事实源**：本文档 + 磁盘（`plugin/` 源码、`repo/` 发布仓、`dist/` 打包产物、`refs/` 参考克隆、`tmp/` 工具）。
+> **一句话现状**（2026-09-19）：**M0.1~M0.4 全部完工并由用户设备实测验收**，设备运行 **0.5.9**；**M0.5「设置页」已开工（代码写完、本地编译通过、未上机验证）**——下个 session 第一件事就是把它发给设备并验证。
 
-**v0.1.0-alpha2 已发布（alpha1 的 Run-test 转圈 = 达菲主循环不驱动 AnyEvent，已换 Slim::Utils::Timers 轮询修复）** —— M0.1 设备验证的全部软件侧工作就绪。
+---
 
-- Release: https://github.com/jackyytche/lms-plugin-lxmusic/releases/tag/v0.1.0-alpha1
-  - `LxMusic.zip`（1,134,864 B, SHA1 `a77f4c4163e6c6d77725d64fdaa2b3e6856d945f`）
-  - `repo.xml`（锚定本版 tag URL，勿用 /releases/latest —— 被引擎 release 占住）
-- CI：run 22 全绿（Helper 回归 + 全模块 perl -c 语法检查）
-- LAN 通道：`dist/`（repo.xml + LxMusic.zip）+ 开发机 8765 http.server
+## 一、共识备忘（定稿需求，勿再讨论）
 
-## alpha1 内容
+- **纯插件方案**（不做旁车服务/混合路线）：Perl 插件跑在达菲内部，靠 vendored qjs 执行洛雪订阅源与内置 musicSdk。
+- **功能范围**：导入订阅源（粘贴/URL/文件）、音质选择、**平台×榜单浏览**、**搜索（歌曲/歌单）**、**歌单整单播放**、收藏（待做）。
+- **不做**：歌词 / 下载 / 登录。
+- **跨源 fallback 严格匹配**（宁缺毋滥）、静默降级；默认音质 **320k**。
+- 显示名 **「洛雪音乐」**；发布仓库 **`jackyytche/lms-plugin-lxmusic`**；设备侧插件名 **LxMusic**（tag `lxmusic`）。
+- 达菲订阅源优先走 **LAN 通道** `http://192.168.2.68:8765/repo.xml`（8765 指向 `dist/`，pack 即生效）。
 
-- `lxm://m/<b64url(musicInfo)>?s=<src>&t=<quality>&n=<name>` 协议（ProtocolHandler.pm）：
-  播放时经 Helper→qjs→订阅源取真实直链，canTranscodeSeek=1（达菲 seek 修正），
-  内存元数据缓存（标题/音质如实显示）。
-- Web 页 `plugins/LxMusic/index.html`：订阅导入（粘贴/URL，服务器端 curl 拉取）、
-  状态显示、songmid 取链测试（异步回调重渲染）。
-- 菜单（XMLBrowser）：播放测试（输入 kw 数字歌曲 ID → lxm:// 音频项）+ 源状态行。
-- prefs：sourceContent/sourceName/quality(320k)；重启自动恢复源到 tmpfs。
-- Helper.pm 增 `currentSourcePath`/`sourceInfo`；installSource 额外写 `sources/current.js`。
+---
 
-## M0.1 设备验证步骤（用户操作）
+## 二、当前进度（里程碑总览）
 
-1. （推荐 LAN 通道）达菲 Web → 设置 → 插件 → 第三方仓库：
-   添加 `http://192.168.2.68:8765/repo.xml` → 安装「LX Music / 洛雪音乐」。
-   （GitHub 通道：`.../releases/download/v0.1.0-alpha1/repo.xml`，达菲根路径机制未在 release URL 上实证。）
-2. 浏览器开 `http://<daphile>:9000/plugins/LxMusic/index.html`：
-   - 导入订阅源：粘贴 `refs/samples/lx-music-source-v6-fixed.js` 全文（或其 LAN URL）
-   - 播放测试输入 `228908`（酷我《晴天》周杰伦，已实测存在的 ID）→ 期望显示真实直链
-3. 菜单（音乐服务 → 洛雪音乐）→ 播放测试 → 输入 `228908` → 点击播放 → 听声。
-4. 顺带观察：server.log 里 shim 报错若出现 `curl: not found` → M0.1b 需要 busybox 回退。
+| 里程碑 | 状态 | 版本 | 验收证据 |
+|---|---|---|---|
+| **M0.1** 最小可播放（订阅源取链→播放） | ✅ | 0.2.8 | Run test OK ~2.1s 返回酷我直链；**HiBy FC4 出声（用户确认）** |
+| **M0.2** vendor musicSdk：聚合搜索 + 四源榜单 + XMLBrowser 菜单 | ✅ | 0.3.7 | 用户实测：**搜索出结果 110 条 / 榜单曲目 / 点选播放出声**；聚合 5.8s |
+| **M0.3** 歌单搜索 + 详情 + 整单播放 | ✅ | 0.4.4 | CLI/设备实测：搜索歌单 3.8s/40 个 → 详情 184 曲 → **整单入队 100 首、mode=play、歌名全中文** |
+| **M0.4** 体验对齐桌面版（封面/视图/分页/提速/封面兜底） | ✅ | 0.5.9 | 用户实测：**网格/列表切换 ✓、kw 封面 ✓、mg 封面 ✓、速度可接受**；kg 封面经代理修复（设备侧 200/image-jpeg） |
+| **M0.5** 设置页 | 🚧 **进行中** | 0.5.9 树内 WIP | 代码：`Settings.pm` + `HTML/EN/plugins/LxMusic/settings/basic.html` + 新 prefs 与接线**已写完且本地编译通过**；**未打包、未上机、未验证** |
 
-## 本轮关键勘误（重要，长期有效）
+**设备现状**：达菲 192.168.2.111 运行 **0.5.9**（页面 `/plugins/LxMusic/index.html` 显示的版本号＝运行中代码版本，是唯一可靠判据）。
 
-1. **perl -c 语义**：`-c` 不执行目标文件任何代码；但 `use X`（BEGIN-require）会
-   **编译并执行 X 的顶层**。因此「-c 主文件」绿灯 ≠ 依赖方视角绿灯：
-   ProtocolHandler 顶层的 `registerHandler` 只在 Plugin.pm 的 use 链上触发。
-   诊断时必须 `use` 链视角跑全量。
-2. **非 ASCII 源码风险**：EM DASH（U+2014）等混入 strict 源码曾致无输出编译死。
-   alpha1 起 Plugin.pm 全 ASCII 化（无 use utf8、heredoc 全拆数组拼接、日志文案 ASCII）；
-   中文界面文案走 UTF-8 字节串（页面 charset=utf-8 正确）。
-3. **CI 诊断通道优先级**：jobs API 的 step 粒度红绿（最稳）> artifact 上传
-   （会限流）> runs 日志下载（本会话期间持续 404）。诊断步必须独立成 step。
-4. **stub 完备性**：`main::WEBUI/INFOLOG` 等 main 包常量需在 Log stub 里定义；
-   `use base` 链、`Slim::Player::ProtocolHandlers` 均需显式加载。
-5. **切片器教训**：代码切片诊断会丢 `my` 词法声明（%METADATA 教训）——
-   切片必须携带被切组依赖的全部词法声明。
-6. **本地 MSYS perl 可用**（danger-full-access 后 signal pipe 问题消失）：
-   `C:\Users\jacky\AppData\Local\hermes\git\usr\bin\perl.exe` +
-   `-I t_local`（t_local/JSON/XS.pm 纯 perl JSON 替身，CI 不受影响）。
-   本地秒级复现 CI 编译问题，不再依赖远端轮询。
-7. **kuwo 搜索 API**：`http://search.kuwo.cn/r.s?...` 返回单引号 JSON + GBK，
-   用 `ast.literal_eval` 直解；`MUSICRID` 去 `MUSIC_` 前缀即 songmid。
+---
 
-## 下一步
+## 三、架构与文件地图
 
-- **M0.1**（用户）：按上述步骤装 alpha1 → 导入 v6 源 → 228908 取链/播放。
-  失败看 server.log 的 LXMusic 行 + Web 测试页的错误/日志区。
-- **M0.2**：musicSdk vendor 进 shim（聚合搜索 kw/kg/mg/tx/wy + 榜单）→
-  菜单接入搜索/分类浏览（共识批次2①②）。
-- **M0.3**：歌单搜索/整单播放；**M0.4**：文件上传。
-- shim crypto（aes/rsa/zlib）按 v6 源运行时缺什么补什么。
-- **Token 安全**：M0.1 验证通过后可撤销本 PAT（CI 重发需用户重建并更新
-  本地环境变量）。
+**运行链路**（全部设备端实证）：
+```
+XMLBrowser 菜单 / 网页  →  Plugin.pm（feed handlers / webHandler）
+   →  Helper.pm  fork + exec:  /tmp/LXMusic/qjs  /tmp/LXMusic/shim.mjs  <source.js|sdk.bundle.js>  <action>  <payloadJSON>
+        →  shim.mjs：qjs 环境 polyfill（lx 宿主 API / Buffer / navigator / node-crypto…）
+                     ├─ 源分支：加载洛雪订阅源 → 签名握手 → lx.on('request') → musicUrl 取直链
+                     └─ sdk 分支：加载 vendored musicSdk bundle → search / boards / boardlist / songlist / songlistdetail
+        →  HTTP：shim 用 os.exec 调系统 curl（字节精确、follow 3 跳、可调超时）
+        →  stdout 单行 `RESULT {json}` + `LOG ...` 行
+   →  Helper._parse（类方法！）→ cb({ok,data,error,logs,alerts})
+   →  ProtocolHandler.pm：lxm:// → 解析缓存 → 真实直链 → 交 Slim::Player::Protocols::HTTP 播放
+```
+
+**关键文件**：
+| 路径 | 作用 |
+|---|---|
+| `plugin/LxMusic/Plugin.pm` | 插件主体：OPMLBased 菜单、feed handlers、webHandler（工具页/搜索/试听/封面代理/m3u）、prefs 初始化 |
+| `plugin/LxMusic/Helper.pm` | qjs 子进程编排：init 拷贝引擎、request/fork/轮询/解析、**并发闸**、sourceInfo |
+| `plugin/LxMusic/ProtocolHandler.pm` | `lxm://` 协议：解析缓存、预取、封面发布、播放收尾与客户端刷新信号 |
+| `plugin/LxMusic/Settings.pm` | **M0.5 新增**：`Slim::Web::Settings` 子类（设置页 handler + 订阅源导入/清除 + 诊断信息） |
+| `plugin/LxMusic/HTML/EN/plugins/LxMusic/settings/basic.html` | **M0.5 新增**：设置页模板（header/footer + setting WRAPPER） |
+| `plugin/LxMusic/engine/shim.mjs` | qjs 宿主 shim（源分支 + sdk 分支 + curl 桥） |
+| `plugin/LxMusic/engine/sdk/sdk.bundle.js` | vendored musicSdk 打包产物（kw/kg/tx/wy/mg；bd/xm 已裁） |
+| `plugin/LxMusic/engine/sdk/renderer/…` | vendor 源码树（仅开发用，pack.py 排除不上机） |
+| `plugin/LxMusic/pack.py` | 打包：zip（qjs 0755）+ SHA1 + `repo.xml`；**zip 名带版本号** |
+| `plugin/t/**` | 本地 perl -c 存根（Slim::Plugin::OPMLBased、Web::Settings、Net::SimpleAsyncHTTP、Player::Playlist…） |
+| `tmp/shim-sim/` | **shim 层模拟器**：node loader hook 把 qjs `std`/`os` 映射为 fs/spawnSync，直接跑 shim 的 sdk 分支 |
+| `repo/` | 发布用 git 仓（GitHub `lms-plugin-lxmusic`），内容 = plugin 源码镜像 |
+| `dist/` | `LxMusic-<ver>.zip` + `repo.xml`（pack.py 产物，LAN 直接服务） |
+| `refs/lx-music-desktop/` | 落雪 PC 端全量源码（**getPic/封面逻辑的权威参考**） |
+| `slimserver/` | LMS 源码稀疏克隆（API/契约对照） |
+
+---
+
+## 四、版本史（为什么长这样）
+
+| 版本 | 关键点 |
+|---|---|
+| 0.1.x | 骨架；AnyEvent→Timers/dup2；版本号去掉 `-alpha`（破坏升级比较器）；诊断探针 |
+| 0.2.0~0.2.6 | Buffer 重写为真 Uint8Array 子类；`rawScript`+`env/version` 契约；**CRLF 双侧规范化**（rconfig 403→200）；drain 泵 |
+| 0.2.7 / 0.2.8 | `lx.request` 回调形状对齐 desktop preload；**`_parse` 类方法调用修复**（RESULT 从第一天起从未被解析） |
+| 0.3.0~0.3.2 | vendor musicSdk 落地；**基类改 OPMLBased**（此前菜单从未注册）；curl 诊断 |
+| **0.3.3** | **qjs 语义双雷修复**（见 §五.1）——聚合搜索首次出结果 |
+| 0.3.4~0.3.7 | 超时钳制（15s→7s；migu 3s）；单位 bug 修复；聚合 5.8s |
+| 0.4.0~0.4.5 | 歌单搜索/详情/整单入队；并发闸；m3u 截断；编码修复（`_u()`/`parseUrl`） |
+| 0.5.0~0.5.2 | 队列元数据发布、分页、解析缓存、预取、渲染期预热 |
+| 0.5.3~0.5.9 | 封面五源终态（kg albumId 推导、kw 代理、mg jpg 化）；**封面代理端点 + 新增页面注册**；修复 `SimpleAsyncHTTP->request()` 误用 |
+| **0.5.9（当前设备）** | 以上全部 + 封面代理修正（kg/kw 走代理、mg 直取） |
+
+---
+
+## 五、开发经验与坑（长期有效，按类归档）
+
+### 5.1 qjs / shim（最容易翻车）
+1. **⚠️ qjs 语义双雷（0.3.3 修复，本项目最大坑）**
+   - `os.exec(args,{block:true})` 返回**纯数字退出码**，不是 `{exit_code}` 对象（quickjs-libc.c 注释 "exec -> exitcode"）。读 `r.exit_code` 恒 undefined ⇒ 所有成功请求被误判失败 ⇒ 源重试耗尽抛 `try max num` /「无法连接服务器」。
+   - `FILE.write` **只接收 ArrayBuffer(offset,length)，不收字符串**（POST body 写字符串直接 `TypeError: ArrayBuffer object expected`）。
+   - 教训：**模拟器 stub 必须照抄 C 实现契约**（我最初的 stub 顺手支持了对象/字符串，把两个雷全掩盖）；golden 依据 = bellard quickjs `quickjs-libc.c`。
+2. **qjs 顶层不跑 promise 微任务**：必须 `await` 让出栈；`await` 必须在 async 函数内。源脚本要手动 drain 到 `inited`。
+3. **count/units 陷阱**：桥里 `opts.timeout` 是**毫秒**，而钳制常量用**秒**。0.3.6 写成 `Math.min(3000, 15)`（毫秒混秒）⇒ 所有请求回到 15s，修复被无声回退。**验尸金标准**：页面日志里 curl stderr 的 `timed out after N milliseconds`。
+4. shim 的 Buffer polyfill **必须可 `new`**（vendor 树有 `new Buffer(x)`）；`navigator.userAgent` 在模块加载期就被 kg infSign 读取（qjs 无 navigator ⇒ bundle 加载崩）。
+5. `node --check` 对 `.mjs` 按 CJS 解析会误报顶层 await —— 真实 ESM 验证用 `node -e "import('file:///…')"`。
+
+### 5.2 LMS / 达菲（契约层）
+6. **主循环不驱动 AnyEvent**：回调永不触发。配方 = 子进程输出落临时文件 + `Slim::Utils::Timers` 轮询 `waitpid(WNOHANG)` + `POSIX::open/dup2` 重定向 fd（`open(STDOUT,…)` 会死在 Log::Trapper 的 tie 上）。
+7. **达菲过滤 info 级日志** ⇒ 诊断输出必须 `$log->warn`（或 `$log->error`）。
+8. **插件日志分类必须注册**：只 `logger('plugin.lxmusic')` 不注册 ⇒ 调试页不列出、重启后 warn/info 静默丢失。修法：`Slim::Utils::Log->addLogCategory({category=>'plugin.lxmusic', defaultLevel=>'ERROR', description=>'LX Music'})`；开 DEBUG 时必须带 **`persist=1`**（不带则重启即失效）。
+9. **插件基类必须 `Slim::Plugin::OPMLBased`**（0.1~0.3.0 误用 Base ⇒ feed/tag/menu 被无视，菜单/CLI 从未注册，是潜伏 bug）。
+10. **XMLBrowser 契约**：feed coderef 收 `($client,$cb,\%args,@passthrough_flat)`（位置参数）；下钻靠 `item_id:<层级>`；CLI 搜索=`search:<词>`；**web 表单=`index=<序号>&q=<词>`**（不是 `search=`）。
+11. **新增 web 页面必须注册**：`Slim::Web::Pages->addPageFunction('plugins/LxMusic/cover', …)`——漏注册会落到 LMS 默认 404（0.5.6 现场：'代理端点 404'）。
+12. **`SimpleAsyncHTTP` 没有 `->request($req)`**：自定义 header 是作为 `get($url, @headers)` 的**额外参数**传给 Net::HTTP::NB::formatRequest（源码 L49-53 注释明示）。用错 ⇒ 页面处理器整体崩溃、端点对任何 URL 都返回连接失败（0.5.8 现场：**改了 kg 却把原本正常的 mg 一起弄坏**）。
+13. **LMS 把远程 m3u 当"单条链式流"**：`playlist play <m3u>` 队列里只有 1 条（顺序播但不可见/不可跳）。**整单正确做法 = 插件侧展开**：feed 放 `type=link` 项 → handler 内 `Slim::Control::Request::executeRequest($player,['playlist','clear'|'play'|'add',$url])`（实测 `playlist add` 仅 5-7ms）。
+14. **队列/正在播放元数据**：渲染期 `Slim::Music::Info::setRemoteMetadata($url,{title,secs,cover})`（否则队列行只有裸 URL）+ 解析完成 `currentPlaylistUpdateTime(time())` + `notifyFromArray($client,['playlist','newmetadata'])`（否则轮询客户端不刷新面板）。
+15. **分页**：handler 读 `$args->{index}/{quantity}`，`page=int(index/50)+1`、`skip=index%50`；避免返回的 rows < 上报 total（会被补空行）。
+16. **`Slim::Web::Settings`**：子类 + `require`+`->new()`（`if (main::WEBUI)`）；模板 `HTML/EN/plugins/<Name>/settings/basic.html`；基类会把**声明的每个 pref 都用表单值覆盖**（未勾选的 checkbox ⇒ 置空），所以模板里必须为每个声明的 pref 提供字段。
+17. CLI **9090** 是可靠通道（CLI 命令可下钻/查状态）；`/jsonrpc.js` 可用但异步 items 查询会返回空；POST 到 `/` 只会返回皮肤 HTML。
+
+### 5.3 编码 / 中文
+18. **`uri_unescape` 返回未打 UTF-8 旗标的字节串**，交给 LMS（`getMetadataFor`/`setRemoteMetadata`）会被按 latin1 再编码 ⇒ 队列/正在播放乱码（`å¨æ°ä¼¦`）。修法：`parseUrl` 里 `Encode::decode('UTF-8', …)`（FB_CROAK，失败保留原值）。
+19. **`join(' · ', …)` 混用旗标/未旗标串**会把非 ASCII 分隔符搞坏 ⇒ 分隔符也要过 `_u()`；m3u 是字节流 ⇒ `Encode::encode('UTF-8', …)` 显式落字节。
+20. **PowerShell `Set-Content` 会写坏 UTF-8 中文（三次事故，禁令级）**——改文件一律 python bytes replace / write·edit 工具；PS 给 curl.exe 传 JSON 会吃内嵌双引号（body 走 `--data-binary @file`）。
+
+### 5.4 自主升级链（本项目最大工程资产）
+21. **LMS 插件下载按 zip 文件名做 digest 校验**：同名 `LxMusic.zip` 连续升级会 `digest does not match` 而**静默不装**（表现为"POST 成功但版本不变"）。**必须版本化文件名** `LxMusic-<ver>.zip`（pack.py 已改）。
+22. **仓库缓存 300s TTL**：两次 POST 间隔 <5min 会拿旧仓数据判"无更新" ⇒ 等满 5 分钟再 POST，或用 `--repos=…?v=N` 换新 URL 破缓存。
+23. **安装序列**：`diag_plugin_install.py post LxMusic` →（等 TTL）→ `restart`（**有"正在播放则中止"守卫**，需先 stop 播放器）→ **只看 `/plugins/LxMusic/index.html` 的页面版本号**确认。
+24. **日志端点延迟可达 10+ 分钟**（`/server.log?zip=1`、mslog、log.txt 都一样）⇒ 别把它当实时通道；实时诊断优先用「插件自己渲染在页面上的 logs 块」与 CLI/JSONRPC 查询。
+25. 首次打包/升级的隐形前提：**Helper init 会重建 `/tmp/LXMusic`**；init 曾因 qjs 拷贝失败提前 return 导致 shim 停在旧版（已加固：shim/sdk 先拷、qjs 失败仅降级）。
+
+---
+
+## 六、自主开发闭环（下个 session 直接复用）
+
+1. **改代码** → 本地校验：`perl -I plugin\t_local -I plugin\t -I plugin -c plugin\LxMusic\<Module>.pm`（需要 `plugin/t/**` 存根）；`node --check engine/shim.mjs`；shim 侧行为验证用 `tmp/shim-sim/`。
+2. **打包发布（LAN）**：`$env:LX_REPO_BASE='http://192.168.2.68:8765'; python plugin\LxMusic\pack.py`（产物进 `dist/`，LAN 即时生效）→ 同步 `repo/plugin/**` → `git -C repo commit --amend`（本地提交，未 push 的历史用 amend）。
+3. **装机**：`python _research/ximalaya-daphile-plugin/m0/diag_plugin_install.py post LxMusic`（**等 TTL**）→ `… restart`（先确保播放器 stop）→ 轮询页面版本号。
+4. **取证**：
+   - CLI 9090：`lxmusic items 0 40 item_id:0 search:晴天`（菜单/下钻/搜索）；`<playerid> status - 1 tags:cgAl`（播放状态）。
+   - JSONRPC：`/jsonrpc.js` POST `{"id":1,"method":"slim.request","params":["<playerid>",["playlist","play",["<url>"]]]}`。
+   - 页面自证：`?q=`（搜索）、`?type=pl&q=`（歌单搜索）、`?plid=&plsrc=`（歌单详情）、`?track=`（试听解析）、`?u=<b64url>`（封面代理，返回图片字节即设备侧可直连该 CDN）。
+   - 日志：设备日志端点（**延迟大**）；插件自身 `LOG …` 行会渲染在搜索/歌单页的 logs 块里。
+5. **播放验证**：`playlist clear` → `playlist add <lxm://…>`×N → `playlist jump 0` → `play` → `<playerid> status`；用户听声确认。
+
+**播放器**：HiBy FC4 `5a:78:10:59:c7:74`（用户主用，验证目标）；HD-Audio Generic `5a:bf:86:1b:a6:ff`（本机声卡）；小爱音箱 squeezelite `bb:bb:69:a9:cf:23`（**会出声，勿用**）。
+
+---
+
+## 七、下个 session 待办（按序）
+
+1. **M0.5 设置页收尾（当前 WIP，代码已完成待验证）**
+   - 已有：`Plugin/LxMusic/Settings.pm`、`HTML/EN/plugins/LxMusic/settings/basic.html`、新 prefs（`bridgeTimeout`/`helperConcurrency`/`resolveTtl`/`coverProxy`/`boardsKg|Tx|Wy|Mg`）、接线（Helper 并发闸与 `LX_BRIDGE_TIMEOUT` 环境变量下发、ProtocolHandler `resolveTtl`、Plugin 封面代理开关与榜单源开关、`Helper::engineStatus`）。
+   - **待做**：① `Plugin.pm` 里把 `coverProxy` / `boards*` 两个开关真正接进 `_coverOf` 与 `handleFeed`（**这两处尚未接线**）；② 补 `Settings.pm` 的 `$params->{lxEngine}` 改为调用 `Helper->engineStatus`（现为占位）；③ bump **0.6.0** → pack → 装机 → 打开 `/plugins/LxMusic/settings/basic.html` 验证渲染；④ 逐项保存验证（音质/超时/并发/TTL/开关）并确认**立即生效**（Helper/ProtocolHandler 每次请求读 prefs）；⑤ 订阅源导入/清除按钮实测。
+2. **M0.6 候选**：常驻 qjs worker（把冷解析 2.3s 降到 ~0，桌面版体感）；搜索渐进式出结果；kw 榜单（上游签名已失效，需重新逆向或放弃）。
+3. **遗留清理**：`repo/plugin/helper-test.log`、页面硬编码版本号字符串、`tmp/` 诊断脚本归置。
+4. **PAT 撤销**：本轮发布用的 token 由用户提供，**用完提醒用户撤销**。
+5. **发布**：GitHub `jackyytche/lms-plugin-lxmusic`（本轮已推 main + Release；后续版本沿用 pack.py 的 GH_BASE 生成 repo.xml 资产）。
+
+---
+
+## 八、现场状态与凭据
+
+- **设备**：达菲 `192.168.2.111`（LMS 9.0.3 / perl 5.40；Web `:9000`，CGI `:80`）；运行 **0.5.9**。
+- **通道**：达菲订阅 = **LAN** `http://192.168.2.68:8765/repo.xml`（8765 常驻 `python -m http.server` 指向 `dist/`；**进程易失**，掉线就在 `dist/` 重启）。
+- **本机 IP/仓库基址**：`192.168.2.68:8765`（**DHCP 可能变化**，变了要同步 `dist/repo.xml` 的 URL 与 pack.py 的 `LAN_BASE`）。
+- **GitHub**：`jackyytche/lms-plugin-lxmusic`；PAT 由用户在需要时提供（**勿写入文件**；撤销提醒见 §七.4）。
+- **订阅源样本**：`refs/samples/lx-music-source-v6-fixed.js`（与 pdone/lx-music-source 官方 `lx/6.js` 逐字节一致）。
+- **本地工具**：python 3.14（`pack.py`、诊断脚本）、node 24（`tmp/shim-sim`）、达菲诊断脚本复用喜马拉雅项目 `_research/ximalaya-daphile-plugin/m0/diag_plugin_install.py`（装机/重启）与 `diag_settings_form.py`（改日志级别等整表回放）。
+
+---
+
+## 九、文档与索引
+
+- `共识定版.md` — 需求定稿（§一为其摘要）
+- `docs/lx-music-source-analysis.md` — 订阅源深度分析；`docs/lx-music-custom-source-api.md` — lx 宿主契约
+- `docs/js-helper-architecture.md` — Perl+qjs 助手架构设计；`docs/existing-bridges-and-lms-constraints.md` — 桥接方案与约束调研
+- `docs/source-api-endpoint-inventory.md` — 各源端点清单
+- `plugin/LxMusic/engine/sdk/` — vendor 树与打包产物说明；`tmp/shim-sim/` — shim 模拟器
+- `refs/lx-music-desktop/`（PC 端源码，封面/榜单权威参考）、`refs/lx-music-mobile/`、`refs/samples/`、`slimserver/`（LMS 源码）

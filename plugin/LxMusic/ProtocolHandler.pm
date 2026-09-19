@@ -16,10 +16,16 @@ use base qw(Slim::Player::Protocols::HTTP);
 
 use MIME::Base64 qw(encode_base64url decode_base64url);
 use URI::Escape qw(uri_escape_utf8 uri_unescape);
+use Encode ();
+use Scalar::Util qw(blessed);
 
 use Slim::Music::Info;
+use Slim::Networking::SimpleAsyncHTTP;
+use Slim::Player::Playlist;
 use Slim::Player::ProtocolHandlers;
+use Slim::Control::Request;
 use Slim::Utils::Log;
+use Slim::Utils::Prefs;
 
 use Plugins::LxMusic::Helper;
 my $log = logger('plugin.lxmusic');
@@ -48,6 +54,12 @@ sub buildUrl {
 	my $type  = $a{type}  || '320k';
 	my $name  = $a{name}  || '';
 
+	# name 可能是 raw UTF-8 字节串（.pm 字面量）：uri_escape_utf8 对未打旗标的
+	# 字节串按 latin1 逐字节升级 → mojibake。统一解码成字符旗标串（已解码则透传）。
+	if (defined $name && $name ne '' && !utf8::is_utf8($name)) {
+		$name = Encode::decode('UTF-8', $name);
+	}
+
 	my $json = $JSON->encode($music);
 	my $b64  = encode_base64url($json);
 	my $q    = 's=' . uri_escape_utf8($src)
@@ -72,6 +84,21 @@ sub parseUrl {
 		}
 	}
 
+	# 修复队列/正在播放乱码：uri_unescape 返回未打旗标的 UTF-8 字节串，
+	# 直接交给 LMS（getMetadataFor/setRemoteMetadata）会被前端按 latin1 再编码一次。
+	# 统一 decode 成字符旗标串（非法 UTF-8 时保留原值）。
+	for my $k (keys %q) {
+		next unless defined $q{$k} && length $q{$k};
+		next if utf8::is_utf8($q{$k});
+		my $decoded = eval { Encode::decode('UTF-8', $q{$k}, Encode::FB_CROAK()) };
+		if (defined $decoded) {
+			$q{$k} = $decoded;
+		}
+		else {
+			$log->warn('LxMusic: url param not utf8 (' . $k . '), kept raw');
+		}
+	}
+
 	my $json  = eval { decode_base64url($b64) } or return undef;
 	my $music = eval { $JSON->decode($json) } or return undef;
 	ref($music) eq 'HASH' or return undef;
@@ -82,6 +109,214 @@ sub parseUrl {
 		type  => ($q{t} || '320k'),
 		name  => ($q{n} || ''),
 	};
+}
+
+# ---------- 解析缓存（0.5.1）：同一 lxm:// 在 TTL 内直接命中，零 fork ----------
+my %RESOLVE_CACHE;      # url => { direct => 'http...', expires => epoch }
+my $prefs = preferences('plugin.lxmusic');   # 设置页可调（resolveTtl）
+
+# 直链有 CDN 签名时效；TTL 由设置页控制（默认 600s）
+sub _resolveTtl {
+	my $n = $prefs->get('resolveTtl');
+	return (defined $n && $n >= 0 && $n <= 3600) ? int($n) : 600;
+}
+
+my $MAX_CACHE   = 200;
+
+sub _cache_get {
+	my ($url) = @_;
+	my $c = $RESOLVE_CACHE{$url} or return undef;
+	if (($c->{expires} || 0) > time()) {
+		return $c;
+	}
+	delete $RESOLVE_CACHE{$url};
+	return undef;
+}
+
+sub _cache_put {
+	my ($url, $direct) = @_;
+	return unless $url && $direct;
+	%RESOLVE_CACHE = () if keys %RESOLVE_CACHE > $MAX_CACHE;
+	$RESOLVE_CACHE{$url} = { direct => $direct, expires => time() + _resolveTtl() };
+	return 1;
+}
+
+# 解析收尾（快慢路径共用）：元数据 + 客户端刷新信号 + 流地址替换
+sub _finish_resolve {
+	my ($class, $song, $url, $info, $direct, $args, $cb) = @_;
+
+	my $qLabel = $class->qualityLabel($info->{type});
+	my %meta = (ct => ($qLabel =~ /FLAC/i ? 'audio/flac' : 'audio/mpeg'), type => $qLabel);
+	$meta{title} = $info->{name} if $info->{name};
+	Slim::Music::Info::setRemoteMetadata($url, \%meta);
+	$class->cache_metadata($url, { title => $info->{name}, quality => $qLabel });
+
+	# 封面：队列/正在播放也要有图（tx/wy/mg 直取，kg 推导，kw 异步 getPic）
+	eval { $class->_publish_cover($url, $info->{src}, $info->{music}) };
+
+	# 晚到元数据：轮询客户端靠 playlist_timestamp 变化才会重取富 status（喜马拉雅 0.1.48/49 实证）
+	if (blessed($song) && $song->can('master')) {
+		if (my $pc = $song->master()) {
+			$pc->currentPlaylistUpdateTime(time())
+				if blessed($pc) && $pc->can('currentPlaylistUpdateTime');
+			Slim::Control::Request::notifyFromArray($pc, [ 'playlist', 'newmetadata' ]);
+		}
+	}
+
+	$song->streamUrl($direct) if blessed($song) && $song->can('streamUrl');
+	$args->{cb} = sub {
+		my ($track) = @_;
+		if ($track && $info->{name}) {
+			$track->title($info->{name});
+			$track->url($url);
+		}
+		$cb->($track, @_);
+	};
+	$class->SUPER::scanUrl($direct, $args);
+	return;
+}
+
+# 预取下一首（0.5.1）：把下一首的 2.3s 解析藏在本首播放期间，切歌近乎零等待
+sub _prefetch_next {
+	my ($class, $song, $url) = @_;
+
+	return unless blessed($song) && $song->can('master');
+	my $client = $song->master() or return;
+
+	my $tracks = eval { Slim::Player::Playlist::tracks($client) };
+	return unless $tracks && ref($tracks) eq 'ARRAY' && @$tracks;
+
+	my ($idx) = grep { blessed($tracks->[$_]) && $tracks->[$_]->can('url') && $tracks->[$_]->url eq $url }
+		0 .. $#$tracks;
+	return unless defined $idx && $idx < $#$tracks;
+
+	my $nextTrack = $tracks->[ $idx + 1 ];
+	return unless blessed($nextTrack) && $nextTrack->can('url');
+	my $nextUrl = $nextTrack->url;
+	return unless $nextUrl && $nextUrl =~ m{^lxm://};
+	return if _cache_get($nextUrl);            # 已有缓存不必再取
+
+	my $ninfo = eval { $class->parseUrl($nextUrl) } or return;
+	my $sourcePath = Plugins::LxMusic::Helper->currentSourcePath() or return;
+
+	$log->info('LxMusic: prefetch next (' . ($ninfo->{name} || '') . ')');
+	Plugins::LxMusic::Helper->request(
+		source   => $sourcePath,
+		action   => 'musicUrl',
+		sourceId => $ninfo->{src},
+		info     => { musicInfo => $ninfo->{music}, type => $ninfo->{type} },
+		timeout  => 20,
+		cb       => sub {
+			my ($res) = @_;
+			my $direct = $res->{data};
+			if ($res->{ok} && $direct && !ref($direct) && $direct =~ /^https?:/) {
+				_cache_put($nextUrl, $direct);
+				$log->info('LxMusic: prefetched ok');
+			}
+			else {
+				$log->debug('LxMusic: prefetch failed: ' . ($res->{error} || 'unknown'));
+			}
+		},
+	);
+	return;
+}
+
+# 渲染期预热（0.5.2）：列表渲染完就后台解析前 N 首，用户点哪首都是缓存命中（秒开）。
+# 受 Helper 并发闸（max 2）保护，不会打满设备；已在缓存里的跳过。
+sub warmTracks {
+	my ($class, $urls, $max) = @_;
+	$max ||= 3;
+	return 0 unless $urls && ref($urls) eq 'ARRAY';
+
+	my $n = 0;
+	for my $u (@$urls) {
+		last if $n >= $max;
+		next unless $u && $u =~ m{^lxm://};
+		next if _cache_get($u);
+
+		my $info = eval { $class->parseUrl($u) } or next;
+		my $sourcePath = Plugins::LxMusic::Helper->currentSourcePath() or last;
+
+		$n++;
+		$log->info('LxMusic: warm ' . $n . ' (' . ($info->{name} || '') . ')');
+		Plugins::LxMusic::Helper->request(
+			source   => $sourcePath,
+			action   => 'musicUrl',
+			sourceId => $info->{src},
+			info     => { musicInfo => $info->{music}, type => $info->{type} },
+			timeout  => 20,
+			cb       => sub {
+				my ($res) = @_;
+				my $direct = $res->{data};
+				_cache_put($u, $direct)
+					if $res->{ok} && $direct && !ref($direct) && $direct =~ /^https?:/;
+			},
+		);
+	}
+	return $n;
+}
+
+# 曲目封面推导（对齐落雪 PC：列表用 musicInfo.img；缺失时按源推导 / getPic）
+# - tx/wy/mg：musicInfo.img 自带
+# - kg：albumId 直出 stdmusic 封面（实测 200/17.8KB，比 PC 端的 get_res_privilege POST 更省）
+# - kw：PC 端 getPic = pic.web?rid=<songmid>，响应体是图片 URL 纯文本（实测 200 -> kwcdn jpg 108KB）
+#       该 URL 需要一次 GET 才能拿到，故只在解析时异步取（队列/正在播放有图），列表行不阻塞
+sub _coverFromMusic {
+	my ($src, $m) = @_;
+	return '' unless $m && ref($m) eq 'HASH';
+
+	for my $k (qw(img pic albumPic picUrl cover)) {
+		my $v = $m->{$k};
+		if (defined $v && $v ne '' && $v =~ m{^https?://}) {
+			$v =~ s/\.webp$/.jpg/i;   # mg 的 webp 换成同路径 .jpg（实测 200/159KB jpeg）
+			return $v;
+		}
+	}
+	if (($src || '') eq 'kg' && ($m->{albumId} || '') =~ /^\d+$/) {
+		return 'https://imge.kugou.com/stdmusic/240/' . $m->{albumId} . '.jpg';
+	}
+	if (($src || '') eq 'tx' && ($m->{albumMid} || '') =~ /^[A-Za-z0-9]+$/) {
+		return 'https://y.gtimg.cn/music/photo_new/T002R300x300M000' . $m->{albumMid} . '.jpg';
+	}
+	return '';
+}
+
+sub _publish_cover {
+	my ($class, $url, $src, $music) = @_;
+
+	my $cover = _coverFromMusic($src, $music);
+	if ($cover) {
+		Slim::Music::Info::setRemoteMetadata($url, { cover => $cover });
+		$class->cache_metadata($url, { cover => $cover });
+		return 1;
+	}
+
+	# kw：一次轻量 GET 换图片 URL（PC 端同款 getPic），异步不阻塞主循环
+	if (($src || '') eq 'kw' && $music && ($music->{songmid} || '') =~ /^\d+$/) {
+		my $picApi = 'http://artistpicserver.kuwo.cn/pic.web?corp=kuwo&type=rid_pic&pictype=500&size=500&rid='
+			. $music->{songmid};
+		eval {
+			Slim::Networking::SimpleAsyncHTTP->new(
+				sub {
+					my $res = shift;
+					my $img = $res ? $res->content : '';
+					if ($img && $img =~ m{^https?://\S+$}) {
+						$img =~ s/\s+$//;
+						Slim::Music::Info::setRemoteMetadata($url, { cover => $img });
+						$class->cache_metadata($url, { cover => $img });
+						$log->debug('LxMusic: kw cover ok');
+					}
+					else {
+						$log->debug('LxMusic: kw cover miss');
+					}
+				},
+				{ timeout => 8 },
+			)->get($picApi);
+		};
+		return 1;
+	}
+
+	return 0;
 }
 
 # ---------- 播放解析 ----------
@@ -95,6 +330,14 @@ sub scanUrl {
 	unless ($info) {
 		$log->error('LxMusic: cannot parse request url');
 		$cb->(undef);
+		return;
+	}
+
+	# 同步快路：命中缓存直接交父类，省掉 qjs fork + 上游请求（桌面版级别的瞬时起播）
+	if (my $cached = _cache_get($url)) {
+		$log->info('LxMusic: resolve cache HIT (' . ($info->{name} || '') . ')');
+		$class->_finish_resolve($song, $url, $info, $cached->{direct}, $args, $cb);
+		$class->_prefetch_next($song, $url);
 		return;
 	}
 
@@ -126,29 +369,12 @@ sub scanUrl {
 			}
 
 			$log->info('LxMusic: resolved ' . substr($direct, 0, 80));
-
-			# now-playing 元数据：标题 + 音质（如实显示）
-			my $qLabel = $class->qualityLabel($info->{type});
-			if ($info->{name}) {
-				Slim::Music::Info::setRemoteMetadata($url, {
-					title => $info->{name},
-					ct    => ($qLabel =~ /FLAC/i ? 'audio/flac' : 'audio/mpeg'),
-					type  => $qLabel,
-				});
-			}
-			$class->cache_metadata($url, { title => $info->{name}, quality => $qLabel });
+			_cache_put($url, $direct);
 
 			# 直链是实际流地址；playlist 里保持稳定的 lxm:// URL
-			$song->streamUrl($direct);
-			$args->{cb} = sub {
-				my ($track) = @_;
-				if ($track && $info->{name}) {
-					$track->title($info->{name});
-					$track->url($url);
-				}
-				$cb->($track, @_);
-			};
-			$class->SUPER::scanUrl($direct, $args);
+			$class->_finish_resolve($song, $url, $info, $direct, $args, $cb);
+			$class->_prefetch_next($song, $url);
+			return;
 		},
 	);
 
@@ -179,8 +405,32 @@ sub cache_metadata {
 		title   => $info->{title}   || '',
 		quality => $info->{quality} || '',
 		error   => $info->{error}   || '',
+		cover   => $info->{cover}   || '',
+		secs    => $info->{secs}    || 0,
 	};
 
+	return 1;
+}
+
+# 渲染期发布队列/正在播放元数据（喜马拉雅 0.1.47 同款）：
+# 不发布则队列行只有裸 URL（无歌名/无封面）；列表数据已在手，零额外 API 调用。
+sub publishQueueMetadata {
+	my ($class, $url, $info) = @_;
+	return 0 unless $url && ref($info) eq 'HASH';
+
+	my %meta;
+	$meta{title} = $info->{title} if defined $info->{title} && $info->{title} ne '';
+	$meta{secs}  = $info->{secs}  if $info->{secs} && $info->{secs} > 0;
+	$meta{cover} = $info->{cover} if defined $info->{cover} && $info->{cover} ne '';
+	return 0 unless scalar keys %meta;
+
+	Slim::Music::Info::setRemoteMetadata($url, \%meta);
+	$class->cache_metadata($url, {
+		title   => $info->{title},
+		cover   => $info->{cover},
+		secs    => $info->{secs},
+		quality => $info->{quality},
+	});
 	return 1;
 }
 
@@ -190,6 +440,8 @@ sub getMetadataFor {
 	if (my $m = $METADATA{$url}) {
 		my %meta;
 		$meta{title} = $m->{title} if $m->{title};
+		$meta{cover} = $m->{cover} if $m->{cover};
+		$meta{secs}  = $m->{secs}  if $m->{secs};
 		if ($m->{quality}) {
 			$meta{type}    = $m->{quality};
 			$meta{bitrate} = $m->{quality};

@@ -137,7 +137,8 @@ async function main(std, os) {
 		if (options.body != null && options.body !== '') {
 			const wf = std.open(fIn, 'wb');
 			if (!wf) throw new Error('cannot write request body file');
-			wf.write(toUtf8(String(options.body)));
+			const u8 = toUtf8(String(options.body));
+			wf.write(u8.buffer, u8.byteOffset, u8.byteLength);   // write 只收 ArrayBuffer
 			wf.close();
 			args.push('--data-binary', '@' + fIn);
 		} else if (options.form && method !== 'GET') {
@@ -385,12 +386,14 @@ async function main(std, os) {
 			return new NodeBuf(out2);
 		}
 	}
-	const NodeBuffer = {
-		from: (d, e) => new NodeBuf(d, e),
-		alloc: (n) => new NodeBuf(Number(n) || 0),
-		concat: (arr) => new NodeBuf(0).concat(arr),
-		isBuffer: (x) => x instanceof NodeBuf,
-	};
+	// Buffer 必须可 new（vendor musicSdk 的 request/crypto/zlib 与 js-md5/js-sha1
+	// 都有 `new Buffer(x)` 调用；node harness 里真 Buffer 是构造函数所以曾漏测）。
+	// 类继承 NodeBuf 获得实例方法；静态方法挂类上（不用 static 字段语法，兼容旧 qjs）。
+	class NodeBuffer extends NodeBuf { }
+	NodeBuffer.from = (d, e) => new NodeBuf(d, e);
+	NodeBuffer.alloc = (n) => new NodeBuf(Number(n) || 0);
+	NodeBuffer.concat = (arr) => new NodeBuf(0).concat(arr);
+	NodeBuffer.isBuffer = (x) => x instanceof NodeBuf;
 	globalThis.Buffer = NodeBuffer;
 	globalThis.TextEncoder = class { encode(s) { return toUtf8(String(s)); } };
 	globalThis.TextDecoder = class { decode(u8) { return utf8Decode(u8); } };
@@ -466,10 +469,235 @@ async function main(std, os) {
 	if (rawArgs[0] && /\.mjs$/.test(rawArgs[0])) ai = 1;
 	const args = rawArgs.slice(ai);
 	if (args.length < 3) {
-		print('RESULT ' + JSON.stringify({ ok: false, error: 'usage: qjs shim.mjs <source.js> <action> <infoJSON> (args=' + JSON.stringify(rawArgs) + ')' }));
+		print('RESULT ' + JSON.stringify({ ok: false, error: 'usage: qjs shim.mjs <source.js|sdk.bundle.js> <action> <infoJSON> (args=' + JSON.stringify(rawArgs) + ')' }));
 		std.exit(1);
 	}
 	const [sourcePath, action, infoJson] = args;
+
+	// ---------- SDK 模式（vendored musicSdk，无需订阅源） ----------
+	// qjs shim.mjs <sdk.bundle.js> <search|boards|boardlist|songlist|songlistdetail> <payloadJSON>
+	//   search    payload = { query, source?, page?, limit? }
+	//             source 缺省 = searchMusic 跨源聚合（返回按源分组的数组）
+	//   boards    payload = { source }                       -> getBoards()
+	//   boardlist payload = { source, bangid|id, page? }     -> getList(bangid, page)
+	//     注：kg/tx/wy/mg 的 getList 吃 bangid；kw 榜单上游 wbd 签名已失效（搜索不受影响）
+	const SDK_ACTIONS = { search: 1, boards: 1, boardlist: 1, songlist: 1, songlistdetail: 1 };
+	if (SDK_ACTIONS[action]) {
+		let payload = {};
+		try { payload = JSON.parse(infoJson || '{}') || {} } catch (e) {}
+		if (payload && payload.info && typeof payload.info === 'object') payload = payload.info;
+		print('LOG sdk mode=' + action + ' payload=' + JSON.stringify(payload).slice(0, 200));
+		// navigator polyfill：kg infSign 模块加载期读 navigator.userAgent（KGBrowser 检测）。
+		// node harness（node24 自带 navigator）是已验证基线，值贴 node 避免走进未测分支。
+		if (typeof globalThis.navigator === 'undefined') {
+			globalThis.navigator = { userAgent: 'Node.js/24', platform: 'linux', language: 'zh-CN' };
+		}
+		// ---- __lxBinHttp：sdk bundle 的 HTTP 实体（字节精确，curl 落临时文件）----
+		// fetch(url, {method, headers, body:Uint8Array|null, timeout:ms})
+		//   -> {statusCode, headers, bytes:Uint8Array}；失败 throw Error(.code)
+		const bridgeTmpBase = (os.getenv && os.getenv('LX_TMP') || '/tmp') + '/lxh_' + Date.now() + '_' + Math.floor(Math.random() * 1e6);
+		function curlHeaderName(line, name) {
+			const m = line.match(new RegExp('^' + name + '\\s*:\\s*(.*)$', 'i'));
+			return m ? m[1].trim() : null;
+		}
+		function readBinFile(path) {
+			const f = std.open(path, 'rb');
+			if (!f) throw new Error('binHttp: cannot open ' + path);
+			const chunks = [];
+			const buf = new Uint8Array(65536);
+			for (;;) {
+				const n = f.read(buf.buffer, 0, buf.length);
+				if (n <= 0) break;
+				chunks.push(buf.slice(0, n));
+				if (n < buf.length) break;
+			}
+			f.close();
+			let total = 0;
+			for (const c of chunks) total += c.length;
+			const out = new Uint8Array(total);
+			let off = 0;
+			for (const c of chunks) { out.set(c, off); off += c.length; }
+			return out;
+		}
+		function writeBinFile(path, bytes) {
+			const f = std.open(path, 'wb');
+			if (!f) throw new Error('binHttp: cannot write ' + path);
+			// bellard FILE.write 只收 ArrayBuffer(offset,length)，不收字符串！
+			f.write(bytes.buffer, bytes.byteOffset, bytes.length);
+			f.close();
+		}
+		function bytesToLatin1(b) {
+			let s = '';
+			for (let i = 0; i < b.length; i++) s += String.fromCharCode(b[i]);
+			return s;
+		}
+		function curlOnce(url, opts, outBin, outHdr, inBody) {
+			const outErr = outHdr + '.err';
+			// 桥级超时钳制（单位：秒！opts.timeout 是 ms）：UI 等不了 15s 级拖尾；
+			// migu.cn 设备网络实测 ~325B/s 龟速（0.3.4 现场测量），单独 3s 快速失败
+			// 上限由设置页下发（Helper 传 LX_BRIDGE_TIMEOUT），默认 7s
+			const envCap = (os.getenv && Number(os.getenv('LX_BRIDGE_TIMEOUT'))) || 7;
+			const baseCap = envCap >= 2 && envCap <= 30 ? envCap : 7;
+			const mHost = String(url).match(/^https?:\/\/([^\/]+)/i);
+			const capSec = (mHost && /migu\.cn/i.test(mHost[1])) ? Math.min(3, baseCap) : baseCap;
+			const tmo = Math.min(capSec, Math.max(2, Math.ceil((opts.timeout || 15000) / 1000)));
+			const args = ['curl', '-sS', '--max-time', String(tmo),
+				'-o', outBin, '-D', outHdr, '--path-as-is', '--stderr', outErr];
+			const hdrs = opts.headers || {};
+			for (const k of Object.keys(hdrs)) {
+				if (hdrs[k] == null) continue;
+				args.push('-H', k + ': ' + String(hdrs[k]));
+			}
+			const method = String(opts.method || 'get').toLowerCase();
+			if (method !== 'get' && method !== 'head') args.push('-X', method.toUpperCase());
+			if (opts.body && opts.body.length) {
+				writeBinFile(inBody, opts.body);
+				args.push('--data-binary', '@' + inBody);
+			}
+			args.push(url);
+			const r = os.exec(args, { block: true });
+			// 设备 bellard qjs：block exec 返回纯数字退出码（quickjs-libc.c "exec -> exitcode"）；
+			// 兼容对象形态（node sim stub 旧约定）
+			const code = typeof r === 'number' ? r : (r ? ((r.exit_code != null) ? r.exit_code : 1) : 1);
+			if (code !== 0) {
+				let errText = '';
+				try { const ef = std.open(outErr, 'r'); if (ef) { for (;;) { const l = ef.getline(); if (l == null) break; errText += l + '\n'; } ef.close(); } } catch (e) {}
+				print('LOG binHttp curl exit=' + code + ' url=' + String(url).slice(0, 80) + ' stderr=' + errText.slice(0, 200));
+				print('LOG binHttp args=' + JSON.stringify(args).slice(0, 400));
+			}
+			if (code === 28) throw errCode('binHttp timeout', 'ETIMEDOUT');
+			if (code === 6 || code === 7) throw errCode('binHttp connect failed', 'ENOTFOUND');
+			if (code !== 0) throw errCode('binHttp curl exit ' + code, 'ECONNRESET');
+			const hf = std.open(outHdr, 'r');
+			const headerLines = [];
+			if (hf) {
+				for (;;) {
+					const line = hf.getline();
+					if (line === undefined || line === null) break;
+					headerLines.push(line.replace(/\r$/, ''));
+				}
+				hf.close();
+			}
+			let statusCode = 0;
+			for (const line of headerLines) {
+				const m = line.match(/^HTTP\/[\d.]+\s+(\d{3})/);
+				if (m) statusCode = Number(m[1]);
+			}
+			const headers = {};
+			for (const line of headerLines) {
+				const c = line.indexOf(':');
+				if (c > 0) headers[line.slice(0, c).trim().toLowerCase()] = line.slice(c + 1).trim();
+			}
+			const bytes = readBinFile(outBin);
+			print('LOG binHttp ' + statusCode + ' ' + bytes.length + 'B ' + String(url).slice(0, 70));
+			return { statusCode, headers, bytes };
+		}
+		function errCode(msg, code) {
+			const e = new Error(msg);
+			e.code = code;
+			return e;
+		}
+		globalThis.__lxBinHttp = {
+			fetch(url, opts) {
+				const outBin = bridgeTmpBase + '.bin';
+				const outHdr = bridgeTmpBase + '.hdr';
+				const inBody = bridgeTmpBase + '.in';
+				try {
+					let cur = String(url);
+					for (let hop = 0; hop < 3; hop++) {
+						const r = curlOnce(cur, opts || {}, outBin, outHdr, inBody);
+						if (r.statusCode >= 300 && r.statusCode < 400 && r.headers['location']) {
+							const loc = r.headers['location'];
+							const origin = (cur.match(/^https?:\/\/[^/]+/i) || ['']);
+							cur = /^https?:\/\//i.test(loc) ? loc : (loc.charAt(0) === '/' ? origin[0] + loc : cur.slice(0, cur.lastIndexOf('/') + 1) + loc);
+							continue;
+						}
+						return r;
+					}
+					throw errCode('too many redirects (>3)', 'ETOOMANYREDIRECTS');
+				}
+				finally {
+					try { os.remove(outBin); } catch (e) {}
+					try { os.remove(outHdr); } catch (e) {}
+					try { os.remove(outHdr + '.err'); } catch (e) {}
+					try { os.remove(inBody); } catch (e) {}
+				}
+			},
+		};
+		try {
+			std.loadScript(sourcePath);
+		} catch (e) {
+			print('RESULT ' + JSON.stringify({ ok: false, error: 'sdk bundle load failed: ' + String((e && e.message) || e) }));
+			std.exit(1);
+		}
+		const sdk = globalThis.__LXSDK;
+		if (!sdk) {
+			print('RESULT ' + JSON.stringify({ ok: false, error: 'sdk bundle did not expose __LXSDK' }));
+			std.exit(1);
+		}
+		const runSdk = async () => {
+			if (action === 'search') {
+				const q = String(payload.query || payload.name || '');
+				const page = Number(payload.page) || 1;
+				const limit = Number(payload.limit) || 30;
+				if (!q) throw new Error('search: query required');
+				const src = payload.source || payload.src;
+				if (src) {
+					const mod = sdk[src] && sdk[src].musicSearch;
+					if (!mod) throw new Error('sdk: no musicSearch for source ' + src);
+					return await mod.search(q, page, limit);
+				}
+				return await sdk.searchMusic({ name: q, limit });
+			}
+			if (action === 'songlist') {
+				// 歌单搜索：跨源聚合（kw/kg/tx/wy/mg 各自 songList.search）
+				const q = String(payload.query || payload.name || '');
+				if (!q) throw new Error('songlist: query required');
+				const page = Number(payload.page) || 1;
+				const perSrc = Number(payload.limit) || 8;
+				const SL_SOURCES = ['kg', 'tx', 'wy', 'mg', 'kw'];
+				const tasks = SL_SOURCES.map(s => {
+					const sl = sdk[s] && sdk[s].songList;
+					if (!sl || !sl.search) return Promise.resolve(null);
+					return sl.search(q, page, perSrc).then(r => {
+						if (!r || !r.list || !r.list.length) return null;
+						return { source: s, list: r.list.slice(0, perSrc), total: r.total };
+					}).catch(() => null);
+				});
+				const groups = (await Promise.all(tasks)).filter(g => g);
+				return groups;
+			}
+			if (action === 'songlistdetail') {
+				// 歌单详情：统一 getListDetail(id, page)，tx 内部自带 getListDetail2 兜底
+				const src = payload.source || payload.src;
+				const sl = sdk[src] && sdk[src].songList;
+				if (!sl || !sl.getListDetail) throw new Error('songlistdetail: no songList for source ' + src);
+				const id = String(payload.id != null ? payload.id : (payload.listid || ''));
+				if (!id) throw new Error('songlistdetail: id required');
+				const page = Number(payload.page) || 1;
+				return await sl.getListDetail(id, page);
+			}
+			const mod = sdk[payload.source] && sdk[payload.source].leaderboard;
+			if (!mod) throw new Error('sdk: no leaderboard for source ' + payload.source);
+			if (action === 'boards') return await mod.getBoards();
+			const bangid = String(payload.bangid != null && payload.bangid !== '' ? payload.bangid : (payload.id || ''));
+			if (!bangid) throw new Error('boardlist: bangid required');
+			return await mod.getList(bangid, Number(payload.page) || 1);
+		};
+		runSdk().then(r => {
+			const s = JSON.stringify({ ok: true, data: r == null ? null : r });
+			print('LOG sdk stringify len=' + s.length);
+			print('RESULT ' + s);
+			std.out.flush();
+			std.exit(0);
+		}).catch(e => {
+			print('RESULT ' + JSON.stringify({ ok: false, error: String((e && e.message) || e) }));
+			std.out.flush();
+			std.exit(1);
+		});
+		print('LOG sdk chain armed');
+		return;   // 主流程结束，qjs 排空微任务后 .then 打 RESULT
+	}
 
 	// ---------- 加载源脚本 ----------
 	let sourceCode;
