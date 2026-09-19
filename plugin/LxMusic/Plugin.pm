@@ -139,7 +139,7 @@ sub handleFeed {
 				type        => 'link',
 				url         => \&sdkBoardsHandler,
 				passthrough => [ 'boards', $_ ],
-			} } qw(kg tx wy mg)
+			} } grep { _boardEnabled($_) } qw(kg tx wy mg)
 		),
 		{
 			name        => 'Play test (enter song id)',
@@ -153,8 +153,21 @@ sub handleFeed {
 		},
 	);
 
+	# 榜单源全关时给一行提示，避免"菜单像坏了"的错觉（设置页可重新打开）
+	if (!grep { _boardEnabled($_) } qw(kg tx wy mg)) {
+		splice(@items, 2, 0, { name => _u('（榜单源已在设置页全部关闭）'), type => 'text' });
+	}
+
 	$cb->({ items => \@items });
 	return;
+}
+
+# 榜单源开关（设置页 0.6.0）：每次渲染读 prefs，改完立即生效
+sub _boardEnabled {
+	my ($src) = @_;
+	my %pref = (kg => 'boardsKg', tx => 'boardsTx', wy => 'boardsWy', mg => 'boardsMg');
+	my $p = $pref{$src} or return 0;
+	return $prefs->get($p) ? 1 : 0;
 }
 
 # kw numeric song id -> musicUrl play item
@@ -242,6 +255,12 @@ sub sdkBoardsHandler {
 	my ($client, $cb, $args, $mode, $src) = @_;
 	$src ||= 'kg';
 
+	# 防御：设置页关掉某源后，旧菜单项/已下钻的链接仍可能带该源进来
+	if (!_boardEnabled($src)) {
+		$cb->({ items => [ { name => _u('该榜单源已在设置页关闭'), type => 'text' } ] });
+		return;
+	}
+
 	if (my $cached = $BOARDS_CACHE{$src}) {
 		$cb->({ items => _boardItems($src, $cached) });
 		return;
@@ -279,6 +298,11 @@ sub sdkBoardTracksHandler {
 	my ($client, $cb, $args, $mode, $src, $bangid) = @_;
 	$src    ||= 'kg';
 	$bangid ||= '';
+
+	if (!_boardEnabled($src)) {
+		$cb->({ items => [ { name => _u('该榜单源已在设置页关闭'), type => 'text' } ] });
+		return;
+	}
 
 	# 客户端窗口：Material/达菲皮肤滚到第 N 行会用 index/quantity 再请求
 	my $index  = $args->{index} || 0;
@@ -373,9 +397,14 @@ sub _coverOf {
 	my ($t) = @_;
 	my $src = $t->{source} || '';
 
-	# kg/mg 的图 CDN 在设备侧直连不出图（用户实测）→ 统一走插件代理（补 Referer/UA）
+	# 设置页「封面代理」开关（0.6.0）：关掉后 kg/kw 列表行不再经插件中转 ——
+	# 代价是这两源无图（kg 的 CDN 设备侧直连不出图；kw 的图 URL 必须由代理解析
+	# pic.web 才能拿到），换来少一次中转。mg 本来就是直取，不受开关影响。
+	my $proxy = $prefs->get('coverProxy') ? 1 : 0;
+
 	if ($src eq 'kg' && ($t->{albumId} || '') =~ /^\d+$/) {
-		return _coverProxyUrl('https://imge.kugou.com/stdmusic/240/' . $t->{albumId} . '.jpg');
+		my $direct = 'https://imge.kugou.com/stdmusic/240/' . $t->{albumId} . '.jpg';
+		return $proxy ? _coverProxyUrl($direct) : $direct;
 	}
 	if ($src eq 'mg' && ($t->{img} || '') =~ m{^https?://}) {
 		# mg 直连本来就可用（用户实测：走代理前有图）——保持直取，不中转
@@ -384,7 +413,8 @@ sub _coverOf {
 		return _u($img);
 	}
 	if ($src eq 'kw' && ($t->{songmid} || '') =~ /^\d+$/) {
-		return _coverProxyUrl('kw:' . $t->{songmid});   # 代理内解析 pic.web 再取图
+		# 代理内解析 pic.web 再取图；关掉代理则无图可给（pic.web 返回的是文本 URL）
+		return $proxy ? _coverProxyUrl('kw:' . $t->{songmid}) : '';
 	}
 
 	for my $k (qw(img pic albumPic picUrl cover)) {
@@ -1137,9 +1167,12 @@ sub _page {
 		'.status { color: #555; } pre { background: #f6f6f6; padding: .6em; overflow: auto; max-height: 14em; }',
 		'.box { border: 1px solid #ddd; border-radius: 8px; padding: 1em; margin: 1em 0; }',
 		'</style></head><body>',
-		'<h1>LX Music <span style="font-size:.6em;color:#888">v0.5.9</span></h1>',
+		'<h1>LX Music <span style="font-size:.6em;color:#888">v'
+			. encode_entities(Plugins::LxMusic::Helper->pluginVersion) . '</span></h1>',
 		'<div class="box"><h2>Source status</h2><p class="status">' . $status . '</p>',
-		'<p>quality: 320k (default)</p></div>',
+		'<p>quality: ' . encode_entities($prefs->get('quality') || '320k')
+			. '（设置页可改） · 封面代理: '
+			. ($prefs->get('coverProxy') ? 'on' : 'off') . '</p></div>',
 		'<h2>Import source</h2>',
 		'<form method="post">',
 		'<p>Option 1: paste the lx custom-source script (.js) below</p>',

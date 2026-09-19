@@ -70,6 +70,26 @@ sub engineStatus {
 	return 'ok（qjs + shim + sdk 就绪）';
 }
 
+# 运行中代码的真实版本号：直接读随包 install.xml（单一事实源）。
+# 不要硬编码版本字符串——页面/设置页的版本号是判断"设备跑的是哪版"的唯一可靠判据，
+# 硬编码会让装机后仍显示旧版本（假阴性）。LMS 不会自动设置 $Plugins::LxMusic::VERSION。
+my $PLUGIN_VERSION;
+sub pluginVersion {
+	my ($class) = @_;
+	return $PLUGIN_VERSION if defined $PLUGIN_VERSION;
+
+	$PLUGIN_VERSION = '?';
+	my $dir = _pluginDir() or return $PLUGIN_VERSION;
+	my $xml = File::Spec->catfile($dir, 'install.xml');
+	if (open(my $fh, '<', $xml)) {
+		local $/;
+		my $s = <$fh> // '';
+		close $fh;
+		$PLUGIN_VERSION = $1 if $s =~ m{<version>\s*([^<\s]+)\s*</version>};
+	}
+	return $PLUGIN_VERSION;
+}
+
 # ---------- init ----------
 sub init {
 	my ($class) = @_;

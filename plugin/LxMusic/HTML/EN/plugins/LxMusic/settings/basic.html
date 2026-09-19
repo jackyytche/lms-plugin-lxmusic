@@ -4,11 +4,11 @@
 		<div class="settingSection"><b>[% params.lxMessage | html %]</b></div>
 	[% END %]
 
-	[% WRAPPER setting title="订阅源" desc="当前生效的洛雪订阅源（JS）。可粘贴源内容后点「导入」，或清除。" %]
+	[% WRAPPER setting title="订阅源" desc="当前生效的洛雪订阅源（JS）。粘贴源内容、或直接粘贴源 URL 后点「导入」；也可清除。" %]
 		<div style="margin-bottom:6px"><b>[% params.lxSourceStatus | html %]</b></div>
 		<div style="margin-bottom:6px;color:#666">路径：[% params.lxSourcePath | html %]</div>
 		<input type="text" class="stdedit" name="sourceName" value="current.js" size="30" />
-		<textarea name="sourceContent" class="stdedit" rows="6" cols="80" placeholder="粘贴 .js 订阅源内容（留空则仅改设置）"></textarea>
+		<textarea name="sourceContent" class="stdedit" rows="6" cols="80" placeholder="粘贴 .js 订阅源内容，或 http(s):// 源地址（留空则仅保存设置）"></textarea>
 		<div style="margin-top:6px">
 			<button type="submit" name="lxAction" value="import">导入订阅源</button>
 			<button type="submit" name="lxAction" value="clear">清除订阅源</button>
