@@ -147,6 +147,25 @@ sub handleFeed {
 				passthrough => [ 'boards', $_ ],
 			} } grep { _boardEnabled($_) } qw(kg tx wy mg)
 		),
+		# 歌单发现（M0.8）：推荐 / 最热 / 最新 —— 档位内再按平台下钻，最后进歌单详情
+		{
+			name        => _u('推荐歌单'),
+			type        => 'link',
+			url         => \&sdkPlSortHandler,
+			passthrough => [ 'plsort', 'rec' ],
+		},
+		{
+			name        => _u('最热歌单'),
+			type        => 'link',
+			url         => \&sdkPlSortHandler,
+			passthrough => [ 'plsort', 'hot' ],
+		},
+		{
+			name        => _u('最新歌单'),
+			type        => 'link',
+			url         => \&sdkPlSortHandler,
+			passthrough => [ 'plsort', 'new' ],
+		},
 		{
 			name        => 'Play test (enter song id)',
 			type        => 'search',
@@ -530,30 +549,112 @@ sub sdkSonglistSearchHandler {
 				$cb->({ items => [ { name => _u('歌单搜索失败: ') . ($res->{error} || 'unknown'), type => 'text' } ] });
 				return;
 			}
+			# 歌单搜索是跨源聚合（数组）→ 逐组渲染，总计上限 40
 			my @items;
 			for my $grp (@{ $res->{data} }) {
 				next unless $grp && $grp->{list} && @{ $grp->{list} };
 				my $src = $grp->{source} || '?';
-				for my $pl (@{ $grp->{list} }) {
-					next unless $pl && $pl->{id};
-					my $name = _u($pl->{name} || '?');
-					# 分隔符也必须走 _u()：join 混用旗标/未旗标串会把 '·' 的字节按 latin1 再编码（Â·）
-					my $meta = join(_u(' · '), grep { $_ ne '' } (
-						$src,
-						($pl->{total} ? _u($pl->{total}) . _u('首') : ''),
-						($pl->{author} ? _u($pl->{author}) : ''),
-					));
-					push @items, {
-						name        => _u('🎼 ') . $name . ($meta ne '' ? "  ($meta)" : ''),
-						type        => 'link',
-						url         => \&sdkSonglistDetailHandler,
-						passthrough => [ 'songlistdetail', $src, $pl->{id} ],
-						(($pl->{img} && $pl->{img} =~ m{^https?://}) ? (image => _u($pl->{img})) : ()),
-					};
-					last if @items >= 40;
-				}
+				push @items, @{ _plItems($src, $grp->{list}, 40 - scalar(@items)) };
+				last if @items >= 40;
 			}
 			$cb->({ items => @items ? \@items : [ { name => _u('无歌单结果'), type => 'text' } ] });
+		},
+	);
+	return;
+}
+
+# 歌单条目渲染（歌单搜索 / 推荐·最热·最新 共用）：名称 +（来源 · N首 · 作者）+ 封面
+sub _plItems {
+	my ($src, $list, $max) = @_;
+	$max ||= 40;
+	my @items;
+	for my $pl (@$list) {
+		next unless ref($pl) eq 'HASH' && $pl->{id};
+		my $name = _u($pl->{name} || '?');
+		# 分隔符也必须走 _u()：join 混用旗标/未旗标串会把 '·' 的字节按 latin1 再编码（Â·）
+		my $meta = join(_u(' · '), grep { $_ ne '' } (
+			_u($src),
+			($pl->{total} ? _u($pl->{total}) . _u('首') : ''),
+			($pl->{author} ? _u($pl->{author}) : ''),
+		));
+		my $img = $pl->{img};
+		# 歌单封面也走插件代理（kw/kg 的图 CDN 需要 UA/Referer，设备直连不出图）
+		$img = _coverProxyUrl($img) if $img && $img =~ m{^https?://} && $prefs->get('coverProxy');
+		push @items, {
+			name        => _u('🎼 ') . $name . ($meta ne '' ? "  ($meta)" : ''),
+			type        => 'link',
+			url         => \&sdkSonglistDetailHandler,
+			passthrough => [ 'songlistdetail', $src, $pl->{id} ],
+			(($img && $img =~ m{^https?://}) ? (image => _u($img)) : ()),
+		};
+		last if @items >= $max;
+	}
+	return \@items;
+}
+
+# 歌单档位 -> 支持的平台（id 取自各平台 vendored songList.sortList：
+#   kw ''/hot/new、kg '5'/'6'/'7'、tx 5/2、wy hot、mg '15127315'；wy/mg 的"最新"上游已注释掉）
+my %PL_SORTS = (
+	rec => { label => '推荐歌单', srcs => [ [ 'kw', '' ], [ 'kg', '5' ], [ 'mg', '15127315' ] ] },
+	hot => { label => '最热歌单', srcs => [ [ 'kw', 'hot' ], [ 'kg', '6' ], [ 'tx', 5 ], [ 'wy', 'hot' ] ] },
+	new => { label => '最新歌单', srcs => [ [ 'kw', 'new' ], [ 'kg', '7' ], [ 'tx', 2 ] ] },
+);
+
+# 档位入口（推荐/最热/最新）→ 选平台
+sub sdkPlSortHandler {
+	my ($client, $cb, $args, $mode, $sort) = @_;
+	$sort ||= 'hot';
+	my $def = $PL_SORTS{$sort} or do {
+		$cb->({ items => [ { name => _u('未知歌单档位'), type => 'text' } ] });
+		return;
+	};
+	my @items = map {
+		my ($src, $sid) = @$_;
+		{
+			name        => _u($def->{label}) . _u(' · ') . _u($src),
+			type        => 'link',
+			url         => \&sdkPlListHandler,
+			passthrough => [ 'pllist', $src, $sort ],
+		}
+	} @{ $def->{srcs} };
+	$cb->({ items => \@items });
+	return;
+}
+
+# 某平台某档位的歌单列表（支持 XMLBrowser 的 index/quantity 分页）
+sub sdkPlListHandler {
+	my ($client, $cb, $args, $mode, $src, $sort) = @_;
+	$src  ||= 'kw';
+	$sort ||= 'hot';
+
+	my $def = $PL_SORTS{$sort} or do {
+		$cb->({ items => [ { name => _u('未知歌单档位'), type => 'text' } ] });
+		return;
+	};
+	my ($sid) = map { $_->[1] } grep { $_->[0] eq $src } @{ $def->{srcs} };
+	$sid = '' unless defined $sid;
+
+	my $index  = $args->{index} || 0;
+	my $window = $args->{quantity} || 50;
+	$window = 50 if $window < 1 || $window > 300;
+	my $page   = int($index / 30) + 1;     # 上游页宽按 30 计（kw/mg 30，kg/tx 36 —— 取小更稳）
+	my $skip   = $index % 30;
+
+	Plugins::LxMusic::Helper->request(
+		action  => 'songlistbytag',
+		info    => { source => $src, sortId => $sid, tagId => '', page => $page },
+		timeout => 30,
+		cb      => sub {
+			my ($res) = @_;
+			unless ($res->{ok} && $res->{data} && $res->{data}{list}) {
+				$cb->({ items => [ { name => _u('歌单获取失败: ') . ($res->{error} || 'unknown'), type => 'text' } ] });
+				return;
+			}
+			my @list = @{ $res->{data}{list} };
+			@list = @list[ $skip .. $#list ] if $skip && @list > $skip;
+			@list = @list[ 0 .. $window - 1 ] if @list > $window;
+			my $items = _plItems($src, \@list, 60);
+			$cb->({ items => @$items ? $items : [ { name => _u('该平台没有返回歌单'), type => 'text' } ] });
 		},
 	);
 	return;

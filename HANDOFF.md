@@ -2,7 +2,7 @@
 
 > **下个 session 恢复方式**：直接说「继续 lx-music 插件，先读 HANDOFF.md」。
 > **权威事实源**：本文档 + 磁盘（`plugin/` 源码、`repo/` 发布仓、`dist/` 打包产物、`refs/` 参考克隆、`tmp/` 工具）。
-> **一句话现状**（2026-09-20 深夜）：设备运行 **0.8.3**（稳定可用）。M0.1~M0.6 已完工验收；**M0.7 两项新功能已上线**：① 多平台**聚合搜索 + 相似度重排**（PC 的归一化编辑距离算法，实测排序严格单调不增）② 播放失败**由插件立即跳下一曲**开关（`autoSkipOnError`，文案已注明 LMS 自身也会跳）。设备只保留 1 个可用源（qdy 源实测取链是死链 410，已按用户决定删除）。
+> **一句话现状**（2026-09-21）：设备运行 **0.8.5**（稳定可用）。M0.1~M0.6 已完工验收；**M0.7/M0.8 已上线**：① 多平台**聚合搜索 + 相似度重排**（PC 的归一化编辑距离算法，实测排序严格单调不增）② 播放失败**由插件立即跳下一曲**开关 ③ **歌单发现：推荐 / 最热 / 最新**（档位 → 平台 → 歌单列表(分页) → 歌单详情 → 整单播放，封面走代理）。设备只保留 1 个可用源（qdy 源实测取链是死链 410，已删除）。
 > ⚠️ 本轮出过一次**自伤事故**（0.8.0 编译失败仍打包上机 → LMS 加载失败并把插件从已安装列表摘掉 → 全部页面 404），已用 `tmp/repair_install.py` 完整恢复，并立了 `tmp/precheck.ps1` 打包门禁（详见 §5.7）。**代码仍未发 GitHub（远端只有 v0.5.9）**：要发版就 GH 基址 pack → release **v0.8.2**（需用户 PAT）。
 
 ---
@@ -28,7 +28,9 @@
 | **M0.4** 体验对齐桌面版（封面/视图/分页/提速/封面兜底） | ✅ | 0.5.9 | 用户实测：**网格/列表切换 ✓、kw 封面 ✓、mg 封面 ✓、速度可接受**；kg 封面经代理修复（设备侧 200/image-jpeg） |
 | **M0.5** 设置页 | ✅ | **0.6.4** | 入口：设置 → 插件 的 LX Music 行有 **Settings** 链接（`<optionsURL>`）+ 设置下拉有条目 `label="LX Music"` 且 `selected`；页面 100% ASCII 实体渲染（非 ASCII 字节 0、乱码 0，8 个分区标签齐全）；诊断块 = 版本 / 引擎 ok（qjs+shim+sdk 就绪）/ 日志级别 / 源路径 / 源 64094 B；保存验证：quality 320k↔flac（工具页同步读到）、bridgeTimeout 9 / concurrency 3 / TTL 300 落盘后复原、boardsWy 关闭后菜单 count 8→7 且只剩 kg/tx/mg、coverProxy 关闭后列表 image 由 `/plugins/LxMusic/cover?u=` 变 `imge.kugou.com` 直链、导入(URL+粘贴)/清除/重启恢复 + 取直链 OK 2.2s |
 
-**设备现状**：达菲 192.168.2.111 运行 **0.7.2**（页面 `/plugins/LxMusic/index.html` 显示的版本号＝运行中代码版本，由 `Helper::pluginVersion` 直读 install.xml，是唯一可靠判据）。
+**设备现状**：达菲 192.168.2.111 运行 **0.8.5**（页面 `/plugins/LxMusic/index.html` 显示的版本号＝运行中代码版本，由 `Helper::pluginVersion` 直读 install.xml，是唯一可靠判据）。
+
+| **M0.8** 歌单发现 | ✅ | **0.8.5** | 菜单新增「推荐歌单 / 最热歌单 / 最新歌单」；设备 CLI 实测：最热→4 平台（kw/kg/tx/wy）、最新→3 平台（kw/kg/tx）、推荐→3 平台（kw/kg/mg）；歌单条目带 `(来源 · N首 · 作者)` 与封面（走代理）；打开歌单 → `▶ 播放整个歌单（替换队列）` + 曲目列表。**档位 id 表**（各平台 vendored `songList.sortList`）：kw `''`(推荐)/`hot`/`new`；kg `'5'`/`'6'`/`'7'`；tx `5`/`2`；wy `hot`；mg `'15127315'`——wy/mg 上游把"最新"注释掉了，故最新只有 3 家 |
 
 | **M0.6** 多源/音质 | ✅ | **0.7.2** | 设备实测：老单源自动迁移进注册表（独家音源 64094 B）；URL 导入成功 + 同内容去重 + 目录导入逐个判重；行内启用/上移下移/删除均持久；取链 `OK (2.4s) [独家音源] 320k ~320kbps verified`（音质裁剪 + HEAD 校验 + **实测码率**）；无源时页面红字提示且取链报明确错误（不再静默无声）。设置页 100% ASCII 实体、`selectFile/selectFolder` 文件选择器字段就位 |
 
@@ -95,7 +97,9 @@ XMLBrowser 菜单 / 网页  →  Plugin.pm（feed handlers / webHandler）
 | 0.8.0 | ⚠️ **坏版本，勿用**：Plugin.pm 编译失败（`$src` 未声明）却被打包上机 → LMS 加载失败（详见 §5.7.37） |
 | 0.8.1 | 修 0.8.0 的编译错误；新增「播放行为」分区（`autoSkipOnError`）+ 聚合搜索重排；机上被 LMS 摘除后由 `repair_install.py` 恢复 |
 | **0.8.2** | 修单源搜索 die（`@{$res->{data}}` 对 hashref 解引用，§5.7.39）；聚合搜索 + 相似度重排实测排序严格单调不增；自动跳曲 + 防连跳风暴上线 |
-| **0.8.3（当前设备）** | 按用户决定：跳曲开关文案改清楚（明说"由插件立即跳"、限流不跳、防连跳）；删除死链源 qdy |
+| **0.8.3** | 按用户决定：跳曲开关文案改清楚（明说"由插件立即跳"、限流不跳、防连跳）；删除死链源 qdy |
+| 0.8.4 | **歌单发现**（M0.8）：菜单加「推荐歌单 / 最热歌单 / 最新歌单」→ 平台 → 歌单列表（分页）→ 复用歌单详情与整单播放；shim 新增 `songlistbytag` |
+| **0.8.5（当前设备）** | 歌单封面也走插件代理（kw/kg 的图 CDN 需要 UA/Referer） |
 
 ---
 
@@ -251,8 +255,8 @@ XMLBrowser 菜单 / 网页  →  Plugin.pm（feed handlers / webHandler）
 
 ## 七、下个 session 待办（按序）
 
-1. **发版 v0.8.3（待定，需用户提供 PAT）**——远端 GitHub 目前只有 v0.5.9，本轮 0.6.0~0.8.3 全在本地。
-   - 步骤：不设 `LX_REPO_BASE` 跑 `pack.py`（生成 GH 基址 zip + repo.xml）→ `dist/LxMusic-0.8.3.zip` + `repo.xml` 作为 `v0.8.3` release 资产。
+1. **发版 v0.8.5（待定，需用户提供 PAT）**——远端 GitHub 目前只有 v0.5.9，本轮 0.6.0~0.8.5 全在本地。
+   - 步骤：不设 `LX_REPO_BASE` 跑 `pack.py`（生成 GH 基址 zip + repo.xml）→ `dist/LxMusic-0.8.5.zip` + `repo.xml` 作为 `v0.8.5` release 资产。
    - 推送：`git push https://x-access-token:<token>@github.com/jackyytche/lms-plugin-lxmusic main`（token 只内联，不落盘；本地 main 领先远端，快进即可）。
 2. **M0.7 剩余候选**：每源失败冷却（连续点歌不反复撞死源）；**不喜欢歌曲规则**（`歌曲名@艺术家` 三态过滤，
    PC 端最契合服务端的一项）；搜索排序可选增强（PC 算法下"歌手名越短得分越高"⇒ 是否加"完全同名优先 / 优先某源"）；
@@ -267,8 +271,8 @@ XMLBrowser 菜单 / 网页  →  Plugin.pm（feed handlers / webHandler）
 
 ## 八、现场状态与凭据
 
-- **设备**：达菲 `192.168.2.111`（LMS 9.0.3 / perl 5.40；Web `:9000`，CGI `:80`）；运行 **0.8.3**。
-- **通道**：达菲订阅 = **LAN** `http://192.168.2.68:8765/repo.xml?v=46`（8765 常驻 `python -m http.server` 指向 `dist/`；**进程易失**，掉线就在 `dist/` 重启；`?v=N` 是 LMS 仓库缓存的破除参数，每次装机 +1）。
+- **设备**：达菲 `192.168.2.111`（LMS 9.0.3 / perl 5.40；Web `:9000`，CGI `:80`）；运行 **0.8.5**。
+- **通道**：达菲订阅 = **LAN** `http://192.168.2.68:8765/repo.xml?v=48`（8765 常驻 `python -m http.server` 指向 `dist/`；**进程易失**，掉线就在 `dist/` 重启；`?v=N` 是 LMS 仓库缓存的破除参数，每次装机 +1）。
 - **设备侧现状**：订阅源 **1 个**：`独家音源`（在线 `http://192.168.2.68:8765/lx-6.js`，64094 B）——**可用**，取链实测 `flac ~1647kbps verified` / `320k ~320kbps verified`。prefs 默认（quality 320k / bridgeTimeout 7 / helperConcurrency 2 / resolveTtl 600 / coverProxy on / boards 全 on / qualityFallback on / verifyUrl on / autoSkipOnError on）；`plugin.lxmusic` 日志级别 = **ERROR**。
   - 已删除的源：`全豆要[聚合音源]`（`qdy.js`）——它的取链产物是死链：回 `kw-er.kuwo.cn/...F000000bYDlc2XxKLs.flac?bitrate$2000&...`（`=` 被打成 `$` 是它自己的构造问题），HEAD/Range/带 Referer/换 UA 全是 **HTTP 410 Gone**（`tmp/probe_qdy_url.py` 实测）。`dist/qdy.js` 仍留着，将来拿它做多源测试很方便。
 - **本机 IP/仓库基址**：`192.168.2.68:8765`（**DHCP 可能变化**，变了要同步 `dist/repo.xml` 的 URL 与 pack.py 的 `LAN_BASE`）。

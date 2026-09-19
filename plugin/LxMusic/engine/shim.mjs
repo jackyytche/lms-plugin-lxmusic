@@ -539,7 +539,7 @@ async function main(std, os) {
 	//   boards    payload = { source }                       -> getBoards()
 	//   boardlist payload = { source, bangid|id, page? }     -> getList(bangid, page)
 	//     注：kg/tx/wy/mg 的 getList 吃 bangid；kw 榜单上游 wbd 签名已失效（搜索不受影响）
-	const SDK_ACTIONS = { search: 1, boards: 1, boardlist: 1, songlist: 1, songlistdetail: 1 };
+	const SDK_ACTIONS = { search: 1, boards: 1, boardlist: 1, songlist: 1, songlistdetail: 1, songlistbytag: 1 };
 	if (SDK_ACTIONS[action]) {
 		let payload = {};
 		try { payload = JSON.parse(infoJson || '{}') || {} } catch (e) {}
@@ -724,6 +724,18 @@ async function main(std, os) {
 				});
 				const groups = (await Promise.all(tasks)).filter(g => g);
 				return groups;
+			}
+			if (action === 'songlistbytag') {
+				// 歌单分类列表（推荐/最热/最新）：sortId 用各平台自己 sortList 的 id
+				//   kw: ''=推荐 / hot / new      kg: '5'=推荐 / '6'=最热 / '7'=最新
+				//   tx: 5=最热 / 2=最新          wy: hot        mg: '15127315'=推荐
+				// （wy/mg 上游把"最新"注释掉了，所以只有 kw/kg/tx 提供最新）
+				const src = payload.source || payload.src;
+				const sl = sdk[src] && sdk[src].songList;
+				if (!sl || !sl.getList) throw new Error('songlistbytag: no songList for source ' + src);
+				const sortId = payload.sortId != null ? payload.sortId : 'hot';
+				const tagId = payload.tagId != null ? payload.tagId : '';
+				return await sl.getList(sortId, tagId, Number(payload.page) || 1);
 			}
 			if (action === 'songlistdetail') {
 				// 歌单详情：统一 getListDetail(id, page)，tx 内部自带 getListDetail2 兜底

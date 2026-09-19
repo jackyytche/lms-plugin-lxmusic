@@ -369,7 +369,7 @@ sub request {
 		$source = $SHIM;
 	}
 	elsif ($action eq 'search' || $action eq 'boards' || $action eq 'boardlist'
-		|| $action eq 'songlist' || $action eq 'songlistdetail') {
+		|| $action eq 'songlist' || $action eq 'songlistdetail' || $action eq 'songlistbytag') {
 		-f $SDK or do { $cb->(_err('sdk bundle not installed (search/browse disabled)')); return };
 		$source = $SDK;
 	}
