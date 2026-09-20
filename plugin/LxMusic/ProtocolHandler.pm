@@ -515,23 +515,30 @@ sub new {
 	return $class->SUPER::new($args);
 }
 
-# 整榜/单曲双语义（0.11.1 榜单页头引入 lxm://b/）：
+# 整榜/整歌单/单曲三语义（0.11.1 榜单页头引入 lxm://b/；0.11.13 加 lxm://l/ 给歌单）：
 #   lxm://b/<src>/<bangid> -> 展开为全榜 lxm:// 曲目 URL（上限 100，防超榜拖慢入队）
+#   lxm://l/<src>/<plid>   -> 展开为整个歌单的 lxm:// 曲目 URL（同上限）
 # 喜马拉雅 xmly://album/<id> 同款机制：LMS 对带 explodePlaylist 的协议做
 # playlist play/add 时，先向协议要全量 URL 列表再 playtracks/addtracks
 # （Slim::Control::Commands.pm L1383-1400）。曲目 URL 展开为自身（原语义不变）。
 sub explodePlaylist {
 	my ($class, $client, $url, $cb) = @_;
 
-	if (my ($src, $bangid) = $url =~ m{^lxm://b/([a-z]+)/([A-Za-z0-9_-]+)$}) {
+	my ($kind, $src, $id);
+	if    ($url =~ m{^lxm://b/([a-z]+)/([A-Za-z0-9_-]+)$}) { ($kind, $src, $id) = ('board', $1, $2) }
+	elsif ($url =~ m{^lxm://l/([a-z]+)/([A-Za-z0-9_-]+)$}) { ($kind, $src, $id) = ('songlist', $1, $2) }
+
+	if ($kind) {
 		Plugins::LxMusic::Helper->request(
-			action  => 'boardlist',
-			info    => { source => $src, bangid => $bangid, page => 1 },
+			action  => ($kind eq 'board' ? 'boardlist' : 'songlistdetail'),
+			info    => ($kind eq 'board'
+				? { source => $src, bangid => $id, page => 1 }
+				: { source => $src, id     => $id, page => 1 }),
 			timeout => 45,
 			cb      => sub {
 				my ($res) = @_;
 				unless ($res->{ok} && $res->{data} && $res->{data}{list} && @{ $res->{data}{list} }) {
-					$log->error('LxMusic: board explode failed: ' . ($res->{error} || 'empty list'));
+					$log->error("LxMusic: $kind explode failed: " . ($res->{error} || 'empty list'));
 					$cb->([]);
 					return;
 				}

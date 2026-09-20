@@ -548,19 +548,27 @@ sub board_render {
 				: { name => _u('[' . $src . ']'), type => 'text', label => 'ARTIST' }),
 		]),
 	});
+	# 诊断（warn 级=达菲可见）：页头按钮依赖 bangid，缺了就是「页头没有播放/添加按钮」
+	if (!length $bangid) {
+		$log->warn("LxMusic board_render: bangid 为空 ⇒ 不发页头 play/actions (src=$src bname=$bname)");
+	}
 }
 
 # 页头播放按钮命令（喜马拉雅 _album_play_actions 同形，只留 *all 键——
 # 普通 play/add 留在 feed 级会把整榜命令盖到每一行的行内按钮上）。
 # 命中 lxm://b/<src>/<bangid>，由 ProtocolHandler::explodePlaylist 展开整榜。
-sub _board_play_actions {
-	my ($src, $bangid) = @_;
-	my $u = "lxm://b/$src/$bangid";
+sub _all_actions {
+	my ($u) = @_;
 	return {
 		playall => { command => [ 'playlist', 'play',   $u ], fixedParams => {} },
 		addall  => { command => [ 'playlist', 'add',    $u ], fixedParams => {} },
 		insert  => { command => [ 'playlist', 'insert', $u ], fixedParams => {} },
 	};
+}
+
+sub _board_play_actions {
+	my ($src, $bangid) = @_;
+	return _all_actions("lxm://b/$src/$bangid");
 }
 
 # track(search/boardlist 产出) -> lxm:// audio 项（$prefixOf 可按曲给不同前缀，如聚合搜索的来源标签）
@@ -669,6 +677,18 @@ sub _coverOf {
 	# pic.web 才能拿到），换来少一次中转。mg 本来就是直取，不受开关影响。
 	my $proxy = $prefs->get('coverProxy') ? 1 : 0;
 
+	if ($src eq 'kg' && ($t->{hash} || '') =~ /^[0-9A-Fa-f]{16,}$/) {
+		# ⚠️ kg 专辑图**不能**用 albumId 拼 URL：实测不同 albumId 的
+		# https://imge.kugou.com/stdmusic/240/<id>.jpg 返回**同一张占位图**
+		# （0.11.13 现场：5 个不同 id → 同一 md5 2882B；PC 端也是这样拿到占位图，
+		# 它靠 getPic 现取）。官方 kg/pic.js 是 POST media.store.kugou.com/v1/
+		# get_res_privilege 换取真图 URL ⇒ 交给封面代理按 'kg:<aaid>:<albumId>:<hash>' 解析。
+		my $aaid = (($t->{albumAudioId} || $t->{songmid} || '') =~ /^\d+$/)
+			? ($t->{albumAudioId} || $t->{songmid}) : '';
+		return $proxy
+			? _coverProxyUrl('kg:' . $aaid . ':' . ($t->{albumId} || 0) . ':' . $t->{hash})
+			: '';
+	}
 	if ($src eq 'kg' && ($t->{albumId} || '') =~ /^\d+$/) {
 		my $direct = 'https://imge.kugou.com/stdmusic/240/' . $t->{albumId} . '.jpg';
 		return $proxy ? _coverProxyUrl($direct) : $direct;
@@ -853,9 +873,17 @@ sub sdkSonglistDetailHandler {
 	my $index  = $args->{index} || 0;
 	my $window = $args->{quantity} || 50;
 	$window = 50 if $window < 1 || $window > 300;
-	my $page   = int($index / 50) + 1;
-	my $skip   = $index % 50;
 
+	# 歌单详情的上游页宽同样不固定（kw/wy 一次给整单、mg 50、kg 100），先按 50 猜，
+	# 拿到响应的 limit 再重算重取一次（同榜单 0.11.5 的教训）
+	my $upw   = 50;
+	my $page  = int($index / $upw) + 1;
+	my $skip  = $index % $upw;
+	my $retuned = 0;
+	my $want  = $index;
+
+	my $fetch;
+	$fetch = sub {
 	Plugins::LxMusic::Helper->request(
 		action  => 'songlistdetail',
 		info    => { source => $src, id => $plid, page => $page },
@@ -866,30 +894,63 @@ sub sdkSonglistDetailHandler {
 				$cb->({ items => [ { name => _u('歌单详情失败: ') . ($res->{error} || 'unknown'), type => 'text' } ] });
 				return;
 			}
+
+			# 首响应校正页宽（与榜单 handler 同款）
+			if (!$retuned) {
+				my $lim = $res->{data}{limit};
+				if (defined $lim && $lim > 0) {
+					$retuned = 1;
+					if ($lim != $upw) {
+						$upw  = $lim;
+						$page = int($want / $upw) + 1;
+						$skip = $want % $upw;
+						$fetch->();
+						return;
+					}
+				}
+			}
+
 			my $info = $res->{data}{info} || {};
-			my @items;
-			push @items, {
-				name => _u('🎼 ') . _u($info->{name} || $plid)
-					. ($info->{author} ? _u(' · ') . _u($info->{author}) : ''),
-				type => 'text',
-				(($info->{img} && $info->{img} =~ m{^https?://}) ? (image => _u($info->{img})) : ()),
-			};
-			# 整单入队：m3u 会被 LMS 当"单条链式流"（队列只 1 条）——改为链接项，
-			# 点它由插件侧展开（clear + play 首曲 + add 其余，add 仅 5ms 不阻塞）
-			push @items, {
-				name        => _u('▶ 播放整个歌单（替换队列）'),
-				type        => 'link',
-				url         => \&sdkSonglistPlayAllHandler,
-				passthrough => [ 'songlistplay', $src, $plid ],
-			};
-			my @list = @{ $res->{data}{list} };
+			my $all  = $res->{data}{list};
+
+			# 页头配方（§5.11.69 同款）：feed 级 image/play/actions/albumData。
+			# play 一出现，模板就不再渲染自动的 "All Songs" 行；整单播放改由页头
+			# 按钮走 lxm://l/ 展开 ⇒ 不再需要列表里的「歌单名」「播放整个歌单」两行。
+			my $cover;
+			if ($info->{img} && $info->{img} =~ m{^https?://}) {
+				$cover = $prefs->get('coverProxy') ? _coverProxyUrl($info->{img}) : $info->{img};
+			}
+			elsif (@$all && $all->[0]) {
+				$cover = _coverOf($all->[0]);
+			}
+
+			my @list = @$all;
 			@list = @list[ $skip .. $#list ] if $skip && @list > $skip;
 			@list = @list[ 0 .. $window - 1 ] if @list > $window;
-			my $tracks = _trackItems(\@list);
-			push @items, @$tracks;
-			$cb->({ items => \@items });
+			my $tracks = _trackItems(\@list, undef, undef, $index);
+
+			my $total = $info->{count} || $res->{data}{total} || scalar @$all;
+			my $plname = $info->{name} || $plid;
+
+			$cb->({
+				items  => $tracks,
+				offset => $index,
+				(total => $total),
+				($cover ? (image => $cover) : ()),
+				(play    => "lxm://l/$src/$plid"),
+				(actions => _all_actions("lxm://l/$src/$plid")),
+				(albumData => [
+					{ name => _u('🎼 ') . _u($plname), type => 'text', label => 'ALBUM' },
+					{ name => _u('[' . $src . ']')
+						. ($info->{author} ? _u(' · ') . _u($info->{author}) : '')
+						. _u(' · ') . int($total) . _u(' 首'),
+					  type => 'text', label => 'ARTIST' },
+				]),
+			});
 		},
 	);
+	};
+	$fetch->();
 	return;
 }
 
@@ -1446,6 +1507,59 @@ sub _coverProxy {
 			},
 			{ timeout => 8 },
 		)->get($api);
+		return;
+	}
+
+	# kg：POST get_res_privilege 换真图 URL（官方 kg/pic.js 同款）。
+	# 参数格式 'kg:<albumAudioId>:<albumId>:<hash>'（hash 必需）
+	if ($target =~ /^kg:(\d*):(\d+):([0-9A-Fa-f]+)$/) {
+		my ($aaid, $albumid, $hash) = ($1, $2, $3);
+		my $key = "kg:$aaid:$albumid:$hash";
+		if (my $cached = $COVER_CACHE{$key}) {
+			return _streamImage($cached, $client, $params, $callback, $httpClient, $response);
+		}
+		my $api = 'http://media.store.kugou.com/v1/get_res_privilege';
+		my $body = $TRACK_JSON->encode({
+			appid => 1001, area_code => '1', behavior => 'play', clientver => '9020',
+			need_hash_offset => 1, relate => 1,
+			resource => [ {
+				album_audio_id => $aaid eq '' ? 0 : $aaid,
+				album_id       => $albumid,
+				hash           => $hash,
+				id             => 0,
+				name           => 'lxmusic.mp3',
+				type           => 'audio',
+			} ],
+			token => '', userid => 2626431536, vip => 1,
+		});
+		Slim::Networking::SimpleAsyncHTTP->new(
+			sub {
+				my $res = shift;
+				my $img = '';
+				eval {
+					my $d = JSON::XS->new->utf8->decode($res ? $res->content : '');
+					my $info = $d->{data}[0]{info} || {};
+					$img = $info->{image} || '';
+					if ($img && $info->{imgsize} && ref($info->{imgsize}) eq 'ARRAY' && @{ $info->{imgsize} }) {
+						my $sz = $info->{imgsize}[0];
+						$img =~ s/\{size\}/$sz/;
+					}
+				};
+				if ($img && $img =~ m{^https?://}) {
+					%COVER_CACHE = () if keys %COVER_CACHE > 300;
+					$COVER_CACHE{$key} = $img;
+					return _streamImage($img, $client, $params, $callback, $httpClient, $response);
+				}
+				$log->debug("LxMusic: kg get_res_privilege miss for $key");
+				return _respondCoverFail('no cover', $client, $params, $callback, $httpClient, $response);
+			},
+			{ timeout => 8 },
+		)->post($api,
+			'KG-RC'        => 1,
+			'KG-THash'     => 'expand_search_manager.cpp:852736169:451',
+			'User-Agent'   => 'KuGou2012-9020-ExpandSearchManager',
+			'Content-Type' => 'application/json',
+			$body);
 		return;
 	}
 
