@@ -548,10 +548,11 @@ sub board_render {
 				: { name => _u('[' . $src . ']'), type => 'text', label => 'ARTIST' }),
 		]),
 	});
-	# 诊断（warn 级=达菲可见）：页头按钮依赖 bangid，缺了就是「页头没有播放/添加按钮」
-	if (!length $bangid) {
-		$log->warn("LxMusic board_render: bangid 为空 ⇒ 不发页头 play/actions (src=$src bname=$bname)");
-	}
+	# 诊断（warn 级，需 plugin.lxmusic=DEBUG/WARN 才落盘）：页头按钮依赖 feed 级 play/actions
+	$log->warn(sprintf('LxMusic board_render: src=%s bangid=%s play=%s total=%s rows=%d',
+		$src, (length $bangid ? $bangid : '<empty>'),
+		(length $bangid ? "lxm://b/$src/$bangid" : '<none>'),
+		(defined $total ? $total : '?'), scalar(@$tracks)));
 }
 
 # 页头播放按钮命令（喜马拉雅 _album_play_actions 同形，只留 *all 键——

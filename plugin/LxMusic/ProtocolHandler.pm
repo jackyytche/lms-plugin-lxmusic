@@ -557,11 +557,24 @@ sub explodePlaylist {
 						name  => $name,
 					);
 					next unless $u;
-					# 入队前发布队列元数据（歌名/时长/封面）——队列行渲染靠它，零额外 API
+					# 入队前发布队列元数据（歌名/时长/封面/码率估算）——队列行渲染靠它，零额外 API
 					$class->_publish_cover($u, ($t->{source} || $src), $t);
+					my $secs = _secs_of_interval($t->{interval});
+					my $est;
+					if ($secs && ref($t->{types}) eq 'ARRAY') {
+						my $biggest;
+						for my $ty (@{ $t->{types} }) {
+							next unless ref $ty eq 'HASH';
+							my $b = eval { Plugins::LxMusic::Plugin::_bytesOf($ty->{size}) };
+							next unless $b;
+							$biggest = $b if !defined $biggest || $b > $biggest;
+						}
+						$est = int($biggest * 8 / 1000 / $secs) if $biggest;
+					}
 					$class->publishQueueMetadata($u, {
 						title   => $name,
-						secs    => _secs_of_interval($t->{interval}),
+						secs    => $secs,
+						kbps    => $est,
 						quality => $q,
 					});
 					push @urls, $u;
