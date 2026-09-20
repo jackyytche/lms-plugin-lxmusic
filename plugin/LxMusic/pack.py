@@ -16,6 +16,10 @@ BASE = os.environ.get('LX_REPO_BASE', GH_BASE)
 # zip 名带版本号（喜马拉雅同款）：LMS 对同名 zip 有 DownloadedPlugins 缓存/摘要校验，
 # 复用 LxMusic.zip 会在连续升级时出现"下载了却不安装"（0.4.5 现场踩到）
 ZIP_TMPL = 'LxMusic-{version}.zip'
+# 插件图标：随包放在插件 HTML 目录（LMS 按需缩放 logo_50x50/100x100），
+# 同时拷一份到 dist/ 供 repo.xml 的绝对 URL 用（"未安装/待更新"列表项也要有图）
+ICON_SRC = os.path.join(SRC, 'HTML', 'EN', 'plugins', 'LxMusic', 'html', 'images', 'logo.png')
+ICON_NAME = 'lxmusic_logo.png'
 
 
 def _stamp():
@@ -77,6 +81,12 @@ def main():
             h.update(chunk)
     sha1 = h.hexdigest()
 
+    # 图标也放到发布根（LAN 直接可取；GH 基址时需作为 release 资产一起上传）
+    icon_out = os.path.join(OUT, ICON_NAME)
+    if os.path.exists(ICON_SRC):
+        with open(ICON_SRC, 'rb') as src, open(icon_out, 'wb') as dst:
+            dst.write(src.read())
+
     repo = f'''<?xml version="1.0" encoding="utf-8"?>
 <extensions>
 \t<details>
@@ -92,6 +102,7 @@ def main():
 \t\t\t<desc lang="EN">Play music from LX Music custom-source subscriptions: import a source, search and stream with quality selection.</desc>
 \t\t\t<url>{base}/{zip_name}</url>
 \t\t\t<sha>{sha1}</sha>
+\t\t\t<icon>{base}/{ICON_NAME}</icon>
 \t\t\t<creator>jackyytche</creator>
 \t\t\t<email>noreply@example.com</email>
 \t\t\t<category>musicservices</category>
@@ -105,6 +116,7 @@ def main():
     print(f'version = {version}')
     print(f'sha1    = {sha1}')
     print(f'zip     = {zip_path} ({os.path.getsize(zip_path)} bytes)')
+    print(f'icon    = {icon_out} ({os.path.getsize(icon_out) if os.path.exists(icon_out) else 0} bytes)')
     print(f'repo    = {os.path.join(OUT, "repo.xml")} (base={BASE})')
     print(f'entries = {len(entries)}')
     for _, rel in entries:

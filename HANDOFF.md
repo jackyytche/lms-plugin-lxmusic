@@ -2,7 +2,8 @@
 
 > **下个 session 恢复方式**：直接说「继续 lx-music 插件，先读 HANDOFF.md」
 > **权威事实源**：本文档 + 磁盘（`plugin/` 源码、`repo/` 发布仓、`dist/` 打包产物、`refs/` 参考克隆、`tmp/` 工具）
-> **一句话现状**（2026-09-21 第七轮，换源 + mg https 修复）：设备运行 **0.11.19**（已装机验收）。
+> **一句话现状（2026-09-21 第八轮，插件图标）**：设备运行 **0.11.19**（mg/wy 播放与拖动均已验收）；
+> **0.11.20 已打包待装机** = 换插件图标（落雪官方 logo，见 §5.11.81）。
 > 0.11.2=榜单页头；0.11.3=feed 内嵌翻页行（**作废**——用户指正那不是达菲原生翻页）；0.11.4=原生窗口
 > `items+offset+total`（喜马拉雅 albumHandler 配方），Web 翻页走 UI 原生页码；
 > 0.11.5~0.11.7=**修窗口数学**（上游页宽按 SDK `limit` 学，不再硬编码 50；行号改绝对序号），kw 热歌榜 6 页逐首对齐上游（§5.11.74）；
@@ -165,6 +166,7 @@ XMLBrowser 菜单 / 网页  ← Plugin.pm（feed handlers / webHandler）
 | 0.11.17（**已装机**） | **修「tx 不能拖进度条」**（§5.11.79）：`bitrate/secs` 原先只发给了 `lxm://` URL，而 LMS 的 `HTTP::getSeekData` 是拿 `$song->currentTrack()`（**直链**那条记录）查码率 ⇒ 查不到就 `return`（undef seekdata）⇒ `_JumpToTime` 的 `return unless $seekdata` 把拖动**静默丢弃**。现对 lxm:// 与直链**两个 URL 都发** ct/bitrate/secs |
 | 0.11.18（**已装机**） | **自己实现 `getSeekData`**（不再依赖 LMS 的码率查询）：返回 `{timeOffset}` 恒非 undef，另按 `len*t/secs`（探测总长优先）或 `kbps*1000/8*t` 给 `sourceStreamOffset`；`_cache_put` 把记录同时挂在 lxm:// 与直链两个 URL 下；`_finish_resolve`/`_trackItems` 透传 `secs`/`length`；shim 的 probe 用 `Content-Range` 总量当 `length` |
 | **0.11.19（已装机，已验收）** | **修「mg 完全不能播」**（§5.11.80）：解析出来的直链是 **https**（咪咕 `freetyst.nf.migu.cn`），而我们的处理器继承的是 `Slim::Player::Protocols::HTTP` —— 它下面是**明文** `IO::Socket::INET`，于是 LMS 拿明文 HTTP/1.0 去打 443，CDN 回 `400 Bad Request` ⇒ `PROBLEM_CONNECTING` ⇒ 70ms 就 stop。修法：有 SSL 时把基类换成 LMS 自带的 `Slim::Player::Protocols::HTTPS`（= IO::Socket::SSL + HTTP，按协议自动分流，返回对象仍是我们自己的类 ⇒ 0.11.18 的 seek 覆盖仍然生效），没 SSL 时回落 HTTP 并显式报错。**实测：wy/mg（星海）+ mg（裤佬）+ mg 榜单行全部 PASS，mg/wy/tx 拖动均 PASS** |
+| **0.11.20（已打包，待装机）** | **换插件图标**（§5.11.81）：`install.xml` 加 `<icon>plugins/LxMusic/html/images/logo.png</icon>`（落雪桌面版官方图标，Apache-2.0，取 `lx-music-desktop/resources/icons/256x256.png`），随包放 `HTML/EN/plugins/LxMusic/html/images/logo.png`；`pack.py` 生成的 `repo.xml` 再加一条**绝对 URL** 的 `<icon>{base}/lxmusic_logo.png</icon>`（图标同时拷进 `dist/`）。此前插件管理器显示的是分类兜底图 `html/images/musicservices.svg` |
 
 ---
 
@@ -497,6 +499,39 @@ XMLBrowser 菜单 / 网页  ← Plugin.pm（feed handlers / webHandler）
       `tmp/play_board_row.py 6.0 0` → mg 榜单行 PASS；
       **顺带确认 0.11.18 的拖动修复真的通了**：`tmp/seek_lxm.py`（严格按 UI 形态 `['time', pos*duration]`）
       对 **mg / wy / tx** 三个平台都是"3s 后到位、7s 后继续推进"，can_seek=1
+81. **插件图标怎么换（0.11.20；参考实现 = 兄弟项目喜马拉雅插件）**
+    - **一处声明就够**：`install.xml` 里加一行
+      `<icon>plugins/<PluginName>/html/images/logo.png</icon>`，实体文件放插件包内的
+      `HTML/EN/plugins/<PluginName>/html/images/logo.png`（zip 里就是这条相对路径，
+      LMS 装机后按 `/plugins/<PluginName>/html/images/logo.png` 提供）。
+    - **只放一张原图**：LMS 网页层支持**按需缩放**——设备实测对 `logo_50x50.png` /
+      `logo_100x100.png` / `logo_33x33.png` / `logo_77x77.png` / `logo_300x300.png`
+      **全部 200 且尺寸正确**（`Content-Type: image/png`），而基图不存在时
+      `nope_50x50.png` 是 404、`.jpg` 也是 404（只按基图扩展名转）。所以**不需要**
+      自己生成 `_50x50/_100x100`（喜马拉雅的 zip 里也只有 `logo.png`，设备上却能取到
+      `logo_50x50.png`——同一机制）。
+    - **这一行 <icon> 影响三处**：① 设置→插件列表那一行（插件管理器模板把路径改写成
+      `_50x50.png`（src）+ `_100x100.png`（srcset 2x），并带 `onerror` 回退到
+      `html/images/<category>.svg`）；② `Slim::Plugin::Base::initPlugin` 会把它注册成
+      页面图标（`Slim::Web::Pages->addPageLinks("icons", {<token> => <icon>})`）；
+      ③ **My Apps / apps 菜单**：`Slim::Plugin/MyApps/Plugin.pm` 给 app 项填
+      `icon => $app->_pluginDataFor('icon')` ⇒ 应用列表里也换成我们的图标。
+    - **repo.xml 里要再给一条绝对 URL 的 `<icon>`**（`pack.py` 已生成
+      `<icon>{base}/lxmusic_logo.png</icon>`，并把图标拷进 `dist/`）。原因：
+      `Slim/Web/Settings/Server/Plugins.pm` 的 `prepareDetails` 对**未安装**的插件会把
+      *相对* icon 路径重写成 `GH_IMAGE_URL`（= **LMS-Community/slimserver 官方仓库**，
+      见该文件 L26），第三方插件必然 404；绝对 http(s) URL 则原样使用（`$_->{icon} =
+      $data->{icon} if ... !~ /^http/`）。发 GitHub release 时要**把 `lxmusic_logo.png`
+      一起作为 release 资产上传**（GH 基址是 `…/releases/download/v<version>/lxmusic_logo.png`）。
+    - **素材来源**：落雪桌面版官方图标（`refs/lx-music-desktop/resources/icons/256x256.png`，
+      Apache-2.0，署名放本文件即可）。同一 logo 的**透明 SVG**（`src/renderer/assets/images/icon.svg`）
+      本机没法栅格化（无 imagemagick / rsvg / inkscape / PIL，ffmpeg 也没编 librsvg：
+      `Decoding requested, but no decoder found for: svg`），故用官方方形 PNG（浅灰底 + 长阴影，
+      与其它插件图标风格一致）。
+    - **验证脚本**：`tmp/check_plugin_icon.py`（抓插件管理页里 LxMusic/Ximalaya 行的 `<img>`）、
+      `tmp/dump_plugin_imgs.py`（列出页内所有 `<img>` 及其上下文）。装机后应看到
+      `src="/plugins/LxMusic/html/images/logo_50x50.png"` + `srcset="…_100x100.png 2x"`，
+      而不再是 `html/images/musicservices.svg` + `class="pluginFallbackIcon"`。
 
 ---
 
@@ -555,6 +590,10 @@ XMLBrowser 菜单 / 网页  ← Plugin.pm（feed handlers / webHandler）
      `tmp/dump_req.py`（不截断打印 RemoteStream 的 Request/Response）、`tmp/log_scheme.py`（统计 player open 的 http/https 与建流失败次数）、
      `tmp/check_ssl.py`（SSL 可用性 + 已装版本）、`tmp/show_loglevel.py [类别…]`（看 selected 值）、
      `tmp/verify_release.py [zip]`（zip 内容/sha1 + LAN 仓库一致性）、`tmp/diag_mg.py [查询] [player]`（对照播「直链」与「lxm://」——直链能放而插件不能放 = https 坑指纹）
+   - 0.11.20 图标一轮新增：`tmp/check_plugin_icon.py`（插件管理页里 LxMusic/Ximalaya 行的 `<img>` 与相对 icon 引用）、
+     `tmp/dump_plugin_imgs.py`（页内所有 `<img>` + 上下文，用来确认 srcset 的 `_50x50/_100x100` 形态）、
+     `tmp/check_daphile_menu_icon.py`（达菲皮肤菜单/曲目页里有没有 per-item icon 字段）、
+     `tmp/dump_plugin_rows.py`（插件页里 Ximalaya/LxMusic 周边的原始 HTML）
    - `tmp/lx_set_loglevel.py [LEVEL]` …查看/整表回放设置某个日志类别级别（带 `persist=1`，重启仍生效）
 
 **播放器**：HiBy FC4 `5a:78:10:59:c7:74`（用户主用，验证目标）；HD-Audio Generic `5a:bf:86:1b:a6:ff`（本机声卡）；小爱音箱 squeezelite `bb:bb:69:a9:cf:23`（**会出声，勿用**）
@@ -563,7 +602,14 @@ XMLBrowser 菜单 / 网页  ← Plugin.pm（feed handlers / webHandler）
 
 ## 七、下个 session 待办（按序）
 
-0. ✅ **【本轮 0.11.19】mg https 修复已装机验收 + 两个新订阅源已验收**（详见 §5.11.80 与 §八"订阅源现状"）
+0. **【本轮 0.11.20】装机看图标**：`install.xml` 与 `pack.py` 已改好、LAN 仓库已更新（`?v=97`，
+   `dist/LxMusic-0.11.20.zip` SHA1 `51d4fce14d5f6dfe7fe95ffb19d89c4148609024`，图标
+   `dist/lxmusic_logo.png` 已在仓库根可取）。装机（设置→插件→更新，可能要重启两次）后跑
+   `python tmp/dump_plugin_imgs.py`：应看到 LxMusic 行的 `<img src="/plugins/LxMusic/html/images/logo_50x50.png"
+   srcset="…_100x100.png 2x">`，而不再是灰色的 `musicservices.svg` 兜底图；顺带看 My Apps / apps 菜单里的
+   LX Music 项是否也换成了新图标（§5.11.81 说明它是同一行 `<icon>` 驱动的）。
+   ⚠️ 若发 GitHub release，记得把 `lxmusic_logo.png` 一起作为 release 资产上传。
+1. ✅ **【上一轮 0.11.19】mg https 修复已装机验收 + 两个新订阅源已验收**（详见 §5.11.80 与 §八"订阅源现状"）
    - 0.11.19 已装机（工具页版本号 **0.11.19**，用户手工装）。验收脚本：`python tmp/accept_011_19.py check`
      （wy/mg 各一首端到端）与 `python tmp/accept_011_19.py kulou "稻香"`（**临时停用星海**只留裤佬跑 mg，测完自动恢复）；
      榜单行用 `python tmp/play_board_row.py 6.0 0`；拖动用 `python tmp/seek_lxm.py mg|wy|tx 晴天`。
@@ -611,7 +657,7 @@ XMLBrowser 菜单 / 网页  ← Plugin.pm（feed handlers / webHandler）
 
 ## 八、现场状态与凭据
 
-- **设备**：达菲 `192.168.2.111`（LMS 9.0.3 / perl 5.40；Web `:9000`，CGI `:80`）；运行 **0.11.19**（本机 `repo/` 提交 `a15870c`；LAN 仓库 `?v=96`）。⚠️ 装机后 3 个诊断日志类别已确认复位（plugin.lxmusic / player.source / player.streaming.remote 全 = ERROR）
+- **设备**：达菲 `192.168.2.111`（LMS 9.0.3 / perl 5.40；Web `:9000`，CGI `:80`）；运行 **0.11.19**（本机 `repo/` 提交 `a15870c`；LAN 仓库 `?v=96`）；**0.11.20（插件图标）已打包待装机（`?v=97`）**。⚠️ 装机后 3 个诊断日志类别已确认复位（plugin.lxmusic / player.source / player.streaming.remote 全 = ERROR）
 - **通道**：达菲订阅 = **LAN** `http://192.168.2.68:8765/repo.xml?v=96`（8765 常驻 `python -m http.server` 指向 `dist/`；**进程易失**，掉线就在 `dist/` 重启；`?v=N` 是 LMS 仓库缓存的破除参数，每次装机 +1；0.11.19 用 **v=96**）
 - ⚠️ **本机 IP 会飘**（2026-09-21 实测漂到 .131 又回到 .68）：IP 一变，设备就取不到 LAN 仓库（表现为"POST 成功但版本不变"、源导入报`empty download`）。处理：`ipconfig` 看当前 IP →`$env:LX_REPO_BASE='http://<当前IP>:8765'` 重新 pack →装机时`--repos=http://<当前IP>:8765/repo.xml?v=<N+1>` 把设备指过来；tmp 脚本已统一读环境变量`LX_LAN`（别硬编码）
 - **设备侧现状**：订阅源 **3 个（全部启用）**——`独家音源`(ae78880c，老源，wy 偶发失败) +

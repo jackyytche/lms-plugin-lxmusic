@@ -5,7 +5,7 @@
 	     `| string` 渲染它们，写显示串会渲染成空白（0.6.3 现场：设置下拉里 LX Music 是空行） -->
 	<name>PLUGIN_LXMUSIC</name>
 	<module>Plugins::LxMusic::Plugin</module>
-	<version>0.11.19</version>
+	<version>0.11.20</version>
 	<description>PLUGIN_LXMUSIC_DESC</description>
 	<creator>jackyytche</creator>
 	<email>noreply@example.com</email>
@@ -13,6 +13,13 @@
 	<defaultState>enabled</defaultState>
 	<!-- 璁剧疆鍏ュ彛锛氳缃?鈫?鎻掍欢 閲岄偅涓€琛岀殑 Settings 閾炬帴灏辨槸杩欓噷鏉ョ殑锛堟紡浜嗗氨娌″叆鍙ｏ級 -->
 	<optionsURL>plugins/LxMusic/settings/basic.html</optionsURL>
+	<!-- 插件图标（LMS 插件管理器那一行）：落雪桌面版官方图标（Apache-2.0，取自
+	     lx-music-desktop/resources/icons/256x256.png），放插件自己的 HTML 目录下。
+	     只放一张原图即可——LMS 网页层会把 `logo_50x50.png`/`logo_100x100.png`
+	     这类带尺寸后缀的请求按需缩放后返回（设备实测：50/100/300 都能出图）。
+	     repo.xml（pack.py 生成）里再给一条绝对 URL 的 <icon>，这样"未安装/待更新"
+	     的列表项也有图标（相对路径在未安装时会被 LMS 改写成 slimserver 官方仓库地址，必 404）。 -->
+	<icon>plugins/LxMusic/html/images/logo.png</icon>
 	<type>2</type>
 	<homepage URL="https://github.com/jackyytche/lms-plugin-lxmusic"/>
 	<targetApplication>
