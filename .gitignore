@@ -1,2 +1,8 @@
 # 本地专用，不提交（内容与用途见 subscriptions/README.txt）
 subscriptions/
+
+# 交接文档只留本地：它按设计会写具体平台名与设备细节，不放到公开仓
+HANDOFF.md
+
+# 内部设计/交接文档只留本地根目录 docs/（会写具体平台名与上游路径）
+docs/
