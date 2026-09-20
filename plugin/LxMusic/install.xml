@@ -1,11 +1,11 @@
-﻿<?xml version="1.0" encoding="UTF-8"?>
+<?xml version="1.0" encoding="UTF-8"?>
 <extension>
 	<id>8f4e2a91-6c3d-4b7e-a5d8-2f9c1e7b4a36</id>
 	<!-- name/description 必须是 strings.txt 里的 token：LMS 的插件列表与设置下拉都用
 	     `| string` 渲染它们，写显示串会渲染成空白（0.6.3 现场：设置下拉里 LX Music 是空行） -->
 	<name>PLUGIN_LXMUSIC</name>
 	<module>Plugins::LxMusic::Plugin</module>
-	<version>0.11.17</version>
+	<version>0.11.19</version>
 	<description>PLUGIN_LXMUSIC_DESC</description>
 	<creator>jackyytche</creator>
 	<email>noreply@example.com</email>

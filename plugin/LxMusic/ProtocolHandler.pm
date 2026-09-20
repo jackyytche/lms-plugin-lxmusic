@@ -3,7 +3,8 @@
 # 播放时把 lxm:// 伪 URL 解析为真实音频直链：
 #   lxm://m/<base64url(musicInfo JSON)>?s=<platform>&t=<quality>&n=<title>
 # 取链走 Plugins::LxMusic::Helper（qjs + 订阅源脚本，musicUrl action），
-# 直链交给 Slim::Player::Protocols::HTTP 流播。
+# 直链交给 LMS 流播：http 直链走 Slim::Player::Protocols::HTTP，
+# https 直链走 Slim::Player::Protocols::HTTPS（TLS，见下面的基类选择）。
 # 模式跟随 Plugins::Ximalaya::ProtocolHandler（含达菲 canTranscodeSeek 修正）。
 # ============================================================
 
@@ -13,6 +14,30 @@ use strict;
 use warnings;
 
 use base qw(Slim::Player::Protocols::HTTP);
+
+# ⚠️ 基类选择（0.11.19）：**https 直链必须走 TLS**。
+# 现场实证（2026-09-21，设备日志）：咪咕（星海音乐源 mg）解析出来的直链是
+#   https://freetyst.nf.migu.cn/public/.../xxx.flac?...&Key=...&ua=Android_migu
+# 而我们的处理器继承的是 Slim::Player::Protocols::HTTP —— 它底下是**纯明文**
+# IO::Socket::INET（Slim::Formats::RemoteStream）。于是 LMS 拿明文 HTTP/1.0 去打
+# 443 端口：
+#   Opening connection to https://freetyst.nf.migu.cn/…: [freetyst.nf.migu.cn on port 443 …]
+#   Request: GET /public/…/60054701923151339.flac?… HTTP/1.0
+#   Response: HTTP/1.1 400 Bad Request          ← CDN 对明文请求的回应
+#   → HTTP::new "Couldn't create socket binding" → PROBLEM_CONNECTING → 播放 70ms 就 stop
+# （玩家/直链直接播放没问题：playlist 里放 https:// 时 LMS 用的是它自带的 HTTPS
+#   处理器，TLS 正常 ⇒ 这就是"同一首歌，直链能放、插件播放失败"的根因。）
+#
+# 修法只用 LMS 公开代码：LMS 的 Slim::Player::Protocols::HTTPS = IO::Socket::SSL + HTTP，
+# 它的 new() 内部按 URL 协议分流（http: → 走 HTTP 明文路径；https: → 走 SSL 握手路径，
+# 且返回来的是我们自己的对象 ⇒ getSeekData/canTranscodeSeek 等覆盖仍然生效）。
+# 所以只要运行环境有 SSL，就把基类换成它；没有 SSL 时保持 HTTP（并在 new 里明确报错）。
+BEGIN {
+	if (eval { require Slim::Networking::Async::HTTP; Slim::Networking::Async::HTTP->hasSSL() }
+		&& eval { require Slim::Player::Protocols::HTTPS; 1 }) {
+		our @ISA = ('Slim::Player::Protocols::HTTPS');
+	}
+}
 
 use MIME::Base64 qw(encode_base64url decode_base64url);
 use URI::Escape qw(uri_escape_utf8 uri_unescape);
@@ -161,14 +186,51 @@ sub _cache_get {
 }
 
 sub _cache_put {
-	my ($url, $direct, $fmt, $kbps, $secs) = @_;
+	my ($url, $direct, $fmt, $kbps, $secs, $len) = @_;
 	return unless $url && $direct;
 	%RESOLVE_CACHE = () if keys %RESOLVE_CACHE > $MAX_CACHE;
-	$RESOLVE_CACHE{$url} = {
-		direct => $direct, fmt => $fmt, kbps => $kbps, secs => $secs,
+	my $rec = {
+		direct => $direct, fmt => $fmt, kbps => $kbps, secs => $secs, len => $len,
 		expires => time() + _resolveTtl(),
 	};
+	$RESOLVE_CACHE{$url}    = $rec;
+	# 同一个记录也挂在直链 URL 下：拖动时 LMS 用 currentTrack()/streamUrl 来查，
+	# 两个 URL 都可能被问到（0.11.18 的自实现 getSeekData 依赖它）
+	$RESOLVE_CACHE{$direct} = $rec;
 	return 1;
+}
+
+# 拖动支持（0.11.18）：**自己实现** getSeekData，不再依赖 LMS 的码率查询。
+# 背景（现场实证）：LMS 的 Protocols::HTTP::getSeekData 第一行是
+#     my $bitrate = $song->bitrate() || return;
+# 码率查不到就返回 undef，而 StreamingController::_JumpToTime 里
+#     return unless $seekdata || $restartIfNoSeek;
+# 于是**拖动被静默丢弃**（日志：JumpToTime 之后没有 seek 的 open，几秒后才出现
+# seek=false + streamMode=I）。同一首歌有时能拖有时不能，就是因为那一刻码率查得到/
+# 查不到。这里用解析时缓存下来的真实数据算，永远有返回：
+#   · 有探测长度 + 时长 ⇒ 按比例算字节偏移（最准）
+#   · 只有码率        ⇒ 按码率算
+#   · 都没有          ⇒ 只给 timeOffset，让转码器用 $START$ 跳过（我们声明了 canTranscodeSeek）
+sub getSeekData {
+	my ($class, $client, $song, $newtime) = @_;
+	return undef unless defined $newtime && $newtime > 0;
+
+	my $lxm = eval { $song->currentTrack->url } // '';
+	my $dir = eval { $song->streamUrl }        // '';
+	my $c   = _cache_get($lxm) || _cache_get($dir) || {};
+
+	my %d = (timeOffset => $newtime);
+	if ($c->{len} && $c->{secs} && $c->{secs} > 0) {
+		$d{sourceStreamOffset} = int($c->{len} * $newtime / $c->{secs});
+	}
+	elsif ($c->{kbps} && $c->{kbps} > 0) {
+		$d{sourceStreamOffset} = int(($c->{kbps} * 1000 / 8) * $newtime);
+	}
+
+	$log->warn(sprintf('LxMusic getSeekData: newtime=%s kbps=%s len=%s offset=%s url=%s',
+		$newtime, ($c->{kbps} // 'undef'), ($c->{len} // 'undef'),
+		($d{sourceStreamOffset} // 'none'), substr($lxm || $dir, 0, 34)));
+	return \%d;
 }
 
 
@@ -497,7 +559,7 @@ sub scanUrl {
 				$res->{source} // '?', $res->{quality} // '?', $res->{verified} ? 1 : 0,
 				(defined $res->{actualKbps} ? " ~$res->{actualKbps}kbps" : ''),
 				$res->{format} // '<undef>'));
-			_cache_put($url, $direct, $res->{format}, $res->{actualKbps}, $res->{secs});
+			_cache_put($url, $direct, $res->{format}, $res->{actualKbps}, $res->{secs}, $res->{length});
 
 			# 实际档位/码率如实进队列元数据（PC 端拿不到这个信息，我们靠 HEAD 反推）
 			$class->cache_metadata($url, {
@@ -523,9 +585,18 @@ sub scanUrl {
 sub new {
 	my ($class, $args) = @_;
 	$args->{url} = $args->{song}->streamUrl unless $args->{redir};
+	my $u = defined $args->{url} ? $args->{url} : '';
+
+	# 0.11.19：https 直链必须有 TLS 基类，否则 LMS 会拿明文 HTTP 打 443（见文件头注释）。
+	# 这里显式报错，现场就不用再从 "400 Bad Request / PROBLEM_CONNECTING" 反推了。
+	if ($u =~ m{^https://}i && !$class->isa('Slim::Player::Protocols::HTTPS')) {
+		$log->error('LxMusic: https direct link but LMS has no SSL (IO::Socket::SSL missing) -> '
+			. substr($u, 0, 80));
+	}
+
 	if ($log->is_info) {
-		my $u = (defined $args->{url} && length $args->{url}) ? substr($args->{url}, 0, 90) : '<undef>';
-		$log->info('LxMusic: player open -> ' . $u);
+		my $shown = length $u ? substr($u, 0, 90) : '<undef>';
+		$log->info('LxMusic: player open -> ' . $shown);
 	}
 	return $class->SUPER::new($args);
 }

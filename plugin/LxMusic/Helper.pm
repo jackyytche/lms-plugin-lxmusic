@@ -243,7 +243,7 @@ sub resolveTrack {
 
 	# 交付一个候选（写 tries + 回调）；$friendly 标记是否播放器友好
 	my $finish = sub {
-		my ($src, $q, $url, $tm, $friendly, $verified, $kbps, $magic) = @_;
+		my ($src, $q, $url, $tm, $friendly, $verified, $kbps, $magic, $len) = @_;
 		my $suspect = ($kbps && $kbps < 64) ? 1 : 0;
 		if ($suspect) {
 			$log->warn("LxMusic resolve: SUSPECT short/preview file ([" . ($src->{name} // '?')
@@ -271,6 +271,7 @@ sub resolveTrack {
 			verified   => $verified,
 			actualKbps => $kbps,
 			secs       => $secs,
+			length     => $len,          # 探测到的文件总字节数（拖动算偏移用）
 			suspect    => $suspect,
 			magic      => $magic,
 			format     => $fmt,
@@ -292,7 +293,7 @@ sub resolveTrack {
 			if ($pi->{ok}) {
 				my $secs = _secsOf($track);
 				my $kbps = ($pi->{length} && $secs) ? int($pi->{length} * 8 / 1000 / $secs) : undef;
-				return $finish->($src, $q, $url, $tm, $friendly, 1, $kbps, $pi->{magic});
+				return $finish->($src, $q, $url, $tm, $friendly, 1, $kbps, $pi->{magic}, $pi->{length});
 			}
 			push @tries, { source => $src->{name}, quality => $q, why => 'verify: ' . ($pi->{error} // '?'), %$tm };
 			$log->warn("LxMusic resolve: verify rejected [" . $src->{name} . "] $q: " . ($pi->{error} // '?'));
