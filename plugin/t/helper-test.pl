@@ -9,9 +9,27 @@ use File::Spec;
 use lib File::Spec->catdir($FindBin::Bin);           # t/ —— AnyEvent stubs
 
 # zip 平铺结构：Helper.pm 在插件根，包名 Plugins::LxMusic::Helper
-# （LMS 将 InstalledPlugins/ 加入 @INC，解压后路径自然匹配包名）
+# （LMS 将 InstalledPlugins/ 加入 @INC，解压后路径自然匹配包名）。
+# 本测试树里没有 Plugins/ 目录，而 Helper.pm 会 `use Plugins::LxMusic::Sources`
+# ⇒ 给 @INC 挂一个映射钩子：Plugins/LxMusic/<X>.pm → <插件根>/<X>.pm
+# （优先 CI/本地建的 t_build/Plugins/LxMusic）。这样 `perl t/helper-test.pl`
+# 在 CI 与本地都能独立跑通，不依赖外部 -I 参数。
+# 2026-09-21 修：此前 CI 恒失败于 `Can't locate Plugins/LxMusic/Sources.pm in @INC`。
 BEGIN {
 	$ENV{LX_TEST_VERBOSE} = $ENV{LX_TEST_VERBOSE} || 0;
+	my $root  = File::Spec->rel2abs(File::Spec->catdir($FindBin::Bin, '..'));
+	my $build = File::Spec->catdir($root, 't_build', 'Plugins', 'LxMusic');
+	unshift @INC, sub {
+		my ($self, $file) = @_;
+		return unless $file =~ m{^Plugins/LxMusic/([^/]+\.pm)$};
+		for my $dir ($build, File::Spec->catdir($root, 'LxMusic')) {
+			my $p = File::Spec->catfile($dir, $1);
+			next unless -f $p;
+			open my $fh, '<', $p or next;
+			return $fh;
+		}
+		return;
+	};
 	my $helper = File::Spec->catfile($FindBin::Bin, '..', 'LxMusic', 'Helper.pm');
 	require $helper;
 	Plugins::LxMusic::Helper->import if Plugins::LxMusic::Helper->can('import');
@@ -64,10 +82,22 @@ sub check {
 	check('init returned true',   $r ? 1 : 0, $@);
 }
 
-# ---------- 6. installSource：名字清洗 ----------
+# ---------- 6. installSource：名字清洗 + 落盘（内容过短会被拒，用真实形状的桩） ----------
 {
-	my $p = Plugins::LxMusic::Helper->installSource('../evil?name.js', 'var x=1;');
-	check('installSource sanitised',   defined $p && $p !~ m{\?\;} && $p !~ m{\.\.}, $p // '');
+	# Sources::addContent 的校验：≥50 字节 + 必须有 @name 头；描述里带唯一串保证每次内容不同
+	# （否则同一台机器跑第二遍会命中"内容完全相同，已跳过"而拿不到路径）
+	my $uniq = $$ . '-' . time();
+	my $src = "/**\n"
+		. " * \@name Test Fixture Source\n"
+		. " * \@description regression fixture, uniq $uniq\n"
+		. " */\n"
+		. "const { EVENT_NAMES, on, send } = globalThis.lx;\n"
+		. "on(EVENT_NAMES.request, () => { send(EVENT_NAMES.inited, { status: 'success', sources: {} }); });\n";
+	my $p = Plugins::LxMusic::Helper->installSource('../evil?name.js', $src);
+	check('installSource returns a path',  defined $p && $p =~ /\.js$/, $p // '(undef)');
+	check('installSource path sanitised',  defined $p && $p !~ /[?;]/ && $p !~ m{\.\.}, $p // '');
+	check('installSource wrote the file',  defined $p && -s $p && (-s $p) >= 50, defined $p ? (-s $p) : 'no path');
+	check('installSource rejects junk',    !defined Plugins::LxMusic::Helper->installSource('junk.js', 'var x=1;'));
 }
 
 print $failed ? "\nFAILED: $failed\n" : "\nALL PASS\n";

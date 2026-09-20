@@ -6,3 +6,6 @@ HANDOFF.md
 
 # 内部设计/交接文档只留本地根目录 docs/（会写具体平台名与上游路径）
 docs/
+
+# 测试用 stub 树（CI 与本地跑 t/helper-test.pl 前现建，不进仓库）
+plugin/t_build/

@@ -2,6 +2,12 @@ name: Plugin tests (perl)
 
 # Helper.pm 存根回归 + 全模块语法检查（stub LMS 树）。
 # 回归日志由 CI 直接 commit 回仓库（日志 API 不可靠时的固定取证通道）。
+#
+# 2026-09-21 修：Helper regression 曾在裸 `perl t/helper-test.pl` 下恒失败
+# （`Can't locate Plugins/LxMusic/Sources.pm in @INC`）——Helper.pm 会
+# `use Plugins::LxMusic::Sources`，而 t/ 里没有 Plugins/ 映射。
+# 现在两手都做：① 先建 stub 树并给 perl 传 `-I t -I t_build`；
+# ② t/helper-test.pl 自己也挂了 @INC 钩子（未传 -I 也能独立跑通）。
 
 on:
   push:
@@ -20,12 +26,36 @@ jobs:
       - name: Install perl deps
         run: sudo apt-get update && sudo apt-get install -y libanyevent-perl libjson-xs-perl
 
+      - name: DEPS all core modules loadable
+        run: perl -MURI::Escape -MMIME::Base64 -MJSON::XS -MEncode -MHTML::Entities -MTime::HiRes -MPOSIX -e1
+
+      - name: Build stub tree
+        run: |
+          cd plugin
+          mkdir -p t_build/Plugins/LxMusic
+          cp LxMusic/*.pm t_build/Plugins/LxMusic/
+
       - name: Helper regression
         run: |
           cd plugin
           set -o pipefail
-          perl t/helper-test.pl 2>&1 | tee helper-test.log
+          perl -I t -I t_build t/helper-test.pl 2>&1 | tee helper-test.log
           exit ${PIPESTATUS[0]}
+
+      - name: CHECK Helper.pm
+        run: cd plugin && perl -I t -I t_build -c t_build/Plugins/LxMusic/Helper.pm
+
+      - name: CHECK ProtocolHandler.pm
+        run: cd plugin && perl -I t -I t_build -c t_build/Plugins/LxMusic/ProtocolHandler.pm
+
+      - name: CHECK Plugin.pm
+        run: cd plugin && perl -I t -I t_build -c t_build/Plugins/LxMusic/Plugin.pm
+
+      - name: CHECK Settings.pm / Sources.pm
+        run: |
+          cd plugin
+          perl -I t -I t_build -c t_build/Plugins/LxMusic/Settings.pm
+          perl -I t -I t_build -c t_build/Plugins/LxMusic/Sources.pm
 
       - name: Publish regression log back to repo
         if: always()
@@ -36,21 +66,3 @@ jobs:
           git add -f helper-test.log
           git commit -m "ci: regression log [skip ci]" || echo "no change"
           git push || echo "push skipped"
-
-      - name: Build stub tree
-        run: |
-          cd plugin
-          mkdir -p t_build/Plugins/LxMusic
-          cp LxMusic/*.pm t_build/Plugins/LxMusic/
-
-      - name: DEPS all core modules loadable
-        run: perl -MURI::Escape -MMIME::Base64 -MJSON::XS -MEncode -MHTML::Entities -MTime::HiRes -MPOSIX -e1
-
-      - name: CHECK Helper.pm
-        run: cd plugin && perl -I t -I t_build -c t_build/Plugins/LxMusic/Helper.pm
-
-      - name: CHECK ProtocolHandler.pm
-        run: cd plugin && perl -I t -I t_build -c t_build/Plugins/LxMusic/ProtocolHandler.pm
-
-      - name: CHECK Plugin.pm
-        run: cd plugin && perl -I t -I t_build -c t_build/Plugins/LxMusic/Plugin.pm
