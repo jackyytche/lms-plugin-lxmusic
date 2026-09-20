@@ -435,9 +435,12 @@ sub sdkBoardTracksHandler {
 			}
 			my $title  = ($bname && length $bname) ? $bname : ($info->{name} || (_u($src) . _u('榜单')));
 			my $total  = $res->{data}{total};
-			my @items = _trackItems(\@list, _u("[$src] "));
+			# _trackItems 返回数组引用（勿再套 @ 展开成单元素列表——0.11.1 首版
+			# 曾写成 my @items = _trackItems(...)，items 变成 [[...]]，CLI 路径炸
+			# "Not a HASH reference"（XMLBrowser.pm L1012），榜单 feed 全空）
+			my $items  = _trackItems(\@list, _u("[$src] "));
 			$cb->({
-				items => \@items,
+				items => $items,
 				($cover    ? (image => $cover) : ()),
 				($bangid ne '' ? (play => "lxm://b/$src/$bangid") : ()),
 				($bangid ne '' ? (actions => _board_play_actions($src, $bangid)) : ()),
