@@ -54,6 +54,11 @@ sub getNextTrack {
 			Slim::Music::Info::setContentType($u, $c->{fmt});
 			Slim::Music::Info::setContentType($c->{direct}, $c->{fmt}) if $c->{direct};
 			$t->content_type($c->{fmt}) if $t && $t->can('content_type');
+			# 时长/码率是 canSeek 的前提（Protocols::HTTP::canSeek），开播前再保一次
+			my %m;
+			$m{bitrate} = int($c->{kbps}) if $c->{kbps};
+			$m{secs}    = int($c->{secs}) if $c->{secs};
+			Slim::Music::Info::setRemoteMetadata($u, \%m) if %m;
 		};
 	}
 
@@ -156,17 +161,20 @@ sub _cache_get {
 }
 
 sub _cache_put {
-	my ($url, $direct, $fmt) = @_;
+	my ($url, $direct, $fmt, $kbps, $secs) = @_;
 	return unless $url && $direct;
 	%RESOLVE_CACHE = () if keys %RESOLVE_CACHE > $MAX_CACHE;
-	$RESOLVE_CACHE{$url} = { direct => $direct, fmt => $fmt, expires => time() + _resolveTtl() };
+	$RESOLVE_CACHE{$url} = {
+		direct => $direct, fmt => $fmt, kbps => $kbps, secs => $secs,
+		expires => time() + _resolveTtl(),
+	};
 	return 1;
 }
 
 
 # 解析收尾（快慢路径共用）：元数据 + 客户端刷新信号 + 流地址替换
 sub _finish_resolve {
-	my ($class, $song, $url, $info, $direct, $args, $cb, $fmt, $kbps) = @_;
+	my ($class, $song, $url, $info, $direct, $args, $cb, $fmt, $kbps, $secs) = @_;
 
 	my $qLabel = $class->qualityLabel($info->{type});
 
@@ -181,13 +189,24 @@ sub _finish_resolve {
 	);
 	my $mime = ($fmt && $MIME_OF{$fmt}) || ($qLabel =~ /FLAC/i ? 'audio/flac' : 'audio/mpeg');
 
-	my %meta = (ct => $mime, type => $qLabel);
-	$meta{bitrate} = int($kbps) if $kbps && $kbps > 0;   # kbps；"格式码率"显示靠它
-	$meta{title} = $info->{name} if $info->{name};
-	Slim::Music::Info::setRemoteMetadata($url, \%meta);
+	# 时长兜底：解析结果没有就用曲目元数据里的 interval（"5:09"）
+	$secs = Plugins::LxMusic::Helper::_secsOf($info->{music}) unless $secs;
+
+	# 统一的元数据发布（解析后与扫描后各发一次）：LMS 的 scanUrl 会用嗅探结果
+	# 覆盖同一 URL 的属性，只发一次会出现"格式/码率闪一下就没"（0.11.9 现场）。
+	my $publish = sub {
+		my %m = (ct => $mime, type => $qLabel);
+		$m{bitrate} = int($kbps) if $kbps && $kbps > 0;   # kbps；"格式码率"靠它
+		$m{secs}    = int($secs) if $secs && $secs > 0;   # 时长；canSeek 要求它已知
+		$m{title}   = $info->{name} if $info->{name};
+		eval { Slim::Music::Info::setRemoteMetadata($url, \%m) };
+		return \%m;
+	};
+	$publish->();
+
 	$class->cache_metadata($url, { title => $info->{name}, quality => $qLabel, format => $fmt });
 
-	# 用完整体检出的真实格式覆盖 CDN 撒谎的 Content-Type（只用 LMS 公开 API）
+	# 用真实格式覆盖 CDN 撒谎的 Content-Type（只用 LMS 公开 API）
 	if ($fmt) {
 		eval { Slim::Music::Info::setContentType($url, $fmt) };
 		eval { Slim::Music::Info::setContentType($direct, $fmt) };
@@ -220,6 +239,9 @@ sub _finish_resolve {
 		if ($track && $fmt && $track->can('content_type')) {
 			eval { $track->content_type($fmt) };
 		}
+		# 扫描还会冲掉我们发布的 bitrate/secs（表现："格式码率闪一下就没"+不能拖进度条）
+		# ⇒ 扫完按真实值再发一次（见 $publish 注释）
+		$publish->() if $track;
 		$cb->($track, @_);
 	};
 	$class->SUPER::scanUrl($direct, $args);
@@ -460,7 +482,7 @@ sub scanUrl {
 				$res->{source} // '?', $res->{quality} // '?', $res->{verified} ? 1 : 0,
 				(defined $res->{actualKbps} ? " ~$res->{actualKbps}kbps" : ''),
 				$res->{format} // '<undef>'));
-			_cache_put($url, $direct, $res->{format});
+			_cache_put($url, $direct, $res->{format}, $res->{actualKbps}, $res->{secs});
 
 			# 实际档位/码率如实进队列元数据（PC 端拿不到这个信息，我们靠 HEAD 反推）
 			$class->cache_metadata($url, {
@@ -472,7 +494,8 @@ sub scanUrl {
 			});
 
 			# 直链是实际流地址；playlist 里保持稳定的 lxm:// URL
-			$class->_finish_resolve($song, $url, $info, $direct, $args, $cb, $res->{format}, $res->{actualKbps});
+			$class->_finish_resolve($song, $url, $info, $direct, $args, $cb,
+				$res->{format}, $res->{actualKbps}, $res->{secs});
 			$class->_prefetch_next($song, $url);
 			return;
 		},
@@ -571,6 +594,10 @@ sub cache_metadata {
 		error   => $info->{error}   || '',
 		cover   => $info->{cover}   || '',
 		secs    => $info->{secs}    || 0,
+		# 解析后才知道的真实值（0.11.10）：getMetadataFor 用它们给 UI 发
+		# "格式"标签与**数字**码率（此前误把档位 key 当码率发 ⇒ 队列行显示 br=flac24bit）
+		kbps    => $info->{kbps}    || 0,
+		format  => $info->{format}  || '',
 	};
 
 	return 1;
@@ -586,6 +613,9 @@ sub publishQueueMetadata {
 	$meta{title} = $info->{title} if defined $info->{title} && $info->{title} ne '';
 	$meta{secs}  = $info->{secs}  if $info->{secs} && $info->{secs} > 0;
 	$meta{cover} = $info->{cover} if defined $info->{cover} && $info->{cover} ne '';
+	# 估算码率（types[].size ÷ 时长，Plugin::_trackItems 算出）：写进行属性，
+	# 队列行立刻能看到码率；播放后用真实探测值覆盖（_finish_resolve）
+	$meta{bitrate} = int($info->{kbps}) if $info->{kbps} && $info->{kbps} > 0;
 	return 0 unless scalar keys %meta;
 
 	Slim::Music::Info::setRemoteMetadata($url, \%meta);
@@ -607,9 +637,11 @@ sub getMetadataFor {
 		$meta{cover} = $m->{cover} if $m->{cover};
 		$meta{secs}  = $m->{secs}  if $m->{secs};
 		if ($m->{quality}) {
-			$meta{type}    = $m->{quality};
-			$meta{bitrate} = $m->{quality};
+			# type 给人看：档位 key（flac24bit）→ 显示标签（FLAC 24bit）
+			$meta{type} = $class->qualityLabel($m->{quality});
 		}
+		# bitrate 必须是**数字 kbps**；没有真实码率就别发（否则 UI 显示乱值）
+		$meta{bitrate} = int($m->{kbps}) if $m->{kbps} && $m->{kbps} > 0;
 		return %meta ? \%meta : {};
 	}
 

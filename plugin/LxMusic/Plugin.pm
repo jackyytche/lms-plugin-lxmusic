@@ -566,6 +566,17 @@ sub _board_play_actions {
 # track(search/boardlist 产出) -> lxm:// audio 项（$prefixOf 可按曲给不同前缀，如聚合搜索的来源标签）
 # $offset：列表在整榜中的绝对起始下标（原生翻页时传窗口 index），让编号跨页连续
 # （0.11.5 前按页内 1 起编，翻到第 2 页仍显示 001-050，肉眼像"没翻页"）
+# types[].size（"34.63 MiB"）-> 字节数
+sub _bytesOf {
+	my ($s) = @_;
+	return undef unless defined $s && $s ne '';
+	return int($1 * 1024)        if $s =~ /^\s*([\d.]+)\s*KiB/i;
+	return int($1 * 1048576)     if $s =~ /^\s*([\d.]+)\s*MiB/i;
+	return int($1 * 1073741824)  if $s =~ /^\s*([\d.]+)\s*GiB/i;
+	return int($1)               if $s =~ /^\s*(\d+)\s*B\s*$/i;
+	return undef;
+}
+
 sub _trackItems {
 	my ($list, $prefix, $prefixOf, $offset) = @_;
 	$prefix ||= '';
@@ -587,10 +598,29 @@ sub _trackItems {
 		);
 		next unless $url;
 		my ($secs, $cover) = (_secsOf($t), _coverOf($t));
-		# 渲染期发布队列元数据（喜马拉雅 0.1.47 同款）：队列行才有歌名/时长；封面进 LMS 图像缓存
+
+		# 队列行的码率估算（0.11.11）：SDK 的 types[].size 给了各档位文件体积，
+		# 体积 ÷ 时长 = 估算码率。播放后再由真实探测值覆盖（_finish_resolve）。
+		# kw 的 types 没有 size ⇒ 估不出来（播放后仍有真值），不硬造。
+		my $est_kbps;
+		if ($secs && ref($t->{types}) eq 'ARRAY') {
+			my ($exact, $biggest);
+			for my $ty (@{ $t->{types} }) {
+				next unless ref $ty eq 'HASH';
+				my $b = _bytesOf($ty->{size});
+				next unless $b;
+				$exact   = $b if defined $ty->{type} && $ty->{type} eq $q;
+				$biggest = $b if !defined $biggest || $b > $biggest;
+			}
+			my $bytes = $exact || $biggest;
+			$est_kbps = int($bytes * 8 / 1000 / $secs) if $bytes;
+		}
+
+		# 渲染期发布队列元数据（喜马拉雅 0.1.47 同款）：队列行才有歌名/时长/码率
 		Plugins::LxMusic::ProtocolHandler->publishQueueMetadata($url, {
 			title   => ($singer ne '' ? "$singer - $name" : $name),
 			secs    => $secs,
+			kbps    => $est_kbps,
 			cover   => $cover,
 			quality => $q,
 		});

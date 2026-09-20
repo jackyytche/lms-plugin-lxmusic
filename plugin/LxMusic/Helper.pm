@@ -250,6 +250,9 @@ sub resolveTrack {
 				. "] type=$q -> ~${kbps}kbps) — 可能是试听片段或残缺文件");
 		}
 		my $fmt = $class->lmsFormat($magic, $url);
+		# 时长：曲目元数据里的 interval（搜索结果/榜单条目都有）；LMS 的
+		# Protocols::HTTP::canSeek 要求 bitrate **和** duration 都已知才允许拖动
+		my $secs = _secsOf($track);
 		push @tries, { source => $src->{name}, quality => $q, ok => 1, verified => $verified,
 			kbps => $kbps, suspect => $suspect, magic => $magic, format => $fmt,
 			friendly => $friendly, %$tm };
@@ -267,6 +270,7 @@ sub resolveTrack {
 			quality    => $q,
 			verified   => $verified,
 			actualKbps => $kbps,
+			secs       => $secs,
 			suspect    => $suspect,
 			magic      => $magic,
 			format     => $fmt,
