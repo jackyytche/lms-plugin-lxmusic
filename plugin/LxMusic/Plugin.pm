@@ -385,24 +385,14 @@ sub _boardItems {
 	} } @$boards ];
 }
 
-# 榜单曲目（source/bangid/榜单名/页码 由 passthrough 传入）。
-# 分页（0.11.3）：达菲 Web 对 coderef feed 只取一次就本地切片（Slim::Web::XMLBrowser
-# L505-517：quantity=itemsPerPage，index=start 恒 0），"滚动再取"不存在——所以
-# 翻页必须由 feed 自带「下一页/跳页」行（喜马拉雅 0.1.31/0.1.32 同款）。
-# 每页轨道数 = UI 每页条数(itemsPerPage) - 2（正好容纳 下一页+跳页 两行，避免幻影页）。
-# 页窗口按绝对轨道下标切，跨上游页(页宽 50)时顺序补取。
-sub _board_page_width {
-	my $pp = eval { preferences('server')->get('itemsPerPage') };
-	$pp = 50 unless $pp && $pp =~ /^\d+$/ && $pp >= 10;
-	$pp = 500 if $pp > 500;
-	my $w = $pp - 2;
-	$w = 10  if $w < 10;
-	$w = 100 if $w > 100;    # 上游页宽 50，>100 一页要补 3 个请求，不值
-	return $w;
-}
-
+# 榜单曲目（source/bangid/榜单名 由 passthrough 传入）。
+# 原生翻页（0.11.4，喜马拉雅 albumHandler 0.1.10 + 0.1.51 WINDOW FILLING 同款）：
+# 达菲 Web/jive 回取 coderef feed 时带 index（窗口首曲绝对下标）和 quantity
+# （= itemsPerPage，达菲 50），feed 回 { items: 该窗口, offset: index, total: 全榜数 }
+# 让 UI 渲染自己的页码——0.11.3 的 feed 内嵌翻页行方案废弃（用户指正：那不是达菲
+# 原生翻页体系）。窗口宽于上游页宽(50)时按页顺序补取，绝不吐空行。
 sub sdkBoardTracksHandler {
-	my ($client, $cb, $args, $mode, $src, $bangid, $bname, $page) = @_;
+	my ($client, $cb, $args, $mode, $src, $bangid, $bname) = @_;
 	$src    ||= 'kg';
 	$bangid ||= '';
 
@@ -411,160 +401,105 @@ sub sdkBoardTracksHandler {
 		return;
 	}
 
-	my $W     = _board_page_width();
-	my $index = $args->{index} || 0;
-	if (!defined $page || $page eq '') {
-		# CLI/jive 带 index 的窗口请求折算到页网格（达菲 Web 不会走到这里）
-		$page = ($index > 0) ? int($index / $W) + 1 : 1;
-	}
-	$page = 1 if $page =~ /^\d+$/ && $page < 1;
+	my $window = $args->{quantity} || 50;
+	$window = 1   if $window < 1;
+	$window = 300 if $window > 300;     # fan-out 上限（300 首 = 至多 6 个上游页）
+	my $index      = $args->{index} || 0;
+	my $first_page = int($index / 50) + 1;   # 上游页宽 50
+	my $skip       = $index % 50;
+	my $max_pages  = 8;
 
-	# ---- 跳页层：本地生成页链接（取一次 boardlist 拿 total，零额外 API）----
-	if ($page eq 'pages') {
+	# ---- WINDOW FILLING（喜马拉雅 0.1.51）：顺序取上游页，攒够 [skip, skip+window)
+	# 才切——窗口比上游页宽时绝不吐空行（0.11.3 前身曾把窗口夹到 50 导致缺位空行）----
+	my ($acc, $info, $total, $lastErr) = ([], undef, undef, undef);
+	my $slice = sub {
+		my $last = $skip + $window - 1;
+		$last = $#$acc if $last > $#$acc;
+		return $last >= $skip ? [ @$acc[ $skip .. $last ] ] : [];
+	};
+	my $page = $first_page;
+	my $pages_fetched = 0;
+	my $again;
+	$again = sub {
 		Plugins::LxMusic::Helper->request(
 			action  => 'boardlist',
-			info    => { source => $src, bangid => $bangid, page => 1 },
+			info    => { source => $src, bangid => $bangid, page => $page },
 			timeout => 45,
 			cb      => sub {
 				my ($res) = @_;
-				unless ($res->{ok} && $res->{data} && $res->{data}{list}) {
-					$cb->({ items => [ { name => _u('获取失败: ') . ($res->{error} || 'unknown'), type => 'text' } ] });
-					return;
-				}
-				my $total = $res->{data}{total} || scalar @{ $res->{data}{list} };
-				my $pages = int(($total + $W - 1) / $W);
-				my @links;
-				for my $p (1 .. $pages) {
-					push @links, {
-						name        => _u('第 ' . $p . ' / ' . $pages . ' 页'),
-						type        => 'link',
-						url         => \&sdkBoardTracksHandler,
-						passthrough => [ 'tracks', $src, $bangid, $bname, $p ],
-					};
-				}
-				$cb->({ items => \@links });
-			},
-		);
-		return;
-	}
-
-	$page = 1 unless $page =~ /^\d+$/;
-	$page = 40 if $page > 40;    # 防御：>40 页(≈1900首)的榜按 40 页截断
-
-	# 本页轨道窗口（绝对下标）
-	my $first = ($page - 1) * $W;
-	my $last  = $first + $W - 1;
-	my $upFirst = int($first / 50) + 1;    # 上游页宽 50
-	my $upLast  = int($last / 50) + 1;
-
-	my (@combined, $info, $total, $lastPageFull, $lastErr);
-	my $fetchUp = sub {
-		my ($p, $done) = @_;
-		Plugins::LxMusic::Helper->request(
-			action  => 'boardlist',
-			info    => { source => $src, bangid => $bangid, page => $p },
-			timeout => 45,
-			cb      => sub {
-				my ($res) = @_;
-				if ($res->{ok} && $res->{data} && $res->{data}{list} && @{ $res->{data}{list} }) {
-					push @combined, @{ $res->{data}{list} };
-					$info        = $res->{data}{info} if $p == $upFirst;
-					$total       = $res->{data}{total} if defined $res->{data}{total};
-					$lastPageFull = (scalar @{ $res->{data}{list} } >= 50);
+				$pages_fetched++;
+				my $up = ($res->{ok} && $res->{data} && $res->{data}{list})
+					? $res->{data}{list} : [];
+				if (@$up) {
+					push @$acc, @$up;
+					$info = $res->{data}{info} if $pages_fetched == 1;
+					$total = $res->{data}{total}
+						if !defined $total && defined $res->{data}{total};
 				}
 				else {
 					$lastErr = $res->{error} || 'unknown';
 				}
-				$done->();
+				my $enough = @$acc >= $skip + $window;
+				if (!$enough && @$up && $pages_fetched < $max_pages) {
+					$page++;
+					$again->();
+					return;
+				}
+				my $list = $slice->();
+				unless (@$list) {
+					$cb->({ items => [ { name => _u('获取失败: ') . ($lastErr || '无数据'), type => 'text' } ] });
+					return;
+				}
+				board_render($cb, $src, $bangid, $bname, $info, $acc, $list, $total, $index);
 			},
 		);
 	};
-
-	# 顺序补取 upFirst..upLast（最多 2-3 个请求）
-	my @todo = ($upFirst .. $upLast);
-	my $run;
-	$run = sub {
-		my $done = shift @_;
-		if (!@todo) {
-			$run = undef;
-			$done->();
-			return;
-		}
-		my $p = shift @todo;
-		$fetchUp->($p, sub { $run->($done) });
-	};
-	$run->(sub {
-		unless (@combined) {
-			$cb->({ items => [ { name => _u('获取失败: ') . ($lastErr || '无数据'), type => 'text' } ] });
-			return;
-		}
-
-		my @all = @combined;
-		my $from = $first - ($upFirst - 1) * 50;               # 组合数组内的切片起点
-		my @list = ($from <= $#all) ? @all[ $from .. $#all ] : ();
-		@list = @list[ 0 .. $W - 1 ] if @list > $W;
-
-		# ---- 榜单页头（喜马拉雅 0.1.40-0.1.54 同款，达菲实测过的组合）----
-		#   feed 级 image    -> Slim::Web::XMLBrowser stash -> Web 页顶部大封面
-		#   feed 级 play     -> stash playUrl -> 页头 play/add 按钮（songinfo 页头，
-		#                       它一出现模板就不再渲染自动的 "All Songs" 行）
-		#   feed 级 actions  -> 页头 playall/addall/insert 命令（经 lxm://b/ 整榜展开）
-		#   albumData        -> 页头 details 行（榜单名 / 来源·总数）
-		# 封面优先级：榜单自带封面（kw kbangserver v9_pic2）→ 第一首的封面兜底。
-		my $cover;
-		if ($info && $info->{img} && $info->{img} =~ m{^https?://}) {
-			$cover = $prefs->get('coverProxy') ? _coverProxyUrl($info->{img}) : $info->{img};
-		}
-		elsif (@all && $all[0]) {
-			$cover = _coverOf($all[0]);
-		}
-		my $title = ($bname && length $bname) ? $bname : (($info && $info->{name}) || (_u($src) . _u('榜单')));
-		$total = scalar(@all) + $first unless defined $total;   # 上游没给 total：按"取满即有更多"估算
-		my $pages = int(($total + $W - 1) / $W);
-
-		# _trackItems 返回数组引用（勿再套 @ 展开成单元素列表——0.11.1 首版
-		# 曾写成 my @items = _trackItems(...)，items 变成 [[...]]，CLI 路径炸
-		# "Not a HASH reference"（XMLBrowser.pm L1012），榜单 feed 全空）
-		my $tracks = _trackItems(\@list, _u("[$src] "));
-		my @items  = @$tracks;
-
-		# ---- 翻页行（达菲 Web 不回取 feed，页导航必须长在 feed 里）----
-		my $hasNext = ($page < $pages) ? 1 : 0;
-		if (!$hasNext && $lastPageFull && @combined == ($upLast - $upFirst + 1) * 50) {
-			# 上游没给 total：取满即假设还有下一页
-			$hasNext = 1;
-			$pages   = $page + 1;
-		}
-		if ($hasNext) {
-			push @items, {
-				name        => _u('▶ 下一页（第 ' . ($page + 1) . ' / ' . $pages . ' 页）'),
-				type        => 'link',
-				url         => \&sdkBoardTracksHandler,
-				passthrough => [ 'tracks', $src, $bangid, $bname, $page + 1 ],
-			};
-			if ($pages > 2) {
-				push @items, {
-					name        => _u('⏫ 跳页（共 ' . $pages . ' 页）'),
-					type        => 'link',
-					url         => \&sdkBoardTracksHandler,
-					passthrough => [ 'tracks', $src, $bangid, $bname, 'pages' ],
-				};
-			}
-		}
-
-		$cb->({
-			items => \@items,
-			($cover    ? (image => $cover) : ()),
-			($bangid ne '' ? (play => "lxm://b/$src/$bangid") : ()),
-			($bangid ne '' ? (actions => _board_play_actions($src, $bangid)) : ()),
-			(albumData => [
-				{ name => $title, type => 'text', label => 'ALBUM' },
-				{ name => _u('[' . $src . '] · 第 ' . $page . ' / ' . $pages . ' 页 · 约 ' . int($total) . ' 首'),
-					type => 'text', label => 'ARTIST' },
-			]),
-		});
-	});
+	$again->();
 	return;
+}
+
+# 渲染榜单窗口（0.11.4 从 handler 拆出）：页头 + items + 原生翻页契约
+sub board_render {
+	my ($cb, $src, $bangid, $bname, $info, $acc, $list, $total, $index) = @_;
+
+	# ---- 榜单页头（喜马拉雅 0.1.40-0.1.54 同款，达菲实测过的组合）----
+	#   feed 级 image    -> Slim::Web::XMLBrowser stash -> Web 页顶部大封面
+	#   feed 级 play     -> stash playUrl -> 页头 play/add 按钮（songinfo 页头，
+	#                       它一出现模板就不再渲染自动的 "All Songs" 行）
+	#   feed 级 actions  -> 页头 playall/addall/insert 命令（经 lxm://b/ 整榜展开）
+	#   albumData        -> 页头 details 行（榜单名 / 来源·总数）
+	# 封面优先级：榜单自带封面（kw kbangserver v9_pic2）→ 第一首的封面兜底。
+	my $cover;
+	if ($info && $info->{img} && $info->{img} =~ m{^https?://}) {
+		$cover = $prefs->get('coverProxy') ? _coverProxyUrl($info->{img}) : $info->{img};
+	}
+	elsif (@$acc && $acc->[0]) {
+		$cover = _coverOf($acc->[0]);
+	}
+	my $title = ($bname && length $bname) ? $bname : (($info && $info->{name}) || (_u($src) . _u('榜单')));
+
+	# _trackItems 返回数组引用（勿再套 @ 展开成单元素列表——0.11.1 首版
+	# 曾写成 my @items = _trackItems(...)，items 变成 [[...]]，CLI 路径炸
+	# "Not a HASH reference"（XMLBrowser.pm L1012），榜单 feed 全空）
+	my $tracks = _trackItems($list, _u("[$src] "));
+
+	# 原生翻页契约：offset=窗口首曲绝对下标，total=全榜数（Slim/Control/XMLBrowser
+	# L787 count=total、L1002 start-=offset、L1009 按其切窗）。UI 自己渲染页码，
+	# feed 不掺导航行（0.11.3 方案废弃）。
+	$cb->({
+		items    => $tracks,
+		offset   => $index,
+		(defined $total ? (total => $total) : ()),
+		($cover        ? (image => $cover) : ()),
+		($bangid ne '' ? (play => "lxm://b/$src/$bangid") : ()),
+		($bangid ne '' ? (actions => _board_play_actions($src, $bangid)) : ()),
+		(albumData => [
+			{ name => $title, type => 'text', label => 'ALBUM' },
+			((defined $total && $total)
+				? { name => _u('[' . $src . '] · ' . int($total) . ' 首'), type => 'text', label => 'ARTIST' }
+				: { name => _u('[' . $src . ']'), type => 'text', label => 'ARTIST' }),
+		]),
+	});
 }
 
 # 页头播放按钮命令（喜马拉雅 _album_play_actions 同形，只留 *all 键——
