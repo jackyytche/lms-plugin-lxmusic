@@ -1,5 +1,5 @@
-Ambiguous call resolved as CORE::warn(), qualify as such or use & at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/Slim/Utils/Log.pm line 25.
-Ambiguous call resolved as CORE::warn(), qualify as such or use & at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/Slim/Utils/Log.pm line 26.
+Ambiguous call resolved as CORE::warn(), qualify as such or use & at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/Slim/Utils/Log.pm line 27.
+Ambiguous call resolved as CORE::warn(), qualify as such or use & at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/Slim/Utils/Log.pm line 28.
 Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 556.
 	(Maybe you meant system() when you said exec()?)
 Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 654.
@@ -13,7 +13,6 @@ ok - parse no-result
 ok - parse bad-json
 ok - parse noise ignored
 ok - parse alert captured
-LOG-WARN: LxMusic Sources: added 5af47e93 (Test Fixture Source, import, 243 bytes)
 LOG-ERROR: LxMusic Helper: installSource failed: 内容过短（< 50 字节），不像是订阅源
 ok - init returned true
 ok - installSource returns a path
