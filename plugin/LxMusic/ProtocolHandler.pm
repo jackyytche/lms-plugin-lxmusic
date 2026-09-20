@@ -200,6 +200,21 @@ sub _finish_resolve {
 		$m{secs}    = int($secs) if $secs && $secs > 0;   # 时长；canSeek 要求它已知
 		$m{title}   = $info->{name} if $info->{name};
 		eval { Slim::Music::Info::setRemoteMetadata($url, \%m) };
+
+		# ⚠️ 同一份码率/时长**也必须发给真实直链 URL**（0.11.17）：
+		# 拖动时 LMS 走 `HTTP::getSeekData`，它第一行是
+		#   my $bitrate = $song->bitrate() || return;
+		# 而 `$song->currentTrack()` 指向直链那条记录 ⇒ 直链没有 BITRATE 时
+		# getSeekData 返回 undef ⇒ `_JumpToTime` 里 `return unless $seekdata`
+		# ⇒ **拖动被静默丢弃**（日志实证：kw 15ms 后 `Song::open seek=true … streamMode=R`，
+		# tx 完全没有 seek 的 open、之后是 `seek=false … streamMode=I`）。
+		# 直链只发码率/时长，不发 title（避免覆盖直链行的显示名）。
+		my %md;
+		$md{ct}      = $mime;
+		$md{bitrate} = int($kbps) if $kbps && $kbps > 0;
+		$md{secs}    = int($secs) if $secs && $secs > 0;
+		eval { Slim::Music::Info::setRemoteMetadata($direct, \%md) } if $direct;
+
 		return \%m;
 	};
 	$publish->();
