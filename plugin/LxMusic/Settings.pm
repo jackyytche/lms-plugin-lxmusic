@@ -72,12 +72,12 @@ sub _m { return join('', map { my $x = _chars($_); defined $x ? $x : '' } @_) }
 sub prefs {
 	return ($prefs, qw(
 		quality bridgeTimeout helperConcurrency resolveTtl coverProxy
-		boardsKg boardsTx boardsWy boardsMg qualityFallback verifyUrl autoSkipOnError
+		boardsKw boardsKg boardsTx boardsWy boardsMg qualityFallback verifyUrl autoSkipOnError
 		workerEnable workerIdle preferStreamable
 	));
 }
 
-my @BOOL_PREFS = qw(coverProxy boardsKg boardsTx boardsWy boardsMg qualityFallback verifyUrl autoSkipOnError workerEnable preferStreamable);
+my @BOOL_PREFS = qw(coverProxy boardsKw boardsKg boardsTx boardsWy boardsMg qualityFallback verifyUrl autoSkipOnError workerEnable preferStreamable);
 
 sub handler {
 	my ($class, $client, $params, $callback, $httpClient, $response) = @_;

@@ -63,6 +63,7 @@ sub initPlugin {
 		boardsTx       => 1,
 		boardsWy       => 1,
 		boardsMg       => 1,
+		boardsKw       => 1,     # 0.11.0 kw 榜单改走 kbangserver（免签名）后解禁
 		# ---- M0.6 多订阅源 / 音质 ----
 		sourcesJson    => '',    # 多订阅源注册表（JSON：顺序/启用/来源/元数据）
 		qualityFallback => 1,    # 源没有所选档位时自动降档（对齐 PC getPlayQuality）
@@ -143,14 +144,14 @@ sub handleFeed {
 			url         => \&sdkSonglistSearchHandler,
 			passthrough => ['search'],
 		},
-		# kw 榜单上游(wbd)签名校验已变(10012)——搜索不受影响，榜单用其余四源
+		# kw 榜单 0.11.0 复活：wbd 签名失效后改走免签名 kbangserver（sdk 内已切换）
 		(
 			map { {
 				name        => _u($_ . '榜单'),
 				type        => 'link',
 				url         => \&sdkBoardsHandler,
 				passthrough => [ 'boards', $_ ],
-			} } grep { _boardEnabled($_) } qw(kg tx wy mg)
+			} } grep { _boardEnabled($_) } qw(kw kg tx wy mg)
 		),
 		# 歌单发现（M0.8）：推荐 / 最热 / 最新 —— 档位内再按平台下钻，最后进歌单详情
 		{
@@ -184,7 +185,7 @@ sub handleFeed {
 	);
 
 	# 榜单源全关时给一行提示，避免"菜单像坏了"的错觉（设置页可重新打开）
-	if (!grep { _boardEnabled($_) } qw(kg tx wy mg)) {
+	if (!grep { _boardEnabled($_) } qw(kw kg tx wy mg)) {
 		splice(@items, 2, 0, { name => _u('（榜单源已在设置页全部关闭）'), type => 'text' });
 	}
 
@@ -195,7 +196,7 @@ sub handleFeed {
 # 榜单源开关（设置页 0.6.0）：每次渲染读 prefs，改完立即生效
 sub _boardEnabled {
 	my ($src) = @_;
-	my %pref = (kg => 'boardsKg', tx => 'boardsTx', wy => 'boardsWy', mg => 'boardsMg');
+	my %pref = (kw => 'boardsKw', kg => 'boardsKg', tx => 'boardsTx', wy => 'boardsWy', mg => 'boardsMg');
 	my $p = $pref{$src} or return 0;
 	return $prefs->get($p) ? 1 : 0;
 }
