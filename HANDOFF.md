@@ -4,8 +4,8 @@
 > **权威事实源**：本文档 + 磁盘（`plugin/` 源码、`repo/` 发布仓、`dist/` 打包产物、`refs/` 参考克隆、`tmp/` 工具）
 > **一句话现状（2026-09-21 第九轮：插件图标 + 首次 GitHub 发版）**：设备运行 **0.11.20**（已装机验收：
 > 插件管理器那一行与「应用/apps」菜单里的 LX Music 都换成了落雪官方 logo，见 §5.11.81/§5.11.82）；
-> **GitHub `jackyytche/lms-plugin-lxmusic` 已从 v0.5.9 一步发到 v0.11.20**（zip + repo.xml + lxmusic_logo.png
-> 三资产，见 §5.11.83 与 §七.7）。设备侧仍优先用 LAN 仓库（`http://192.168.2.68:8765/repo.xml?v=97`）。
+> **GitHub `jackyytche/lms-plugin-lxmusic` 已从 v0.5.9 一步发到 v0.11.20**（release id `392384987`；
+> zip + repo.xml + lxmusic_logo.png 三资产，`releases/latest/download/repo.xml` 终验通过，见 §5.11.83 与 §七.8）。设备侧仍优先用 LAN 仓库（`http://192.168.2.68:8765/repo.xml?v=97`）。
 > 0.11.2=榜单页头；0.11.3=feed 内嵌翻页行（**作废**——用户指正那不是达菲原生翻页）；0.11.4=原生窗口
 > `items+offset+total`（喜马拉雅 albumHandler 配方），Web 翻页走 UI 原生页码；
 > 0.11.5~0.11.7=**修窗口数学**（上游页宽按 SDK `limit` 学，不再硬编码 50；行号改绝对序号），kw 热歌榜 6 页逐首对齐上游（§5.11.74）；
@@ -748,10 +748,15 @@ XMLBrowser 菜单 / 网页  ← Plugin.pm（feed handlers / webHandler）
    `ci: regression log [skip ci]` 的提交**（更新 `plugin/helper-test.log`），所以推之前先 `git fetch origin` 看远端状态）
    - **v0.5.9（2026-09-19，历史）**：`2b28c48` = 0.3.0→0.5.9 单一提交；Release id `392124985`，
      资产 `LxMusic-0.5.9.zip`（1231509 B，SHA1 `c0959eb82a8f5d968c3e51de8e160c9cb4875180`）+ `repo.xml`
-   - **v0.11.20（2026-09-21，本轮）**：把 0.6.0~0.11.20 共 30 个本地提交 + 远端 1 个 CI 提交合并后推送
-     （合并提交 `b3ae56c`，只带回 `plugin/helper-test.log`，无冲突）；Release 三资产
-     `LxMusic-0.11.20.zip`（1289210 B，SHA1 `04b7fcd451b1794c051e2d049a8d6265783964d2`）、`repo.xml`（GH 基址）、
-     `lxmusic_logo.png`。**首个带插件的正式发布版本**（此前远端停留在 0.5.9，之后 0.6.0~0.11.19 只在 LAN 通道）
+   - **v0.11.20（2026-09-21，本轮，已发布）**：把 0.6.0~0.11.20 共 30 个本地提交 + 远端 1 个 CI 提交合并后推送
+     （合并提交 `b3ae56c`，只带回 `plugin/helper-test.log`，无冲突；发版内容提交 `4b01463`）；
+     **Release `v0.11.20`（id `392384987`）**： https://github.com/jackyytche/lms-plugin-lxmusic/releases/tag/v0.11.20
+     三资产 `LxMusic-0.11.20.zip`（1289210 B，SHA1 `04b7fcd451b1794c051e2d049a8d6265783964d2`）、
+     `repo.xml`（GH 基址）、`lxmusic_logo.png`（7772 B）。**首个带插件的正式发布版本**
+     （此前远端停留在 0.5.9，0.6.0~0.11.19 只在 LAN 通道）。同时刷新了公开 `README.md`（安装/功能/构建/版权）。
+     **终验通过**（`python tmp/lx_gh_release.py 0.11.20 --verify`）：`releases/latest/download/repo.xml`
+     → version=0.11.20、sha 与 zip 逐字节一致、icon 可取；zip 1289210 B / logo 7772 B 均 match。
+     ⚠️ 本轮 token 由用户在对话里明文给出 —— **发完请吊销**。
 
 ---
 
@@ -795,7 +800,8 @@ XMLBrowser 菜单 / 网页  ← Plugin.pm（feed handlers / webHandler）
   - 附带结论：**设备能直连`raw.githubusercontent.com`**（两个源都从官方原链导入），不必用 ghproxy 加速链
 - **本机 IP/仓库基址**：`192.168.2.68:8765`（**DHCP 可能变化**，变了要同步 `dist/repo.xml` 的 URL 与 pack.py 的 `LAN_BASE`）
 - **GitHub**：`jackyytche/lms-plugin-lxmusic`（公开）；PAT 由用户在需要时提供（**勿写入文件、勿提交**）；
-  本轮（2026-09-21）已用用户提供的 fine-grained PAT 推到 **v0.11.20** —— **用完请吊销该 token**（§七.1）
+  本轮（2026-09-21）已用用户提供的 fine-grained PAT 推到 **v0.11.20**（release id `392384987`）——
+  **用完请吊销该 token**（§七.1）；公开 `README.md` 已同步刷新
 - **可用的救援通道**（LMS 卡死时）：Daphile 自己的 CGI 在**`:80`**，与 LMS 无关 ⇒`http://192.168.2.111/cgi-bin/Settings?ACTION=restart` 重启整机；`/cgi-bin/Info?ACTION=shutdown|pmsuspend` 同理。**没有 SSH**（未配置），所以卡死时这是唯一手段
 - **订阅源样本**：`refs/samples/lx-6.js`（= `lx-music-source-v6-fixed.js` = `lx-latest.js`，4094 B，与 pdone/lx-music-source 官方 `lx/6.js` 逐字节一致；`dist/lx-6.js` 是给设备做 URL 导入测试的 LAN 副本）
 - **本地工具**：python 3.14（`pack.py`、诊断/验收脚本）、node 24（`tmp/shim-sim`）、达菲诊断脚本复用喜马拉雅项目 `m0/diag_plugin_install.py`（装机/重启）与 `diag_settings_form.py`（改日志级别等整表回放）
