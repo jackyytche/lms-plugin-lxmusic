@@ -13,7 +13,7 @@ ok - parse no-result
 ok - parse bad-json
 ok - parse noise ignored
 ok - parse alert captured
-LOG-WARN: LxMusic Sources: added cb4a9ff4 (Test Fixture Source, import, 241 bytes)
+LOG-WARN: LxMusic Sources: added 5af47e93 (Test Fixture Source, import, 243 bytes)
 LOG-ERROR: LxMusic Helper: installSource failed: 内容过短（< 50 字节），不像是订阅源
 ok - init returned true
 ok - installSource returns a path
