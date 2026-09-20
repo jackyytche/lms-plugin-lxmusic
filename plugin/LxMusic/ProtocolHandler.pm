@@ -40,12 +40,27 @@ sub isRemote { 1 }
 
 sub getNextTrack {
 	my ($class, $song, $successCb, $errorCb) = @_;
-	# 诊断（info 级，默认 ERROR 级别下不刷屏）：播放阶段 Song 对象上 streamUrl 是否还在
+	my $su = (blessed($song) && $song->can('streamUrl')) ? $song->streamUrl : undef;
+	my $u  = (blessed($song) && $song->can('url')) ? $song->url : undef;
+
+	# ⚠️ 播放前最后一刻校正流格式：LMS 扫描/开流时会用 CDN 声明的 Content-Type 覆盖
+	# 类型缓存（QQ/网易的 .flac 直链声明 audio/x-ogg），不修就会把 FLAC 数据交给
+	# OGG 解码器 ⇒ 进度条在走但完全无声（2026-09-21 设备日志实证，详见 §5.11.75）。
+	# 只用 LMS 公开 API（setContentType / Track::content_type），不动 LMS 代码。
+	my $c = (defined $u && length $u) ? _cache_get($u) : undef;
+	if ($c && $c->{fmt} && blessed($song) && $song->can('currentTrack')) {
+		my $t = $song->currentTrack();
+		eval {
+			Slim::Music::Info::setContentType($u, $c->{fmt});
+			Slim::Music::Info::setContentType($c->{direct}, $c->{fmt}) if $c->{direct};
+			$t->content_type($c->{fmt}) if $t && $t->can('content_type');
+		};
+	}
+
 	if ($log->is_info) {
-		my $su = (blessed($song) && $song->can('streamUrl')) ? $song->streamUrl : undef;
-		my $u  = (blessed($song) && $song->can('url')) ? $song->url : '?';
-		$log->info('LxMusic: getNextTrack song=' . $u . ' streamUrl='
-			. (defined $su && length $su ? substr($su, 0, 90) : '<undef>'));
+		$log->info('LxMusic: getNextTrack song=' . ($u // '?') . ' streamUrl='
+			. (defined $su && length $su ? substr($su, 0, 90) : '<undef>')
+			. ' fmt=' . ($c ? ($c->{fmt} // '?') : '<nocache>'));
 	}
 	$successCb->();
 }
@@ -151,13 +166,32 @@ sub _cache_put {
 
 # 解析收尾（快慢路径共用）：元数据 + 客户端刷新信号 + 流地址替换
 sub _finish_resolve {
-	my ($class, $song, $url, $info, $direct, $args, $cb, $fmt) = @_;
+	my ($class, $song, $url, $info, $direct, $args, $cb, $fmt, $kbps) = @_;
 
 	my $qLabel = $class->qualityLabel($info->{type});
-	my %meta = (ct => ($qLabel =~ /FLAC/i ? 'audio/flac' : 'audio/mpeg'), type => $qLabel);
+
+	# ⚠️ ct 必须用"我们嗅到的真实格式"来定，不能用档位标签猜：QQ/网易 CDN 的 .flac
+	# 直链会声明 Content-Type: audio/x-ogg，LMS 扫描时把这个错误类型写进轨道缓存，
+	# Song::open 据此把 FLAC 流交给 OGG 解码器 ⇒ 位置在推进但完全无声
+	# （2026-09-21 设备日志实证：Checking formats for: ogg-ogg-*-* → Transcoder:
+	#   streamMode=I, streamformat=ogg）。
+	my %MIME_OF = (
+		flc => 'audio/flac', mp3 => 'audio/mpeg', ogg => 'audio/ogg',
+		mp4 => 'audio/mp4', wav => 'audio/x-wav', ape => 'audio/x-ape', aac => 'audio/aac',
+	);
+	my $mime = ($fmt && $MIME_OF{$fmt}) || ($qLabel =~ /FLAC/i ? 'audio/flac' : 'audio/mpeg');
+
+	my %meta = (ct => $mime, type => $qLabel);
+	$meta{bitrate} = int($kbps) if $kbps && $kbps > 0;   # kbps；"格式码率"显示靠它
 	$meta{title} = $info->{name} if $info->{name};
 	Slim::Music::Info::setRemoteMetadata($url, \%meta);
 	$class->cache_metadata($url, { title => $info->{name}, quality => $qLabel, format => $fmt });
+
+	# 用完整体检出的真实格式覆盖 CDN 撒谎的 Content-Type（只用 LMS 公开 API）
+	if ($fmt) {
+		eval { Slim::Music::Info::setContentType($url, $fmt) };
+		eval { Slim::Music::Info::setContentType($direct, $fmt) };
+	}
 
 	# 封面：队列/正在播放也要有图（tx/wy/mg 直取，kg 推导，kw 异步 getPic）
 	eval { $class->_publish_cover($url, $info->{src}, $info->{music}) };
@@ -180,6 +214,11 @@ sub _finish_resolve {
 		if ($track && $info->{name}) {
 			$track->title($info->{name});
 			$track->url($url);
+		}
+		# 扫描回来的 Track 带着嗅探到的错误 CT，而播放格式正是从这里取
+		# （Schema::contentType 对 track 对象直接读 content_type 字段）⇒ 改回真实格式
+		if ($track && $fmt && $track->can('content_type')) {
+			eval { $track->content_type($fmt) };
 		}
 		$cb->($track, @_);
 	};
@@ -433,7 +472,7 @@ sub scanUrl {
 			});
 
 			# 直链是实际流地址；playlist 里保持稳定的 lxm:// URL
-			$class->_finish_resolve($song, $url, $info, $direct, $args, $cb, $res->{format});
+			$class->_finish_resolve($song, $url, $info, $direct, $args, $cb, $res->{format}, $res->{actualKbps});
 			$class->_prefetch_next($song, $url);
 			return;
 		},

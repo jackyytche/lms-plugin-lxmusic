@@ -601,10 +601,16 @@ async function main(std, os) {
 		else if (bytes.length > 3 && bytes[0] === 0x1a && bytes[1] === 0x45 && bytes[2] === 0xdf && bytes[3] === 0xa3) magic = 'mkv';
 		const head = bytes.slice(0, 32).map(c => (c >= 32 && c < 127) ? String.fromCharCode(c) : '.').join('');
 		const looksHtml = /^\s*(<!doctype|<html|<\?xml|\{|\[)/i.test(head);
+		// 总长度优先取 Content-Range 里的总量（`bytes 0-2047/34600000`）：范围响应的
+		// Content-Length 只是这一片，用它算码率只会得到 ~0kbps（2026-09-21 修）
+		const crTotal = (() => {
+			const r = (hdr('content-range') || '').match(/\/\s*(\d+)\s*$/);
+			return r ? Number(r[1]) : 0;
+		})();
 		const out = {
 			status, method,
 			type: hdr('content-type'),
-			length: Number(hdr('content-length')) || 0,
+			length: crTotal || Number(hdr('content-length')) || 0,
 			range: hdr('content-range'),
 			acceptRanges: hdr('accept-ranges'),
 			bytes: bytes.length,
