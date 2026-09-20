@@ -94,7 +94,14 @@ sub check {
 		. " */\n"
 		. "const { EVENT_NAMES, on, send } = globalThis.lx;\n"
 		. "on(EVENT_NAMES.request, () => { send(EVENT_NAMES.inited, { status: 'success', sources: {} }); });\n";
-	my $p = Plugins::LxMusic::Helper->installSource('../evil?name.js', $src);
+	my $p;
+	{
+		# 这里会打一行 `Sources: added <id> (...)`，而 id 由 `time()+rand()` 生成
+		# ⇒ CI 回写的日志每次都会变一行。为保持日志逐字节稳定（不再每次推送都追一条
+		# ci: regression log 提交），只静音这一段；下面那条 error 级的负例仍然照打。
+		local $ENV{LX_TEST_QUIET_WARN} = 1;
+		$p = Plugins::LxMusic::Helper->installSource('../evil?name.js', $src);
+	}
 	if (!defined $p) {
 		my ($rec) = grep { ($_->{name} // '') eq 'Test Fixture Source' } @{ Plugins::LxMusic::Sources->list };
 		$p = $rec ? Plugins::LxMusic::Sources->pathFor($rec->{id}) : undef;

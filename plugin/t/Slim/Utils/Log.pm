@@ -21,7 +21,9 @@ package Slim::Utils::Log::Stub;
 
 sub new   { my $c = shift; my %o = (@_ % 2 == 0) ? @_ : (); return bless \%o, $c }
 sub info  { my $s = shift; warn "LOG-INFO: @_\n" if $ENV{LX_TEST_VERBOSE} }
-sub warn  { my $s = shift; warn "LOG-WARN: @_\n" }
+# 调用方可临时静音 warn（LX_TEST_QUIET_WARN=1）：用来压掉**内容可变**的日志行，
+# 让 CI 回写的回归日志逐字节稳定（否则每次运行都多一条 ci: regression log 提交）
+sub warn  { my $s = shift; warn "LOG-WARN: @_\n" unless $ENV{LX_TEST_QUIET_WARN} }
 sub error { my $s = shift; warn "LOG-ERROR: @_\n" }
 sub debug { my $s = shift; warn "LOG-DEBUG: @_\n" if $ENV{LX_TEST_VERBOSE} }
 
