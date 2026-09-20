@@ -2,12 +2,14 @@
 
 > **下个 session 恢复方式**：直接说「继续 lx-music 插件，先读 HANDOFF.md」
 > **权威事实源**：本文档 + 磁盘（`plugin/` 源码、`repo/` 发布仓、`dist/` 打包产物、`refs/` 参考克隆、`tmp/` 工具）
-> **一句话现状**（2026-09-21 第五轮，榜单翻页修正）：设备运行 **0.11.7**。0.11.2=榜单页头；
-> 0.11.3=feed 内嵌翻页行（**作废**——用户指正那不是达菲原生翻页）；0.11.4=原生窗口
+> **一句话现状**（2026-09-21 第七轮，换源 + mg https 修复）：设备运行 **0.11.19**（已装机验收）。
+> 0.11.2=榜单页头；0.11.3=feed 内嵌翻页行（**作废**——用户指正那不是达菲原生翻页）；0.11.4=原生窗口
 > `items+offset+total`（喜马拉雅 albumHandler 配方），Web 翻页走 UI 原生页码；
-> 0.11.5~0.11.7=**修窗口数学**（上游页宽按 SDK `limit` 学，不再硬编码 50；行号改绝对序号）。
-> kw 热歌榜 6 页已逐首对齐上游（§5.11.74）。
-> **源侧现状判决（2026-09-21 凌晨实测，DEBUG 日志）**：kw/tx 取链+播放正常；**wy/kg 走独家音源时上游网关
+> 0.11.5~0.11.7=**修窗口数学**（上游页宽按 SDK `limit` 学，不再硬编码 50；行号改绝对序号），kw 热歌榜 6 页逐首对齐上游（§5.11.74）；
+> 0.11.8~0.11.12=修 tx 无声（CDN 谎报 Content-Type）+ 元数据/码率持久化；0.11.13~0.11.16=歌单页头 + kg 真封面 + 整榜码率；
+> 0.11.17~0.11.18=**修拖动进度条**（bitrate 发到直链 URL + 自实现 `getSeekData`，§5.11.79）；0.11.19=**修 mg 完全不能播**（https 直链走了明文处理器，§5.11.80）。
+> **已验证**：wy/mg/tx 播放与 UI 形态拖动（mg/wy/tx）、mg 榜单行、wy 榜单行——全部 PASS。
+> **源侧旧判决（2026-09-21 凌晨实测，独家音源时期，保留作依据）**：kw/tx 取链+播放正常；**wy/kg 走独家音源时上游网关
 > 502 Bad Gateway 全档位取链失败**（不是我们管线的问题）——wy 表现为"点了没声"（autoSkip 3 连败后停止）。
 > "部分榜单不显示格式码率"（kg/tx）= 取链失败的症状：取链成功的曲子 songinfo 有 type/bitrate
 > （tx 实测 `type:MP3 320kbps bitrate:MP3 320kbps`）。kw 榜单调研结论与字段映射见 §5.11。
@@ -162,7 +164,7 @@ XMLBrowser 菜单 / 网页  ← Plugin.pm（feed handlers / webHandler）
 | 0.11.16（**已打包，未装机**） | 整榜入队也发布码率估算（与列表行一致）。装机流程见 §5.11.77 |
 | 0.11.17（**已装机**） | **修「tx 不能拖进度条」**（§5.11.79）：`bitrate/secs` 原先只发给了 `lxm://` URL，而 LMS 的 `HTTP::getSeekData` 是拿 `$song->currentTrack()`（**直链**那条记录）查码率 ⇒ 查不到就 `return`（undef seekdata）⇒ `_JumpToTime` 的 `return unless $seekdata` 把拖动**静默丢弃**。现对 lxm:// 与直链**两个 URL 都发** ct/bitrate/secs |
 | 0.11.18（**已装机**） | **自己实现 `getSeekData`**（不再依赖 LMS 的码率查询）：返回 `{timeOffset}` 恒非 undef，另按 `len*t/secs`（探测总长优先）或 `kbps*1000/8*t` 给 `sourceStreamOffset`；`_cache_put` 把记录同时挂在 lxm:// 与直链两个 URL 下；`_finish_resolve`/`_trackItems` 透传 `secs`/`length`；shim 的 probe 用 `Content-Range` 总量当 `length` |
-| **0.11.19（已打包，待装机）** | **修「mg 完全不能播」**（§5.11.80）：解析出来的直链是 **https**（咪咕 `freetyst.nf.migu.cn`），而我们的处理器继承的是 `Slim::Player::Protocols::HTTP` —— 它下面是**明文** `IO::Socket::INET`，于是 LMS 拿明文 HTTP/1.0 去打 443，CDN 回 `400 Bad Request` ⇒ `PROBLEM_CONNECTING` ⇒ 70ms 就 stop。修法：有 SSL 时把基类换成 LMS 自带的 `Slim::Player::Protocols::HTTPS`（= IO::Socket::SSL + HTTP，按协议自动分流，返回对象仍是我们自己的类 ⇒ 0.11.18 的 seek 覆盖仍然生效），没 SSL 时回落 HTTP 并显式报错 |
+| **0.11.19（已装机，已验收）** | **修「mg 完全不能播」**（§5.11.80）：解析出来的直链是 **https**（咪咕 `freetyst.nf.migu.cn`），而我们的处理器继承的是 `Slim::Player::Protocols::HTTP` —— 它下面是**明文** `IO::Socket::INET`，于是 LMS 拿明文 HTTP/1.0 去打 443，CDN 回 `400 Bad Request` ⇒ `PROBLEM_CONNECTING` ⇒ 70ms 就 stop。修法：有 SSL 时把基类换成 LMS 自带的 `Slim::Player::Protocols::HTTPS`（= IO::Socket::SSL + HTTP，按协议自动分流，返回对象仍是我们自己的类 ⇒ 0.11.18 的 seek 覆盖仍然生效），没 SSL 时回落 HTTP 并显式报错。**实测：wy/mg（星海）+ mg（裤佬）+ mg 榜单行全部 PASS，mg/wy/tx 拖动均 PASS** |
 
 ---
 
@@ -393,7 +395,9 @@ XMLBrowser 菜单 / 网页  ← Plugin.pm（feed handlers / webHandler）
       重启 → 轮询工具页版本号验证）。⚠️ 仍然要**自己再重启一次**（见 bug③）；脚本会把两段都提示出来。
     - 用户手工装机更靠谱（达菲 Web 界面 → 设置 → 插件 → 更新）：本轮 0.11.15 就是用户手工装的。
       **下次要装机先问用户**，别反复 POST/重启折腾他的设备（重启会打断他正在听的歌）。
-78. **mg 的两处已知限制（未修完，下次接着做）**
+78. **mg 的已知限制（0.11.19 后只剩页头按钮一条）**
+    - ✅ **mg 完全不能播（"点在走、没声音/立刻 stop"）已在 0.11.19 修掉**——根因跟源无关，是 https 直链走了明文处理器，
+      见 §5.11.80。**装机实测：mg 搜索曲 `周杰伦-晴天` 位置推进 PASS；mg 榜单 6.0 行 0 PASS（dur=233.794）**
     - **页头没有播放/添加按钮**：**不是**我们没发 play/actions——0.11.15 的诊断行实证
       `board_render: src=mg bangid=27553319 play=lxm://b/mg/27553319 total=50 rows=50`，
       与 kw（`src=kw bangid=93 play=lxm://b/kw/93 total=300`）形状一致；但 Daphile 模板渲染出的
@@ -402,11 +406,11 @@ XMLBrowser 菜单 / 网页  ← Plugin.pm（feed handlers / webHandler）
       ④ 模板/CSS 隐藏（HTML 里就没有锚点）。下一步建议：对比 Daphile 皮肤模板（`songinfo` 相关条件），
       或在 feed 里补 `type => 'playlist'` + `playlist` 键做实验（LMS Web 对 playlist 属性有特判，见
       `Slim/Web/XMLBrowser.pm` L336-344）
-    - **mg 列表行没有时长**：mg 接口字段名是 **`length`（"00:03:01"）**，而 SDK 映射读的是
-      `i.duration` ⇒ `interval` 为空（诊断行 `without-duration=50`）。修法=改
-      `engine/sdk/renderer/utils/musicSdk/mg/*.js` 的映射 + **重建 `sdk.bundle.js`**；
-      本机**没装 esbuild**（`npx esbuild` 会去下载），所以本轮没做 ⇒ 下次先 `npm i -D esbuild`
-      再按 0.11.0 的方式 `esbuild entry.js --bundle --format=esm --alias:@renderer=./renderer`
+    - ~~**mg 列表行没有时长**~~ ✅ **已自愈/不成立（2026-09-21 晚复测）**：设备上 mg 榜单页实测有完整时长
+      （mg 榜单 6.0 行 0 → `dur=233.794`，搜索载荷里也带 `interval="04:30"`）；当初 `without-duration=50`
+      只出现在**那一版 mg 榜单行**上，而 `Plugin::_secsOf` 本来就同时吃 `interval` 与 `duration`，
+      所以**不需要**改 SDK/esbuild（那条 esbuild 待办可以划掉）。若以后又见空时长，先跑
+      `python tmp/dump_payload.py mg 晴天` 看载荷里 interval 在不在，再决定要不要动 SDK。
 - **kg artwork 配方（已实现，供以后参考）**：kg 的 `img` 字段恒为 null，albumId 拼 URL 只能拿占位图；
   正解是官方 `refs/lx-music-desktop/src/renderer/utils/musicSdk/kg/pic.js` 的 getPic：
   POST `http://media.store.kugou.com/v1/get_res_privilege`，头带
@@ -486,6 +490,13 @@ XMLBrowser 菜单 / 网页  ← Plugin.pm（feed handlers / webHandler）
       （`t/` 目录不进 zip）。
     - **推论（以后选源要记）**：直链是 https 的源在 0.11.18 之前**一律不能播**；
       选源/评估时"能取到 https 直链"不等于"能在达菲上播"。
+    - ✅ **装机实测（0.11.19，2026-09-21 晚）**：同一句 `GET …/60054701923151339.flac?… HTTP/1.0`
+      在 0.11.18 上回 **400**、在 0.11.19 上回 **206 Partial Content** + `Opened stream!`；
+      `tmp/accept_011_19.py check` → wy PASS、mg PASS（位置推进）；
+      `tmp/accept_011_19.py kulou 稻香`（临时停用星海只留裤佬）→ mg PASS；
+      `tmp/play_board_row.py 6.0 0` → mg 榜单行 PASS；
+      **顺带确认 0.11.18 的拖动修复真的通了**：`tmp/seek_lxm.py`（严格按 UI 形态 `['time', pos*duration]`）
+      对 **mg / wy / tx** 三个平台都是"3s 后到位、7s 后继续推进"，can_seek=1
 
 ---
 
@@ -535,6 +546,15 @@ XMLBrowser 菜单 / 网页  ← Plugin.pm（feed handlers / webHandler）
      `tmp/probe_board_jsonrpc.py`（jive items 响应的 count/offset/window 形状）、`tmp/cache_experiment.py`（排除 feed 缓存假象）
      **`tmp/read_fresh_log.py`（`server.log?lines=50&full=1` 取最新日志尾——只带 `?lines=N` 会返回缓存的旧切片，
      取现场必须加 `full=1`）**、`tmp/probe_mg.py`（mg 榜不可分页的取证）
+   - 0.11.19 https 修复一轮新增（§5.11.80，都可重复跑）：
+     **`tmp/lms_https_sim.pl`（本机复现 LMS 建流：SSL 路径 206 / 明文路径 400，不用装机就能验证判据）**、
+     `tmp/fetch_mg_url.py`（取新鲜 mg 直链写 `tmp/mg_url.txt`）、`tmp/mg_url_probe.py`（同一 URL 的 curl 头变体矩阵）、
+     `tmp/check_tls_fallback.pl`（无 SSL 时必须回落 HTTP 基类）、`tmp/seek_lxm.py <src> [查询] [player]`（严格按 UI 形态的拖动验收）、
+     **`tmp/accept_011_19.py check|kulou`（装机验收：wy/mg 端到端 + 只走裤佬的 mg）**、
+     `tmp/dump_payload.py <src> [查询]`（看搜索结果第一条的 musicInfo 全字段）、`tmp/log_window.py <日> <起> <止>`（按时间窗抓全量日志行）、
+     `tmp/dump_req.py`（不截断打印 RemoteStream 的 Request/Response）、`tmp/log_scheme.py`（统计 player open 的 http/https 与建流失败次数）、
+     `tmp/check_ssl.py`（SSL 可用性 + 已装版本）、`tmp/show_loglevel.py [类别…]`（看 selected 值）、
+     `tmp/verify_release.py [zip]`（zip 内容/sha1 + LAN 仓库一致性）、`tmp/diag_mg.py [查询] [player]`（对照播「直链」与「lxm://」——直链能放而插件不能放 = https 坑指纹）
    - `tmp/lx_set_loglevel.py [LEVEL]` …查看/整表回放设置某个日志类别级别（带 `persist=1`，重启仍生效）
 
 **播放器**：HiBy FC4 `5a:78:10:59:c7:74`（用户主用，验证目标）；HD-Audio Generic `5a:bf:86:1b:a6:ff`（本机声卡）；小爱音箱 squeezelite `bb:bb:69:a9:cf:23`（**会出声，勿用**）
@@ -543,11 +563,12 @@ XMLBrowser 菜单 / 网页  ← Plugin.pm（feed handlers / webHandler）
 
 ## 七、下个 session 待办（按序）
 
-0. **【本轮 0.11.19】① 装机验 mg https 修复 ② 两个新订阅源的最终验收**（详见 §5.11.80 与 §八"订阅源现状"）
-   - 0.11.19 已打包并上了 LAN 仓库（`dist/LxMusic-0.11.19.zip`，SHA1 `826672509d81fbd484c1d9b952a5f95bbc9725a5`），
-     **设备仍是 0.11.18**（该版本上 mg 一律 70ms stop）。装机后复测：
-     `python tmp/diag_mg.py "晴天"`——它对照播「直链」与「lxm://」两条路，0.11.19 上 mg 的位置应当推进。
-   - 用户点名的"**覆盖 wy 和 mg、稳定可靠质量好**"两个源（本轮已导入设备，id 见 §八）：
+0. ✅ **【本轮 0.11.19】mg https 修复已装机验收 + 两个新订阅源已验收**（详见 §5.11.80 与 §八"订阅源现状"）
+   - 0.11.19 已装机（工具页版本号 **0.11.19**，用户手工装）。验收脚本：`python tmp/accept_011_19.py check`
+     （wy/mg 各一首端到端）与 `python tmp/accept_011_19.py kulou "稻香"`（**临时停用星海**只留裤佬跑 mg，测完自动恢复）；
+     榜单行用 `python tmp/play_board_row.py 6.0 0`；拖动用 `python tmp/seek_lxm.py mg|wy|tx 晴天`。
+     结果：**wy PASS、mg（星海）PASS、mg（裤佬）PASS、mg 榜单行 PASS、mg/wy/tx 拖动 PASS**。
+   - 用户点名的"**覆盖 wy 和 mg、稳定可靠质量好**"两个源（已导入设备并全部启用，id 见 §八）：
      **星海音乐源 v3.2.13**（文件 `src-xinghai-2.3.13.js`，源自报 `@version v3.2.13`／作者 万去了了；
      wy/mg 直链是真 CDN 直链：wy `*.music.126.net`、mg `freetyst.nf.migu.cn`，实测 mg ~934kbps flac；
      kw/kg/tx 亦通，全平台 flac）+ **裤佬SVIP音源 v3.0.0**（kw/kg/wy/mg flac；tx 只有 mp3；
@@ -590,7 +611,7 @@ XMLBrowser 菜单 / 网页  ← Plugin.pm（feed handlers / webHandler）
 
 ## 八、现场状态与凭据
 
-- **设备**：达菲 `192.168.2.111`（LMS 9.0.3 / perl 5.40；Web `:9000`，CGI `:80`）；运行 **0.11.18**（0.11.19 已打包上 LAN 仓库，待装机）
+- **设备**：达菲 `192.168.2.111`（LMS 9.0.3 / perl 5.40；Web `:9000`，CGI `:80`）；运行 **0.11.19**（本机 `repo/` 提交 `a15870c`；LAN 仓库 `?v=96`）。⚠️ 装机后 3 个诊断日志类别已确认复位（plugin.lxmusic / player.source / player.streaming.remote 全 = ERROR）
 - **通道**：达菲订阅 = **LAN** `http://192.168.2.68:8765/repo.xml?v=96`（8765 常驻 `python -m http.server` 指向 `dist/`；**进程易失**，掉线就在 `dist/` 重启；`?v=N` 是 LMS 仓库缓存的破除参数，每次装机 +1；0.11.19 用 **v=96**）
 - ⚠️ **本机 IP 会飘**（2026-09-21 实测漂到 .131 又回到 .68）：IP 一变，设备就取不到 LAN 仓库（表现为"POST 成功但版本不变"、源导入报`empty download`）。处理：`ipconfig` 看当前 IP →`$env:LX_REPO_BASE='http://<当前IP>:8765'` 重新 pack →装机时`--repos=http://<当前IP>:8765/repo.xml?v=<N+1>` 把设备指过来；tmp 脚本已统一读环境变量`LX_LAN`（别硬编码）
 - **设备侧现状**：订阅源 **3 个（全部启用）**——`独家音源`(ae78880c，老源，wy 偶发失败) +
