@@ -87,12 +87,14 @@ def main():
         with open(ICON_SRC, 'rb') as src, open(icon_out, 'wb') as dst:
             dst.write(src.read())
 
-    repo = f'''<?xml version="1.0" encoding="utf-8"?>
+    def repo_xml(b):
+        """一份仓库描述；基址不同就是两份（sha1/zip 名共用，不能各打一次包！）。"""
+        return f'''<?xml version="1.0" encoding="utf-8"?>
 <extensions>
 \t<details>
 \t\t<title lang="EN">jackyytche lx-music repo</title>
 \t\t<name lang="EN">jackyytche lx-music repo</name>
-\t\t<url lang="EN">{base}/</url>
+\t\t<url lang="EN">{b}/</url>
 \t\t<description lang="EN">LX Music (luoxue) custom-source player plugin for Daphile / Lyrion Music Server.</description>
 \t\t<email>noreply@example.com</email>
 \t</details>
@@ -100,9 +102,9 @@ def main():
 \t\t<plugin name="LxMusic" version="{version}" minTarget="7.7" maxTarget="*">
 \t\t\t<title lang="EN">LX Music / 洛雪音乐</title>
 \t\t\t<desc lang="EN">Play music from LX Music custom-source subscriptions: import a source, search and stream with quality selection.</desc>
-\t\t\t<url>{base}/{zip_name}</url>
+\t\t\t<url>{b}/{zip_name}</url>
 \t\t\t<sha>{sha1}</sha>
-\t\t\t<icon>{base}/{ICON_NAME}</icon>
+\t\t\t<icon>{b}/{ICON_NAME}</icon>
 \t\t\t<creator>jackyytche</creator>
 \t\t\t<email>noreply@example.com</email>
 \t\t\t<category>musicservices</category>
@@ -110,14 +112,21 @@ def main():
 \t</plugins>
 </extensions>
 '''
+    # ① 主输出：dist/repo.xml（LAN 服务器直接服务的那份）
     with open(os.path.join(OUT, 'repo.xml'), 'w', encoding='utf-8', newline='\n') as fh:
-        fh.write(repo)
+        fh.write(repo_xml(base))
+    # ② GitHub 基址的那份（**同一个 zip/sha1**）：作为 release 资产上传、文件名就叫 repo.xml，
+    #    这样 `releases/latest/download/repo.xml` 永远可用（镜像喜马拉雅项目的做法）。
+    gh_base = GH_BASE.replace('{version}', version)
+    with open(os.path.join(OUT, 'repo-gh.xml'), 'w', encoding='utf-8', newline='\n') as fh:
+        fh.write(repo_xml(gh_base))
 
     print(f'version = {version}')
     print(f'sha1    = {sha1}')
     print(f'zip     = {zip_path} ({os.path.getsize(zip_path)} bytes)')
     print(f'icon    = {icon_out} ({os.path.getsize(icon_out) if os.path.exists(icon_out) else 0} bytes)')
     print(f'repo    = {os.path.join(OUT, "repo.xml")} (base={BASE})')
+    print(f'repo-gh = {os.path.join(OUT, "repo-gh.xml")} (base={gh_base})')
     print(f'entries = {len(entries)}')
     for _, rel in entries:
         print(f'  {rel}')

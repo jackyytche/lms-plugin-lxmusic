@@ -2,25 +2,31 @@
 
 > **下个 session 恢复方式**：直接说「继续 lx-music 插件，先读 HANDOFF.md」
 > **权威事实源**：本文档 + 磁盘（`plugin/` 源码、`repo/` 发布仓、`dist/` 打包产物、`refs/` 参考克隆、`tmp/` 工具）
-> **一句话现状（2026-09-21 第八轮，插件图标）**：设备运行 **0.11.19**（mg/wy 播放与拖动均已验收）；
-> **0.11.20 已打包待装机** = 换插件图标（落雪官方 logo，见 §5.11.81）。
+> **一句话现状（2026-09-21 第九轮：插件图标 + 首次 GitHub 发版）**：设备运行 **0.11.20**（已装机验收：
+> 插件管理器那一行与「应用/apps」菜单里的 LX Music 都换成了落雪官方 logo，见 §5.11.81/§5.11.82）；
+> **GitHub `jackyytche/lms-plugin-lxmusic` 已从 v0.5.9 一步发到 v0.11.20**（zip + repo.xml + lxmusic_logo.png
+> 三资产，见 §5.11.83 与 §七.7）。设备侧仍优先用 LAN 仓库（`http://192.168.2.68:8765/repo.xml?v=97`）。
 > 0.11.2=榜单页头；0.11.3=feed 内嵌翻页行（**作废**——用户指正那不是达菲原生翻页）；0.11.4=原生窗口
 > `items+offset+total`（喜马拉雅 albumHandler 配方），Web 翻页走 UI 原生页码；
 > 0.11.5~0.11.7=**修窗口数学**（上游页宽按 SDK `limit` 学，不再硬编码 50；行号改绝对序号），kw 热歌榜 6 页逐首对齐上游（§5.11.74）；
 > 0.11.8~0.11.12=修 tx 无声（CDN 谎报 Content-Type）+ 元数据/码率持久化；0.11.13~0.11.16=歌单页头 + kg 真封面 + 整榜码率；
-> 0.11.17~0.11.18=**修拖动进度条**（bitrate 发到直链 URL + 自实现 `getSeekData`，§5.11.79）；0.11.19=**修 mg 完全不能播**（https 直链走了明文处理器，§5.11.80）。
-> **已验证**：wy/mg/tx 播放与 UI 形态拖动（mg/wy/tx）、mg 榜单行、wy 榜单行——全部 PASS。
+> 0.11.17~0.11.18=**修拖动进度条**（bitrate 发到直链 URL + 自实现 `getSeekData`，§5.11.79）；0.11.19=**修 mg 完全不能播**（https 直链走了明文处理器，§5.11.80）；0.11.20=换插件图标（§5.11.81）。
+> **已验证**：wy/mg/tx 播放与 UI 形态拖动（mg/wy/tx）、mg 榜单行、wy 榜单行、mg（星海与裤佬各自）——全部 PASS。
 > **源侧旧判决（2026-09-21 凌晨实测，独家音源时期，保留作依据）**：kw/tx 取链+播放正常；**wy/kg 走独家音源时上游网关
 > 502 Bad Gateway 全档位取链失败**（不是我们管线的问题）——wy 表现为"点了没声"（autoSkip 3 连败后停止）。
 > "部分榜单不显示格式码率"（kg/tx）= 取链失败的症状：取链成功的曲子 songinfo 有 type/bitrate
 > （tx 实测 `type:MP3 320kbps bitrate:MP3 320kbps`）。kw 榜单调研结论与字段映射见 §5.11。
 > **换源判决（2026-09-21 晚，23 源批量实测）**：wy/mg 用 **星海音乐源 v3.2.13**（主）+ **裤佬SVIP音源 v3.0.0**（备）
 > ⇒ 两者都能取到 wy/mg 的真 CDN flac（mg `freetyst.nf.migu.cn` 实测 ~934kbps）——详见 §七.0。
-> **同日查出并修掉 mg 完全不能播的根因**：mg 直链是 **https**，而我们继承了明文的 `Protocols::HTTP`
-> ⇒ LMS 拿明文 HTTP 打 443 收 400（0.11.19 换基类为 `Protocols::HTTPS`，见 §5.11.80）。
+> ⚠️ **订阅源文件绝不进仓库/发布资产**（用户明确要求）：`refs/subs_v260917/**`、`dist/src-*.js`、
+> 用户导入的 `V260917.zip` 一律只在本地；发布前跑 `python tmp/audit_repo_contents.py` 体检（§5.11.83）。
+> ✅ **但本地要留副本**（用户要求：免得每次升级都要重新导入）：`repo/subscriptions/`
+> （**已被 `repo/.gitignore` 排除**，内含两个选定源 + 回执包；见 §5.11.85）。
 > ⚠️ 历史上出过一次**自伤事故**（0.8.0 编译失败仍打包上线 → LMS 加载失败并把插件从已安装列表摘掉 →
-> 全部页面 404），已用 `tmp/repair_install.py` 恢复，并立了 `tmp/precheck.ps1` 打包门禁（详见 §5.7）
-> **代码仍未上 GitHub（远端只有 v0.5.9）；0.6.0~0.11.19 全在本地 `repo/`；要发版就 GH 基址 pack + release（需用户 PAT）
+> 全部页面 404），已用 `tmp/repair_install.py` 恢复，并立了 `tmp/precheck.ps1` 打包门禁（详见 §5.7）；
+> ⚠️ 本文件也被 PowerShell 文本回环**破坏过一次**（中文整体乱码/半篇内容丢失），恢复后立了
+> `python tmp/doc_audit.py` 体检（编码/乱码模式/代码围栏/表格/重复行）与「**只用 edit/write 工具改本文件**」
+> 的纪律（§5.11.84）
 
 ---
 
@@ -31,7 +37,9 @@
 - **跨源 fallback 严格匹配**（宁缺毋滥）、静默降级；默认音质 **320k**
 - **播放验收口径**（0.10.9 定稿）：唯一判据是"播放位置持续推进"，不是 `mode=play`；详见 §5.10.57
 - 显示名**「洛雪音乐」**；发布仓库名**`jackyytche/lms-plugin-lxmusic`**；设备侧插件名**LxMusic**（tag `lxmusic`）
-- 达菲订阅源优先走 **LAN 通道** `http://192.168.2.68:8765/repo.xml`（8765 指向 `dist/`，pack 即生效）
+- 达菲订阅源优先走 **LAN 通道** `http://192.168.2.68:8765/repo.xml`（8765 指向 `dist/`，pack 即生效）；
+  GitHub 通道 `https://github.com/jackyytche/lms-plugin-lxmusic/releases/latest/download/repo.xml` 作为备用
+  （`repo-gh.xml` 由 pack.py 同步生成、以 `repo.xml` 之名作为 release 资产上传，见 §5.11.83）
 
 ---
 
@@ -89,15 +97,17 @@ XMLBrowser 菜单 / 网页  ← Plugin.pm（feed handlers / webHandler）
 | `plugin/LxMusic/Settings.pm` | `Slim::Web::Settings` 子类：设置页 handler + 订阅源导入/清除 + 诊断（含**常驻 worker 现场**） |
 | `plugin/LxMusic/HTML/EN/plugins/LxMusic/settings/basic.html` | 设置页模板（**由 `tmp/mk_settings_template.py` 生成的纯 ASCII 实体**，勿手改） |
 | ★`plugin/LxMusic/engine/shim.mjs` | qjs 宿主 shim：源分支 + sdk 分支 + probe 分支 + **serve 行协议** + curl 桥 |
-| `plugin/LxMusic/install.xml` | 版本号（唯一版本源）、`<optionsURL>` 设置入口、name/description 走 strings.txt token |
+| ★`plugin/LxMusic/install.xml` | 版本号（唯一版本源）、`<optionsURL>` 设置入口、**`<icon>` 插件图标**（0.11.20）、name/description 走 strings.txt token |
+| `plugin/LxMusic/HTML/EN/plugins/LxMusic/html/images/logo.png` | 插件图标原图（落雪官方 256×256，Apache-2.0；`icon.png` 是同一份拷贝）。**LMS 会按需缩放**出 `logo_50x50.png`/`logo_100x100.png`，不用预先切图（§5.11.81） |
 | `plugin/LxMusic/strings.txt` | `PLUGIN_LXMUSIC` / `PLUGIN_LXMUSIC_DESC`（EN/ZH_CN） |
 | `plugin/LxMusic/engine/sdk/sdk.bundle.js` | vendored musicSdk 打包产物（kw/kg/tx/wy/mg；bd/xm 已裁） |
 | `plugin/LxMusic/engine/sdk/renderer/…` | vendor 源码树（仅开发用，pack.py 排除不上机） |
-| `plugin/LxMusic/pack.py` | 打包：zip（qjs 0755）+ SHA1 + `repo.xml`；zip 名带版本号、时间戳=打包时刻；`LX_REPO_BASE` 决定基址 |
+| `plugin/LxMusic/pack.py` | 打包：zip（qjs 0755）+ SHA1 + `repo.xml`（LAN 基址）+ **`repo-gh.xml`（GitHub 基址，同 sha1，作为 release 资产以 `repo.xml` 之名上传）** + 图标拷进 `dist/`；zip 名带版本号、时间戳=打包时刻；`LX_REPO_BASE` 决定 `dist/repo.xml` 的基址 |
 | `plugin/t/**`、`plugin/t_local/**` | 本地 `perl -c` 存根（Slim::* 骨架 + JSON::PP 薄封装的 JSON::XS） |
 | `tmp/precheck.ps1` | **打包门禁（必用）**：所有 .pm 语法 + 模板纯 ASCII + shim 过 `node --check` |
 | `tmp/shim-sim/` | **shim 层模拟器**：node loader hook 把 qjs `std`/`os` 映射到 fs/spawnSync，直接跑 shim 的 sdk 分支 |
 | `repo/` | 发布用 git 仓（GitHub `lms-plugin-lxmusic`），内容 = plugin 源码镜像 |
+| `repo/subscriptions/` | **本地专用（被 `repo/.gitignore` 排除，绝不提交/发布）**：导入设备用的订阅源副本 + 用户回执包。用途与恢复流程见 §5.11.85 与 `repo/subscriptions/README.txt` |
 | `dist/` | `LxMusic-<ver>.zip` + `repo.xml`（pack.py 产物，LAN 直接服务） |
 | `refs/lx-music-desktop/` | 洛雪 PC 端全量源码（**getPic/封面/榜单逻辑的权威参考**） |
 | `slimserver/` | LMS 源码稀疏克隆（API/契约对照；**0.10.x 轮靠它定位到 `Song.pm::open` 的格式判定与 `formatOverride` 钩子**） |
@@ -155,18 +165,18 @@ XMLBrowser 菜单 / 网页  ← Plugin.pm（feed handlers / webHandler）
 | 0.11.5 | **上游页宽修正①**：翻页窗口数学里的「上游页宽」从硬编码 50 改为读 SDK 响应的 `limit`（首响应不符即重算重取）。**根因见 §5.11.74**：各源上游页宽根本不是 50 |
 | 0.11.6 | **曲目编号改绝对序号**（`_trackItems(..., $offset)`）：此前每页都从 `001` 重新编号，翻到第 2 页看到「001-050」＋不同歌名 ⇒ 肉眼判定「没翻页/只有一页」 |
 | 0.11.7 | 页宽修正②：按源默认页宽表（kw/kg=100、tx=300、mg=200、wy=100000）**让首次请求就落在正确上游页**；首个请求若越界失败则回退探第 1 页把 `limit` 学回来 + `install.xml` 中文注释乱码复原。实测 kw 热歌榜 6 页逐首对齐上游（1-50/51-100/…/251-300）、kg 3 页正常 |
-| **0.11.8（当前设备）** | **修"进度条走但没声音"**（tx/wy，见 §5.11.75）：CDN 撒谎的 Content-Type（QQ 的 `.flac` 直链声明 `audio/x-ogg`）被 LMS 嗅探后写进轨道类型缓存 ⇒ 把 FLAC 喂给 OGG 解码器。改为用**我们自己魔数嗅探出的真实格式**覆盖（`setContentType` + 轨道 `content_type`，播放前 `getNextTrack` 再校正一次，**只调 LMS 公开 API、不改 LMS 代码**）；顺带修 probe 的总长度（取 `Content-Range` 总量，此前 `~0kbps`）⇒ 真码率（tx 943kbps）能显示。实测 tx 茶汤/我不难过/晴天/天下 位置均推进过 5s、kw 回归正常 |
+| **0.11.8** | **修"进度条走但没声音"**（tx/wy，见 §5.11.75）：CDN 撒谎的 Content-Type（QQ 的 `.flac` 直链声明 `audio/x-ogg`）被 LMS 嗅探后写进轨道类型缓存 ⇒ 把 FLAC 喂给 OGG 解码器。改为用**我们自己魔数嗅探出的真实格式**覆盖（`setContentType` + 轨道 `content_type`，播放前 `getNextTrack` 再校正一次，**只调 LMS 公开 API、不改 LMS 代码**）；顺带修 probe 的总长度（取 `Content-Range` 总量，此前 `~0kbps`）⇒ 真码率（tx 943kbps）能显示。实测 tx 茶汤/我不难过/晴天/天下 位置均推进过 5s、kw 回归正常 |
 | 0.11.9 | **元数据持久化①**：解析结果带上 `secs`（时长），并在**扫描回调之后再发布一次** ct/bitrate/secs——LMS 的 `scanUrl` 会覆盖同一 URL 的属性，只发一次会出现「格式/码率闪一下就没」且 duration=0 |
 | 0.11.10 | **修「拖动进度条无效」的真凶**：`getMetadataFor` 把**档位 key 当码率**发（`bitrate => 'flac24bit'`）⇒ LMS 写入 `BITRATE = 'flac24bit'*1000 = 0` ⇒ `Protocols::HTTP::canSeek`（要求 bitrate **和** duration 都已知）恒返回 0 ⇒ 所有 lxm:// 曲目都不能拖。改成发显示标签 `type` + **数字 kbps**，并把 kbps/format 存进 `cache_metadata`。**实测 tx 拖动成功（60→65.8s）** |
 | 0.11.11 / 0.11.12 | 队列行的码率估算：`types[].size ÷ 时长`（kg/tx/mg/wy 有 size；kw 没有）写进行属性 ⇒ 未播放的行也能显示码率（kg 实测 1598kbps），播放后被真实探测值覆盖 |
 | 0.11.13 | **歌单详情页头配方**（最新/最热/推荐歌单的曲目页）：feed 级 `image/play/actions/albumData`；`play` 一出现模板就不再渲染自动的 "All Songs" 行，同时**删掉两行冗余**（歌单名 / ▶ 播放整个歌单）⇒ 列表第一行直接是曲目 001。整单播放改由页头按钮走新增的 `lxm://l/<src>/<plid>`（`explodePlaylist` 加歌单分支）；歌单窗口也按响应 `limit` 校正页宽 |
 | 0.11.14 | **kg artwork 真图**：`imge.kugou.com/stdmusic/240/<albumId>.jpg` 对不同 albumId 返回**同一张占位图**（实测 5 个 id → 同一 md5）；按官方 `kg/pic.js` 的 getPic 移植：封面代理 POST `media.store.kugou.com/v1/get_res_privilege`（KG-RC/KG-THash 头 + album_audio_id/album_id/hash）取 `info.image` 再转发。实测 5 行 → 5 张不同真图 |
 | 0.11.15 | `board_render` 加诊断 warn（src/bangid/play/total/rows）——用来证明 mg 的 feed **确实**发了 play/actions（见 §5.11.78） |
-| 0.11.16（**已打包，未装机**） | 整榜入队也发布码率估算（与列表行一致）。装机流程见 §5.11.77 |
+| 0.11.16（**未装机，被 0.11.17 取代**） | 整榜入队也发布码率估算（与列表行一致）。装机流程见 §5.11.77。历史注：设备上从 0.11.15 直接跳到 0.11.17 那一轮（用户手工装） |
 | 0.11.17（**已装机**） | **修「tx 不能拖进度条」**（§5.11.79）：`bitrate/secs` 原先只发给了 `lxm://` URL，而 LMS 的 `HTTP::getSeekData` 是拿 `$song->currentTrack()`（**直链**那条记录）查码率 ⇒ 查不到就 `return`（undef seekdata）⇒ `_JumpToTime` 的 `return unless $seekdata` 把拖动**静默丢弃**。现对 lxm:// 与直链**两个 URL 都发** ct/bitrate/secs |
 | 0.11.18（**已装机**） | **自己实现 `getSeekData`**（不再依赖 LMS 的码率查询）：返回 `{timeOffset}` 恒非 undef，另按 `len*t/secs`（探测总长优先）或 `kbps*1000/8*t` 给 `sourceStreamOffset`；`_cache_put` 把记录同时挂在 lxm:// 与直链两个 URL 下；`_finish_resolve`/`_trackItems` 透传 `secs`/`length`；shim 的 probe 用 `Content-Range` 总量当 `length` |
 | **0.11.19（已装机，已验收）** | **修「mg 完全不能播」**（§5.11.80）：解析出来的直链是 **https**（咪咕 `freetyst.nf.migu.cn`），而我们的处理器继承的是 `Slim::Player::Protocols::HTTP` —— 它下面是**明文** `IO::Socket::INET`，于是 LMS 拿明文 HTTP/1.0 去打 443，CDN 回 `400 Bad Request` ⇒ `PROBLEM_CONNECTING` ⇒ 70ms 就 stop。修法：有 SSL 时把基类换成 LMS 自带的 `Slim::Player::Protocols::HTTPS`（= IO::Socket::SSL + HTTP，按协议自动分流，返回对象仍是我们自己的类 ⇒ 0.11.18 的 seek 覆盖仍然生效），没 SSL 时回落 HTTP 并显式报错。**实测：wy/mg（星海）+ mg（裤佬）+ mg 榜单行全部 PASS，mg/wy/tx 拖动均 PASS** |
-| **0.11.20（已打包，待装机）** | **换插件图标**（§5.11.81）：`install.xml` 加 `<icon>plugins/LxMusic/html/images/logo.png</icon>`（落雪桌面版官方图标，Apache-2.0，取 `lx-music-desktop/resources/icons/256x256.png`），随包放 `HTML/EN/plugins/LxMusic/html/images/logo.png`；`pack.py` 生成的 `repo.xml` 再加一条**绝对 URL** 的 `<icon>{base}/lxmusic_logo.png</icon>`（图标同时拷进 `dist/`）。此前插件管理器显示的是分类兜底图 `html/images/musicservices.svg` |
+| **0.11.20（已装机，已验收，已发布 GitHub v0.11.20）** | **换插件图标**（§5.11.81）：`install.xml` 加 `<icon>plugins/LxMusic/html/images/logo.png</icon>`（落雪桌面版官方图标，Apache-2.0，取 `lx-music-desktop/resources/icons/256x256.png`），随包放 `HTML/EN/plugins/LxMusic/html/images/logo.png`；`pack.py` 生成的 `repo.xml` 再加一条**绝对 URL** 的 `<icon>{base}/lxmusic_logo.png</icon>`（图标同时拷进 `dist/`）。此前插件管理器显示的是分类兜底图 `html/images/musicservices.svg`、apps 菜单里是收音机图标 `html/images/radio.png`。**装机实测**：apps 项 `icon:plugins/LxMusic/html/images/logo.png` ✓；插件管理器行走 repo.xml 的绝对 URL（`/imageproxy/…/image_50x50_o` + `…_100x100_o 2x`，均 200）✓ |
 
 ---
 
@@ -227,7 +237,7 @@ XMLBrowser 菜单 / 网页  ← Plugin.pm（feed handlers / webHandler）
 35. **prefs 里存 JSON 不要用`JSON::XS->utf8`**：`utf8` 模式产出的是"含高位字节的字节串"，落到 `YAML::XS::Dump`（`Prefs/Namespace.pm:327`）会出二进制/乱码风险。用**字符模式**（非 ASCII 转`\uXXXX`，落盘纯 ASCII，读写往返稳定）。另：`plugin/t_local/JSON/XS.pm` 原来是手写假实现（不转义非 ASCII，decode 直接喀 decode_json），会把"存进去读不出"这类问题在本地测试里静默掩盖——已换成 **JSON::PP 薄封装**
 36. **`Set-Content` 又写坏了一次中文**（install.xml 注释，第四次）：改文件**只用 write/edit 工具**！"哪怕只改个版本号"也别用 PowerShell（`-replace | Set-Content` 会按 ANSI 读、UTF8 写）另：在`.pm` 里中文时若用脚本批量替换，替换后务必 `perl -c` + 跑一次设备页面验收
 
-### 5.7 打包门禁与"插件被 LMS 摘除"的恢复（M0.7 现场，4 条，含一次自伤事故）
+### 5.7 打包门禁与"插件被 LMS 摘除"的恢复（M0.7 现场，5 条，含一次自伤事故）
 37. **【事故】编译失败仍打包上机 ⇒LMS 把插件从"已安装"列表摘掉**（0.8.0 的 Plugin.pm 有 `Global symbol "$src"`（我改搜索时漏了变量作用域），`perl -c` 的失败我没当门禁，pack 照跑；装机时 LMS 加载失败（`Slim::bootstrap::tryModuleLoad` 警告 "failed to load"），后果不是"插件不工作"而是 **插件从已安装列表消失**：插件页只剩仓库候选（`<input name="LxMusic" class="unsafePlugin">` + 空的`install:LxMusic`），所有插件页面 404，且**此后所有 POST 都装不上也启不了**（因为 `update:<plugin>` 对未安装的插件是空操作）修法：**先立门禁** `powershell -ExecutionPolicy Bypass -File tmp/precheck.ps1`（所有 .pm 必须 `syntax OK` + 模板纯 ASCII + shim.mjs 过 `node --check`），**通过才允许 pack**；再用 `tmp/repair_install.py`（见 38）重新安装启用 + 重启即可恢复
 38. **插件设置页表单有重复字段名（`repos` 两条），必须用保序 (name,value) 列表回放**：我用 dict 收字段（`d[n]=v`）跑"修复"脚本，把两条 repos 并成一条⇒`Slim::Web::Settings::Server::Plugins` 按提交的 repos 集合与当前集合做增量⇒**把 LAN 仓库删了**，插件候选直接从页面消失（比事故本身更难查）。正解：沿用 `tmp/repair_install.py`（列表式 + 浏览器语义 + `--repos=` 覆盖 + `install:<name>` 标记 + `<name>` 勾选）回放
 39. **单源搜索返回 hashref、跨源返回 arrayref**：`_webSearch` 里`@{$res->{data}}` 在单源时直接 die（"Not an ARRAY reference"）⇒ 页面挂到超时（浏览器/urllib 都只看到 hang，没有错误页）正解：`my @groups = length $src ? ($res->{data}) : @{ $res->{data} };`
@@ -283,7 +293,7 @@ XMLBrowser 菜单 / 网页  ← Plugin.pm（feed handlers / webHandler）
     - **探针（取 2KB）抓不到这类问题**：wy lossless 的 verify 是 OK（1562ms，比 kw 的 352ms 慢 4 倍），但一播就是 0 秒。所以探针通过"不等于能播"——这正是 `preferStreamable` 要绕开脚本中转链的原因
     - 结论/口径：**长青的直链形态（自家脚本中转链、无音频后缀）才是问题**；VIP 只解释了"它为什么要给中转链"（拿不到原始 CDN 直链，只能自己中转）。要让它真正可用得由源作者返回 CDN 直链；我们这边补 `formatOverride` 会让达菲流水线卡死（§5.10.54），不值得再试
 
-### 5.11 M0.11：kw 榜单复活（0.11.0 轮起，14 条，本机+设备双实测）
+### 5.11 M0.11~M0.15：榜单翻页 / 播放元数据 / 拖动 / https / 换源 / 图标 / 发版（0.11.0~0.11.20 轮，共 27 条：59~85，本机+设备双实测）
 
 59. **wbd 签名端点的死法要分层看**：`wbd.kuwo.cn/api/bd/bang/bang_info` 对旧实现返回 `{"code":10006,"msg":"DECRYPT_ERROR"}`——但**裸请求（无 data 参数）返回`10004 AppId错误`**，说明 `appId=y67sprxhhpws` 还在白名单里，**只是 AES key 被上游换掉了**。refs/ 各克隆（desktop/mobile/lxmusic2api）全是同一套旧实现，本地没有现成新签名。别再回去试旧 key
 60. **换端点比补签名划算**：洛雪 PC 端的免签名端点`kbangserver.kuwo.cn/ksong.s` 还活着（`from=pc&fmt=json&pn=<0基>&rn=100&type=bang&data=content&id=<bangid>&show_copyright_off=0&pcmp4=1&isbang=1`），**静态榜单 25/25 全部返回有效数据**（本机+设备双端）。注意`from=phone`/`from=mbox` 会报 `no bangid`——只有`from=pc` 这条形态能用
@@ -543,6 +553,60 @@ XMLBrowser 菜单 / 网页  ← Plugin.pm（feed handlers / webHandler）
       `tmp/dump_plugin_imgs.py`（列出页内所有 `<img>` 及其上下文）。装机后应看到
       `src="/plugins/LxMusic/html/images/logo_50x50.png"` + `srcset="…_100x100.png 2x"`，
       而不再是 `html/images/musicservices.svg` + `class="pluginFallbackIcon"`。
+82. **图标装机实测（0.11.20）：两处都换了，但走的是**两条不同**的取图路径 —— 别被第一种骗了**
+    - **apps/应用菜单**：`python tmp/lx_cli.py "apps 0 60"` → LX Music 项
+      `icon:plugins/LxMusic/html/images/logo.png`（此前 `icon:html/images/radio.png`）。这条来自
+      **包内 install.xml**，稳。
+    - **设置→插件 那一行**：`python tmp/verify_icon_0_11_20.py` → 渲染出的**不是** `…/logo_50x50.png`，
+      而是 `/imageproxy/http%3A%2F%2F192.168.2.68%3A8765%2Flxmusic_logo.png/image_50x50_o`（+ `_100x100_o 2x`）。
+      原因：`Slim/Web/Settings/Server/Plugins.pm::prepareDetails` 里
+      `$_->{icon} = $data->{icon} if $data->{icon} && $_->{icon} !~ /^http/;`
+      —— **只要 repo.xml 给了绝对 URL 的 `<icon>`，它就覆盖包内的相对路径**（然后交给 imageproxy 缩放）。
+      两张图实测都 200（1525 B / 3410 B）。⇒ **LAN 仓库/图标不可达时，插件管理器那一行会退化成
+      `musicservices.svg` 兜底图，而 apps 菜单仍然正常**；排查图标问题时先分清是哪一处。
+83. **【流程】发布到 GitHub（fine-grained PAT）+ 「订阅源文件绝不进仓库」的硬约束**
+    - **推送**：token 只走环境变量或命令行内联，**不写进 `.git/config`、不落盘**：
+      `git push https://x-access-token:$env:GH_TOKEN@github.com/jackyytche/lms-plugin-lxmusic main:main`
+      （`repo/` 里可以放一个**不带 token** 的 `origin` 只用于 `fetch`）。
+    - **远端可能领先**：`plugin-tests.yml` 会给 main 追提交（`ci: regression log [skip ci]`）。先 `git fetch origin`，
+      本地领先就用 `git merge origin/main`（本轮 30 ahead / 1 behind，merge 只带回 `plugin/helper-test.log`，零冲突）。
+    - **打包**：`pack.py` 一次打包产出两份仓库描述（同一个 zip/sha1）——`dist/repo.xml`（LAN）+
+      `dist/repo-gh.xml`（GitHub 基址）。**绝不能各打一次包**（zip 条目时间戳=打包时刻 ⇒ 两次 sha1 不同，
+      而 assets 与 repo.xml 必须严格对应）。
+    - **建 release + 传三资产**：`GH_TOKEN=… python tmp/lx_gh_release.py 0.11.20`（`--verify` 只做终验）：
+      资产固定名 `LxMusic-<ver>.zip`、`repo.xml`（内容=repo-gh.xml）、`lxmusic_logo.png`
+      ⇒ `releases/latest/download/repo.xml` 与 `…/lxmusic_logo.png` 才能长期稳定。
+    - **发布前必跑 `python tmp/audit_repo_contents.py`**：列出全部跟踪文件 + 文件名/内容特征扫描。
+      用户的**订阅源回执包**（`V260917.zip`、`refs/subs_v260917/**`）与**导入用的源脚本**
+      （`dist/src-xinghai-2.3.13.js`、`dist/src-kulou-3.0.0.js` 等）**只在本地**，`repo/` 里一个都不能有；
+      zip 里也不能有（pack.py 只打 `plugin/LxMusic/`，实测 15 条目里零订阅源文件）。
+      ⚠️ 注意区分：插件**自带的** `engine/sdk/**` 是 vendor 的 musicSdk（我们自己构建的），不是订阅源。
+    - **收尾**：提醒用户吊销 PAT；把 release 的 id/URL/sha1 记进 §七.8。
+84. **【纪律】交接文档的完整性：它被 PowerShell 文本回环毁过一次**
+    - **事故形态**：用 `Get-Content`/`Set-Content`（或任何按 ANSI 读写的回环）处理本文件 ⇒ 中文整体乱码、
+      部分段落丢失、行尾混入 CRLF；而且**复制进 `repo/` 时才被 git 记下**（远端历史里那份 0.8.5 快照就是坏的）。
+    - **纪律**：本文件**只用 `read`/`edit`/`write` 工具**改；要复制只能用 `Copy-Item`（逐字节，不解码）；
+      **永远不要**用 PowerShell 读进来再写回去。
+    - **体检**：`python tmp/doc_audit.py`（默认查 `HANDOFF.md`）—— 一次给出：UTF-8/BOM/行尾、
+      U+FFFD、典型乱码模式（`锟斤拷`、UTF-8 被当 GBK/latin1）、代码围栏奇偶、表格管道数、
+      标题层级、重复长行。**判据**：UTF-8 解码 OK + 0 个 U+FFFD + 围栏偶数 + 无重复长行；
+      文档里出现的 `å¨æ°ä¼¦` 这类是**故意引用的乱码样例**（讲编码坑用的），不是损坏。
+    - 同族纪律：`install.xml` 的中文注释也被 PowerShell 写坏过（§5.5.36），改 XML 同样只用 edit 工具。
+85. **订阅源不会因升级而丢 —— 但仍要留本地副本（用户要求）**
+    - **事实**：导入的源正文存在 LMS prefs 目录 `<prefsdir>/lxmusic/sources/<id>.js`，元数据在 prefs
+      `sourcesJson`；**升级插件不动 prefs**。实测证据：0.11.15 → 0.11.17 → 0.11.18 → 0.11.19 → 0.11.20
+      连续升级（含两次重启/次），3 个源始终在位且全 ON（`python tmp/reimport_sources.py check`）。
+      ⇒ "每次升级都要重新导入"并不是必然；会丢的场景只有 **prefs 被清空 / 卸载重装 / 换机器**。
+    - **本地副本**：`repo/subscriptions/`（`src-xinghai-2.3.13.js`、`src-kulou-3.0.0.js`、`V260917.zip` +
+      `README.txt`），**已被 `repo/.gitignore` 排除** —— 既保住"升级/清空后能一键补装"，又不会发上 GitHub。
+    - **一键补装**（无 GUI 也能做）：`python tmp/sync_subs.py`（把副本同步进 LAN 仓库 `dist/`，
+      8765 即时可下载）→ `python tmp/reimport_sources.py check|import`（对照设备已装的源，
+      缺的用设置页的 `add_url` + LAN 地址补装；`--force` 全部重装）。
+      ⚠️ 导入动作只有 `add_url` / `add_file` / `add_dir` 三个（`Settings.pm` L130-149）——
+      **没有** `lxAction=import`（`tmp/lx_settings_post.py` 文档里那个是旧写法，别照抄）；
+      判据用「正文字节数」对照（设备行里带 `NNNN 字节`）。
+    - ⚠️ 因此 **`dist/src-*.js` 不要清理**（它就是 `add_url` 的目标）；换 IP 时记得 `sync_subs.py` 后用
+      新 LAN 地址补装/刷新。
 
 ---
 
@@ -604,7 +668,16 @@ XMLBrowser 菜单 / 网页  ← Plugin.pm（feed handlers / webHandler）
    - 0.11.20 图标一轮新增：`tmp/check_plugin_icon.py`（插件管理页里 LxMusic/Ximalaya 行的 `<img>` 与相对 icon 引用）、
      `tmp/dump_plugin_imgs.py`（页内所有 `<img>` + 上下文，用来确认 srcset 的 `_50x50/_100x100` 形态）、
      `tmp/check_daphile_menu_icon.py`（达菲皮肤菜单/曲目页里有没有 per-item icon 字段）、
-     `tmp/dump_plugin_rows.py`（插件页里 Ximalaya/LxMusic 周边的原始 HTML）
+     `tmp/dump_plugin_rows.py`（插件页里 Ximalaya/LxMusic 周边的原始 HTML）、
+     **`tmp/verify_icon_0_11_20.py`（图标终验：插件行 img 取图 200 + 本地 zip sha1）**
+   - 发版/文档一轮新增（§5.11.83/84 的配套工具）：
+     **`tmp/audit_repo_contents.py`（发布前体检：跟踪文件全表 + 订阅源/凭据特征扫描）**、
+     **`tmp/doc_audit.py [文件]`（交接文档体检：编码/乱码/结构/重复）**、
+     **`tmp/lx_gh_release.py <ver> [--verify]`（建 release + 传三资产 + 终验 `releases/latest/download`）**、
+     `tmp/prep_release_check.py [ver]`（发版前一览：zip 内容/图标/两份 repo.xml 的 URL 与 sha 一致性 + LAN 可达性）、
+     `tmp/check_daphile_shell.py`、`tmp/grep_daphile_js_icon.py`（达菲皮肤图标相关取证）
+   - 订阅源本地持久化一轮新增（§5.11.85）：**`tmp/sync_subs.py`（本地副本 → LAN 仓库 dist/）**、
+     **`tmp/reimport_sources.py check|import [--force]`（对照设备已装的源，缺的用 add_url 补装）**
    - `tmp/lx_set_loglevel.py [LEVEL]` …查看/整表回放设置某个日志类别级别（带 `persist=1`，重启仍生效）
 
 **播放器**：HiBy FC4 `5a:78:10:59:c7:74`（用户主用，验证目标）；HD-Audio Generic `5a:bf:86:1b:a6:ff`（本机声卡）；小爱音箱 squeezelite `bb:bb:69:a9:cf:23`（**会出声，勿用**）
@@ -613,15 +686,24 @@ XMLBrowser 菜单 / 网页  ← Plugin.pm（feed handlers / webHandler）
 
 ## 七、下个 session 待办（按序）
 
-0. **【本轮 0.11.20】装机看图标**：`install.xml` 与 `pack.py` 已改好、LAN 仓库已更新（`?v=97`，
-   `dist/LxMusic-0.11.20.zip` SHA1 `51d4fce14d5f6dfe7fe95ffb19d89c4148609024`，图标
-   `dist/lxmusic_logo.png` 已在仓库根可取）。装机（设置→插件→更新，可能要重启两次）后跑两条：
-   ① `python tmp/lx_cli.py "apps 0 60"` —— LX Music 项应从 `icon:html/images/radio.png`
-   变成 `icon:plugins/LxMusic/html/images/logo.png`；② `python tmp/dump_plugin_imgs.py` ——
-   LxMusic 行应出现 `<img src="/plugins/LxMusic/html/images/logo_50x50.png" srcset="…_100x100.png 2x">`，
-   而不再是 `musicservices.svg` + `class="pluginFallbackIcon"`（§5.11.81）。
-   ⚠️ 若发 GitHub release，记得把 `lxmusic_logo.png` 一起作为 release 资产上传。
-1. ✅ **【上一轮 0.11.19】mg https 修复已装机验收 + 两个新订阅源已验收**（详见 §5.11.80 与 §八"订阅源现状"）
+0. ✅ **【本轮 0.11.20】插件图标：已装机、已验收、已随首次发版上线 GitHub**（§5.11.81/§5.11.83）
+   - 装机后实测（内部播放器无关，纯网页/CLI 取证）：① `python tmp/lx_cli.py "apps 0 60"` ——
+     LX Music 项从 `icon:html/images/radio.png` 变成 **`icon:plugins/LxMusic/html/images/logo.png`** ✓；
+     ② `python tmp/verify_icon_0_11_20.py` —— 插件管理器那一行读的是 **repo.xml 的绝对 URL**
+     （`prepareDetails` 里绝对 icon 会覆盖包内相对路径）⇒ `/imageproxy/http%3A%2F%2F192.168.2.68%3A8765%2Flxmusic_logo.png/image_50x50_o`
+     + `…_100x100_o 2x`，两张图都 200（1525 B / 3410 B）✓。**副作用要知道**：那一行的图标依赖
+     LAN 仓库可达（IP 变了会退化成分类兜底图），apps 菜单那份则始终来自包内 install.xml（更稳）。
+   - pack.py 现在**一次打包同时产出两份仓库描述**（同一个 zip/sha1）：`dist/repo.xml`（LAN）+
+     `dist/repo-gh.xml`（GitHub 基址，作为 release 资产以 `repo.xml` 之名上传）。
+1. **发版（本轮已做，见 §七.7；下次照做）**：
+   - 流程：`pack.py`（不带 `LX_REPO_BASE` 也可，因为 GH 那份总是生成）→ 并进 `repo/`（源码+图标+pack.py+HANDOFF）
+     → `git push`（**token 只在命令行内联/环境变量，绝不写进文件**）→ 用 `tmp/lx_gh_release.py <version>`
+     建 release 并上传**三资产**：`LxMusic-<ver>.zip`、`repo.xml`（= repo-gh.xml）、`lxmusic_logo.png`
+     → `tmp/lx_gh_release.py 0.11.20 --verify` 终验 `releases/latest/download/repo.xml` 的 version/sha/zip 字节数。
+   - ⚠️ **发布前必跑** `python tmp/audit_repo_contents.py`：确认仓库里**没有**用户导入的订阅源文件
+     （`src-*.js` / `V260917.zip` / `refs/subs_*`）、没有 token；订阅源只留在本机 `dist/`、`refs/`（未跟踪）。
+   - ⚠️ 发完**提醒用户吊销 PAT**（本轮 token 由用户在对话里明文给出）。
+2. ✅ **【上一轮 0.11.19】mg https 修复已装机验收 + 两个新订阅源已验收**（详见 §5.11.80 与 §八"订阅源现状"）
    - 0.11.19 已装机（工具页版本号 **0.11.19**，用户手工装）。验收脚本：`python tmp/accept_011_19.py check`
      （wy/mg 各一首端到端）与 `python tmp/accept_011_19.py kulou "稻香"`（**临时停用星海**只留裤佬跑 mg，测完自动恢复）；
      榜单行用 `python tmp/play_board_row.py 6.0 0`；拖动用 `python tmp/seek_lxm.py mg|wy|tx 晴天`。
@@ -635,11 +717,10 @@ XMLBrowser 菜单 / 网页  ← Plugin.pm（feed handlers / webHandler）
      其余候选 wy 不是 403/JSON 报错就是只有 mp3（stellarwave），所以"两个源互相独立"在 **wy 上并不成立**；
      **mg 则宽松得多**（星海/裤佬/墨澜/屿溪/stellarwave 都取到同一条咪咕官方 flac）。
    - ⚠️ **mg 直链是 https**：装 0.11.19 之前，"星海/裤佬能取到 mg 的 flac 直链"**不等于**能在达菲上播出（§5.11.80）。
-1. **发版 v0.11.16（待定，需用户提供 PAT）**——远端 GitHub 目前只有 v0.5.9；0.6.0~0.11.19 全在本地
-   - 步骤：不带 `LX_REPO_BASE` 跑 `pack.py`（生成 GH 基址 zip + repo.xml）→ `dist/LxMusic-0.11.16.zip` + `repo.xml` 作为 `v0.11.16` release 资产（0.11.0 zip SHA1 `44cd31629567002319880bc9ed5f46fcaa066445`，LAN 版已打）
-   - 推送：`git push https://x-access-token:<token>@github.com/jackyytche/lms-plugin-lxmusic main`（token 只内联，不落盘；本地 main 领先远端，快进即可）。本地提交：`e7ef7b3`（0.11.16）、`f7250ab`（0.11.13~0.11.14）、`9cb3026`（0.11.9~0.11.12）、`eb4a2da`（0.11.8）、`62e75d4`（0.11.5~0.11.7）、`a0e752c`（0.11.4）、`a8d0843`（0.11.3）、`961cda0`（0.11.2）
-   - 提醒用户**用完即撤销 PAT**
-2. **播放菜单逐页修订（2026-09-21 第四轮验收通过后用户提出三项）**：
+   - 历史注（v0.11.16 时代写的发版步骤，已被上面第 1 条取代）：本地提交序列 `e7ef7b3`（0.11.16）、
+     `f7250ab`（0.11.13~0.11.14）、`9cb3026`（0.11.9~0.11.12）、`eb4a2da`（0.11.8）、`62e75d4`（0.11.5~0.11.7）、
+     `a0e752c`（0.11.4）、`a8d0843`（0.11.3）、`961cda0`（0.11.2）；0.11.0 zip SHA1 `44cd31629567002319880bc9ed5f46fcaa066445`
+3. **播放菜单逐页修订（2026-09-21 第四轮验收通过后用户提出三项）**：
    1. ✅ **榜单翻页**（0.11.4 原生窗口 + 0.11.5~0.11.7 窗口数学修正，§5.11.74）：kw 热歌榜 6 页
       （1-50/51-100/…/251-300）与 kg 3 页已**逐首对齐上游**验收；待用户在达菲界面目验翻页体验
       （页码条在曲目列表**上方**：`1 2 3 4 5 6 ▶`；点第 2 页应显示 **051** 起的曲目）
@@ -653,28 +734,41 @@ XMLBrowser 菜单 / 网页  ← Plugin.pm（feed handlers / webHandler）
    5. ⏸️ **wy 待换源再试**（用户决定）：wy 取链不稳（本轮现场：源关闭时报「没有可用的订阅源」；
       源开启后 wy 曾报上游 502/取链失败）。用户说"稍后试试别的订阅源"⇒ **先别改代码**，
       等换源后按 §5.11.75 的方法重测（`player.source=DEBUG` + `read_fresh_log.py` 看格式决策）
-3. **M0.10 剩余候选**（kw 榜单已在 0.11.0 完成）：
+4. **M0.10 剩余候选**（kw 榜单已在 0.11.0 完成）：
    - **worker 池化**：同一源进程同时服务"取链 + 校验"（`probe` 其实不依赖源）、多源并行 worker（现在多源是串行试、每源一个进程）；worker 生命周期与`bridgeTimeout` 热更新（现在改桥超时要等 worker 回收才生效）
    - 长青 `kg flac24bit ~48kbps` 试听片段的自适应处置（换源？降档？现为告警；长青已停用，优先级降低）
    - **探针的"能播性"还差一层**：现在只看状态码 + 前 2KB 是音频，抓不到 §5.10.58 那类"探针 OK 但一播就 0 秒"（wy flac：探针 1562ms OK，裸播 40s 位置恒 0）。可选做法：连续两次 Range 都成功或加吞吐门槛（如 ≈100KB/s）、或起播后回查播放器位置并自动换源；**前提是能稳定复现到设备侧**（本机 curl 该 URL 是 367KB/s 正常的），否则只是给每首加一次额外请求却抓不到信号
    - `resolveTtl` 与各 CDN 直链真实时效的对齐（现在统一 600s，过期就播不出→非 autoSkip 兜底）
-4. **M0.7 剩余候选**（未做）：每源失败冷却（连续点歌不反复撞死源）；**不喜欢歌曲规则**（`歌曲名@艺术家` 三态过滤，PC 端最契合服务端的一项）；搜索排序可选增强（PC 算法 + "歌手名越短得分越高"⇒是否加"完全同名优先 / 优先某源"）；`common.sourceNameType` real/alias；繁简转换；歌词三开关；代理；热门搜索；直链缓存上限语义
-5. **共识内未做功能**：**收藏**（§一定稿范围内唯一没做的）
-6. **待清理**：`plugin/t_build/`（本地构建残留）、`dist/lx-6.js`、`dist/qdy.js`（历史测试副本）；`tmp/verify_settings.py` 的分区标签断言已对齐 0.10.9（12 分区 + 全 pref）——**0.11.0 加了 boardsKw 复选框，该脚本的 pref 清单是硬编码的，下次改设置页记得同步**
-7. **发布历史（✅ 2026-09-19）**：GitHub `jackyytche/lms-plugin-lxmusic`（**注意：远端只有 v0.5.9，之后未发**）
-   - main 已推：`a5af529..2b28c48`（`2b28c48` = 0.3.0→0.5.9 + 设置页 WIP 单一提交，含 vendored sdk 树 0.23MB 以便复现）
-   - **Release `v0.5.9`**（id `392124985`）：资产 `LxMusic-0.5.9.zip`（1231509 B，SHA1 `c0959eb82a8f5d968c3e51de8e160c9cb4875180`）+ `repo.xml`（GH 基址）
+5. **M0.7 剩余候选**（未做）：每源失败冷却（连续点歌不反复撞死源）；**不喜欢歌曲规则**（`歌曲名@艺术家` 三态过滤，PC 端最契合服务端的一项）；搜索排序可选增强（PC 算法 + "歌手名越短得分越高"⇒是否加"完全同名优先 / 优先某源"）；`common.sourceNameType` real/alias；繁简转换；歌词三开关；代理；热门搜索；直链缓存上限语义
+6. **共识内未做功能**：**收藏**（§一定稿范围内唯一没做的）
+7. **待清理**：`plugin/t_build/`（本地构建残留）、`dist/lx-6.js`、`dist/qdy.js`（历史测试副本）
+   ⚠️ **但 `dist/src-xinghai-2.3.13.js` / `dist/src-kulou-3.0.0.js` 永不清理**（设备的补装 URL，§5.11.85）；；`tmp/verify_settings.py` 的分区标签断言已对齐 0.10.9（12 分区 + 全 pref）——**0.11.0 加了 boardsKw 复选框，该脚本的 pref 清单是硬编码的，下次改设置页记得同步**
+8. **发布历史**：GitHub `jackyytche/lms-plugin-lxmusic`（公开仓；GitHub Actions 有两个工作流：
+   `plugin-tests.yml`（跑 `plugin/t/helper-test.pl`）与 `build-quickjs.yml`；**`plugin-tests.yml` 会往 main 追一条
+   `ci: regression log [skip ci]` 的提交**（更新 `plugin/helper-test.log`），所以推之前先 `git fetch origin` 看远端状态）
+   - **v0.5.9（2026-09-19，历史）**：`2b28c48` = 0.3.0→0.5.9 单一提交；Release id `392124985`，
+     资产 `LxMusic-0.5.9.zip`（1231509 B，SHA1 `c0959eb82a8f5d968c3e51de8e160c9cb4875180`）+ `repo.xml`
+   - **v0.11.20（2026-09-21，本轮）**：把 0.6.0~0.11.20 共 30 个本地提交 + 远端 1 个 CI 提交合并后推送
+     （合并提交 `b3ae56c`，只带回 `plugin/helper-test.log`，无冲突）；Release 三资产
+     `LxMusic-0.11.20.zip`（1289210 B，SHA1 `04b7fcd451b1794c051e2d049a8d6265783964d2`）、`repo.xml`（GH 基址）、
+     `lxmusic_logo.png`。**首个带插件的正式发布版本**（此前远端停留在 0.5.9，之后 0.6.0~0.11.19 只在 LAN 通道）
 
 ---
 
 ## 八、现场状态与凭据
 
-- **设备**：达菲 `192.168.2.111`（LMS 9.0.3 / perl 5.40；Web `:9000`，CGI `:80`）；运行 **0.11.19**（本机 `repo/` 提交 `a15870c`；LAN 仓库 `?v=96`）；**0.11.20（插件图标）已打包待装机（`?v=97`）**。⚠️ 装机后 3 个诊断日志类别已确认复位（plugin.lxmusic / player.source / player.streaming.remote 全 = ERROR）
-- **通道**：达菲订阅 = **LAN** `http://192.168.2.68:8765/repo.xml?v=96`（8765 常驻 `python -m http.server` 指向 `dist/`；**进程易失**，掉线就在 `dist/` 重启；`?v=N` 是 LMS 仓库缓存的破除参数，每次装机 +1；0.11.19 用 **v=96**）
+- **设备**：达菲 `192.168.2.111`（LMS 9.0.3 / perl 5.40；Web `:9000`，CGI `:80`）；运行 **0.11.20**
+  （本机 `repo/` 提交 `b3ae56c` 之前的最新提交；LAN 仓库 `?v=97`；插件图标已验收，见 §七.0）。
+  ⚠️ 装机后 3 个诊断日志类别已确认复位（plugin.lxmusic / player.source / player.streaming.remote 全 = ERROR）
+- **通道**：① **LAN（设备当前用这条）** `http://192.168.2.68:8765/repo.xml?v=97`（8765 常驻 `python -m http.server`
+  指向 `dist/`；**进程易失**，掉线就在 `dist/` 重启；`?v=N` 是 LMS 仓库缓存的破除参数，每次装机 +1；
+  0.11.19 用 v=96、0.11.20 用 **v=97**）；② **GitHub（备用/公开）**
+  `https://github.com/jackyytche/lms-plugin-lxmusic/releases/latest/download/repo.xml`（资产 `repo.xml` = 本地 `dist/repo-gh.xml`）
 - ⚠️ **本机 IP 会飘**（2026-09-21 实测漂到 .131 又回到 .68）：IP 一变，设备就取不到 LAN 仓库（表现为"POST 成功但版本不变"、源导入报`empty download`）。处理：`ipconfig` 看当前 IP →`$env:LX_REPO_BASE='http://<当前IP>:8765'` 重新 pack →装机时`--repos=http://<当前IP>:8765/repo.xml?v=<N+1>` 把设备指过来；tmp 脚本已统一读环境变量`LX_LAN`（别硬编码）
 - **设备侧现状**：订阅源 **3 个（全部启用）**——`独家音源`(ae78880c，老源，wy 偶发失败) +
   **`星海音乐源`(670c125a，v3.2.13，LAN `http://192.168.2.68:8765/src-xinghai-2.3.13.js`)** +
-  **`裤佬SVIP音源(二改整合版)`(6cf9ef8a，v3.0.0，LAN `.../src-kulou-3.0.0.js`)**（长青已在早前删除）：
+  **`裤佬SVIP音源(二改整合版)`(6cf9ef8a，v3.0.0，LAN `.../src-kulou-3.0.0.js`)**（长青已在早前删除）。
+  **本地副本在 `repo/subscriptions/`（git-ignored）**，补装流程见 §5.11.85（`tmp/sync_subs.py` + `tmp/reimport_sources.py`）：
   1. `独家音源`（`https://raw.githubusercontent.com/pdone/lx-music-source/main/lx/latest.js`，4094 B，v6）——**取链 4~5/5**（wy 偶发），直链是 CDN 直链（如 `car-er.kuwo.cn/…M800000bYDlc2XxKLs.mp3`）⇒ **后缀可判、能正常播放**；但 `mg` 档位取链**上游 block ip**（§5.11.80 前的老现象）
      ⚠️ **2026-09-21 凌晨实测**：该源的 wy/kg 通道上游网关 **502 Bad Gateway**（全档位取链失败），kw/tx 正常——源侧故障，恢复即自愈；**同日晚复测：kg 已恢复（flac24bit 取链 PASS），wy 仍失败**
   2. `星海音乐源` v3.2.13——**本轮为 wy/mg 选定的主源**：wy/mg flac 实测可达（mg `freetyst.nf.migu.cn` ~934kbps verified）；见 §七.0
@@ -700,7 +794,8 @@ XMLBrowser 菜单 / 网页  ← Plugin.pm（feed handlers / webHandler）
   - **订阅源导入/判重/刷新/删除全链路复核**（2026-09-21 第三轮，表单回放逐项实测）：在线 URL 导入 27645 B 逐字节一致（无二次编码/无裁剪，基准=本机直抓同一 URL）；同 URL 重导入→「与已有订阅源…内容完全相同，已跳过」；本地文件导入（指向设备上独家落盘文件）→同样判重；不存在路径→干净报错「文件不存在：…」；lxRefresh →「在线订阅已是最新（内容未变）」；lxDel →「已删除订阅源」且行干净消失、其余源无损。消息全部无乱码（`_m`/`_ent` 混旗标防护有效）。① 注意：重名表单字段会被 LMS 解析成数组→ addUrl 报「URL 必须是 http…」，回放脚本必须先剔旧字段再追加（0.7.38 同族坑）；② 小文案瑕疵：判重跳过的消息前缀是「导入失败：」，语义上应该算「跳过」不算失败（低优先级，改动需重打包装机，暂不动）
   - 附带结论：**设备能直连`raw.githubusercontent.com`**（两个源都从官方原链导入），不必用 ghproxy 加速链
 - **本机 IP/仓库基址**：`192.168.2.68:8765`（**DHCP 可能变化**，变了要同步 `dist/repo.xml` 的 URL 与 pack.py 的 `LAN_BASE`）
-- **GitHub**：`jackyytche/lms-plugin-lxmusic`；PAT 由用户在需要时提供（**勿写入文件**）；撤销提醒见§一
+- **GitHub**：`jackyytche/lms-plugin-lxmusic`（公开）；PAT 由用户在需要时提供（**勿写入文件、勿提交**）；
+  本轮（2026-09-21）已用用户提供的 fine-grained PAT 推到 **v0.11.20** —— **用完请吊销该 token**（§七.1）
 - **可用的救援通道**（LMS 卡死时）：Daphile 自己的 CGI 在**`:80`**，与 LMS 无关 ⇒`http://192.168.2.111/cgi-bin/Settings?ACTION=restart` 重启整机；`/cgi-bin/Info?ACTION=shutdown|pmsuspend` 同理。**没有 SSH**（未配置），所以卡死时这是唯一手段
 - **订阅源样本**：`refs/samples/lx-6.js`（= `lx-music-source-v6-fixed.js` = `lx-latest.js`，4094 B，与 pdone/lx-music-source 官方 `lx/6.js` 逐字节一致；`dist/lx-6.js` 是给设备做 URL 导入测试的 LAN 副本）
 - **本地工具**：python 3.14（`pack.py`、诊断/验收脚本）、node 24（`tmp/shim-sim`）、达菲诊断脚本复用喜马拉雅项目 `m0/diag_plugin_install.py`（装机/重启）与 `diag_settings_form.py`（改日志级别等整表回放）
