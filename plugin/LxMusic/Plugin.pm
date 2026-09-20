@@ -69,6 +69,11 @@ sub initPlugin {
 		verifyUrl      => 1,     # 取链后 HEAD 校验可播（挡掉 403/HTML 错误页 = 防"无声"）
 		# ---- M0.7 ----
 		autoSkipOnError => 1,    # 全源失败后交给 LMS 跳下一曲（对齐 PC player.autoSkipOnError）
+		# ---- M0.10 常驻 worker ----
+		workerEnable   => 1,     # 常驻 qjs worker（取链/校验复用同一进程，省掉每请求的进程启动与源解析）
+		workerIdle     => 600,   # worker 空闲多久退出（秒；0 = 不退常驻）
+		# ---- M0.10 播放兼容 ----
+		preferStreamable => 1,   # 优先选带音频后缀的直链（无后缀脚本中转链在达菲上会无声/卡死）
 	});
 
 	unless (Plugins::LxMusic::Helper->init) {
@@ -1302,6 +1307,16 @@ sub _webPreview {
 			my ($res) = @_;
 			my $elapsed = sprintf('%.2f', time() - $started);
 			my $title = encode_entities(($track->{name} || '?') . ($track->{singer} ? ' - ' . $track->{singer} : ''));
+			# 每次候选尝试的耗时拆解（ms=宿主墙钟, handler=源内耗时, verify=HEAD 校验, path=worker/fork）
+			my $tries = join('; ', map {
+				my $t = ($_->{source} // '?') . '@' . ($_->{quality} // '?') . ': ' . ($_->{why} // 'ok');
+				$t .= sprintf(' %dms', $_->{ms}) if defined $_->{ms};
+				$t .= sprintf('(handler %dms)', $_->{handler}) if defined $_->{handler};
+				$t .= sprintf('(verify %dms)', $_->{verify}) if defined $_->{verify};
+				$t .= ' friendly=0' if $_->{ok} && defined $_->{friendly} && !$_->{friendly};
+				$t .= ' [' . $_->{path} . ']' if $_->{path};
+				encode_entities($t);
+			} @{ $res->{tries} || [] });
 			my $html;
 			if ($res->{ok} && $res->{url}) {
 				my $u = encode_entities($res->{url});
@@ -1310,14 +1325,12 @@ sub _webPreview {
 					. ($res->{verified} ? ' verified' : '')
 					. ($res->{suspect} ? ' ⚠ 码率异常低，疑似试听片段' : '')));
 				$html = '<div class="msg">OK (' . $elapsed . 's) ' . $title . ' — ' . $via
+					. ($tries ? "<br><b>tries:</b> " . $tries : '')
 					. '</div><p><audio controls src="' . $u . '" style="width:100%"></audio></p>'
 					. '<p><a href="' . $u . '">direct link</a> · <a href="?q=' . encode_entities($params->{q} || $track->{name} || '') . '">back to search</a></p>';
 			}
 			else {
 				my $logs = join("\n", map { encode_entities($_) } @{ $res->{logs} || [] });
-				my $tries = join('; ', map {
-					encode_entities(($_->{source} // '?') . '@' . ($_->{quality} // '?') . ': ' . ($_->{why} // 'ok'))
-				} @{ $res->{tries} || [] });
 				$html = '<div class="msg">FAIL (' . $elapsed . 's) ' . $title . ': '
 					. encode_entities($res->{error} || 'unknown')
 					. ($tries ? "<br><b>tries:</b> " . $tries : '')

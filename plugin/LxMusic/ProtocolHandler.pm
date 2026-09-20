@@ -40,6 +40,13 @@ sub isRemote { 1 }
 
 sub getNextTrack {
 	my ($class, $song, $successCb, $errorCb) = @_;
+	# 诊断（info 级，默认 ERROR 级别下不刷屏）：播放阶段 Song 对象上 streamUrl 是否还在
+	if ($log->is_info) {
+		my $su = (blessed($song) && $song->can('streamUrl')) ? $song->streamUrl : undef;
+		my $u  = (blessed($song) && $song->can('url')) ? $song->url : '?';
+		$log->info('LxMusic: getNextTrack song=' . $u . ' streamUrl='
+			. (defined $su && length $su ? substr($su, 0, 90) : '<undef>'));
+	}
 	$successCb->();
 }
 
@@ -112,7 +119,7 @@ sub parseUrl {
 }
 
 # ---------- 解析缓存（0.5.1）：同一 lxm:// 在 TTL 内直接命中，零 fork ----------
-my %RESOLVE_CACHE;      # url => { direct => 'http...', expires => epoch }
+my %RESOLVE_CACHE;      # url => { direct => 'http...', fmt => 'mp3'|'flc'|..., expires => epoch }
 my $prefs = preferences('plugin.lxmusic');   # 设置页可调（resolveTtl）
 
 # 直链有 CDN 签名时效；TTL 由设置页控制（默认 600s）
@@ -134,22 +141,23 @@ sub _cache_get {
 }
 
 sub _cache_put {
-	my ($url, $direct) = @_;
+	my ($url, $direct, $fmt) = @_;
 	return unless $url && $direct;
 	%RESOLVE_CACHE = () if keys %RESOLVE_CACHE > $MAX_CACHE;
-	$RESOLVE_CACHE{$url} = { direct => $direct, expires => time() + _resolveTtl() };
+	$RESOLVE_CACHE{$url} = { direct => $direct, fmt => $fmt, expires => time() + _resolveTtl() };
 	return 1;
 }
 
+
 # 解析收尾（快慢路径共用）：元数据 + 客户端刷新信号 + 流地址替换
 sub _finish_resolve {
-	my ($class, $song, $url, $info, $direct, $args, $cb) = @_;
+	my ($class, $song, $url, $info, $direct, $args, $cb, $fmt) = @_;
 
 	my $qLabel = $class->qualityLabel($info->{type});
 	my %meta = (ct => ($qLabel =~ /FLAC/i ? 'audio/flac' : 'audio/mpeg'), type => $qLabel);
 	$meta{title} = $info->{name} if $info->{name};
 	Slim::Music::Info::setRemoteMetadata($url, \%meta);
-	$class->cache_metadata($url, { title => $info->{name}, quality => $qLabel });
+	$class->cache_metadata($url, { title => $info->{name}, quality => $qLabel, format => $fmt });
 
 	# 封面：队列/正在播放也要有图（tx/wy/mg 直取，kg 推导，kw 异步 getPic）
 	eval { $class->_publish_cover($url, $info->{src}, $info->{music}) };
@@ -164,6 +172,9 @@ sub _finish_resolve {
 	}
 
 	$song->streamUrl($direct) if blessed($song) && $song->can('streamUrl');
+	if ($log->is_info) {
+		$log->info('LxMusic: resolved ' . substr($url, 0, 40) . ' -> ' . substr($direct, 0, 80));
+	}
 	$args->{cb} = sub {
 		my ($track) = @_;
 		if ($track && $info->{name}) {
@@ -379,7 +390,7 @@ sub scanUrl {
 	# 同步快路：命中缓存直接交父类，省掉 qjs fork + 上游请求（桌面版级别的瞬时起播）
 	if (my $cached = _cache_get($url)) {
 		$log->info('LxMusic: resolve cache HIT (' . ($info->{name} || '') . ')');
-		$class->_finish_resolve($song, $url, $info, $cached->{direct}, $args, $cb);
+		$class->_finish_resolve($song, $url, $info, $cached->{direct}, $args, $cb, $cached->{fmt});
 		$class->_prefetch_next($song, $url);
 		return;
 	}
@@ -406,10 +417,11 @@ sub scanUrl {
 			}
 
 			my $direct = $res->{url};
-			$log->info(sprintf('LxMusic: resolved via [%s] type=%s verified=%s%s',
+			$log->info(sprintf('LxMusic: resolved via [%s] type=%s verified=%s%s fmt=%s',
 				$res->{source} // '?', $res->{quality} // '?', $res->{verified} ? 1 : 0,
-				(defined $res->{actualKbps} ? " ~$res->{actualKbps}kbps" : '')));
-			_cache_put($url, $direct);
+				(defined $res->{actualKbps} ? " ~$res->{actualKbps}kbps" : ''),
+				$res->{format} // '<undef>'));
+			_cache_put($url, $direct, $res->{format});
 
 			# 实际档位/码率如实进队列元数据（PC 端拿不到这个信息，我们靠 HEAD 反推）
 			$class->cache_metadata($url, {
@@ -417,10 +429,11 @@ sub scanUrl {
 				source    => $res->{source},
 				quality   => $res->{quality},
 				kbps      => $res->{actualKbps},
+				format    => $res->{format},
 			});
 
 			# 直链是实际流地址；playlist 里保持稳定的 lxm:// URL
-			$class->_finish_resolve($song, $url, $info, $direct, $args, $cb);
+			$class->_finish_resolve($song, $url, $info, $direct, $args, $cb, $res->{format});
 			$class->_prefetch_next($song, $url);
 			return;
 		},
@@ -433,6 +446,10 @@ sub scanUrl {
 sub new {
 	my ($class, $args) = @_;
 	$args->{url} = $args->{song}->streamUrl unless $args->{redir};
+	if ($log->is_info) {
+		my $u = (defined $args->{url} && length $args->{url}) ? substr($args->{url}, 0, 90) : '<undef>';
+		$log->info('LxMusic: player open -> ' . $u);
+	}
 	return $class->SUPER::new($args);
 }
 

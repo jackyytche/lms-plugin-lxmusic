@@ -519,28 +519,23 @@ async function main(std, os) {
 	}
 	const [sourcePath, action, infoJson] = args;
 
-	// ---------- probe 模式：直链可播性探测（M0.6"取链后校验"）----------
-	// qjs shim.mjs <任意存在的文件> probe {"url":"...","timeout":8}
-	//   → RESULT { ok, data:{ status, method, type, length, range, acceptRanges } }
-	// 先 HEAD；CDN 不允许 HEAD（403/405）时退 Range 0-0（只传 1 字节）。
-	// 目的：把 403/HTML 错误页挡在播放器之外——那是"选了 flac 却无声"的常见成因。
-	if (action === 'probe') {
-		let payload = {};
-		try { payload = JSON.parse(infoJson || '{}') || {} } catch (e) {}
-		if (payload && payload.info && typeof payload.info === 'object') payload = payload.info;
+	// probe 的实体实现（单次进程与探测 worker 共用）：返回结果对象，不打印不退出
+	// M0.10：从"只发 HEAD"升级为"取前 2KB 实体 + 嗅探音频魔数"。
+	// 起因（现场）：长青音源的直链 http://yinyue.haitangw.net/kw/kw.php?... 对 HEAD 回 200，
+	// 但真去 GET 时既不出声也不报错——LMS 队列显示 mode=play 而位置永远停在 0 秒（"选了 flac 却没声"）。
+	// 只校验状态码/Content-Type 挡不住这种"HEAD 说好、GET 是空壳/错误页"的直链。
+	function probeOnce(payload) {
 		const url = String(payload.url || '');
-		if (!/^https?:\/\//i.test(url)) {
-			print('RESULT ' + JSON.stringify({ ok: false, error: 'probe: bad url' }));
-			std.exit(1);
-		}
+		if (!/^https?:\/\//i.test(url)) return { ok: false, error: 'probe: bad url' };
 		const tmo = Math.max(3, Math.min(20, Number(payload.timeout) || 8));
 		const base = ((os.getenv && os.getenv('LX_TMP')) || '/tmp') + '/lxp_' + Date.now() + '_' + Math.floor(Math.random() * 1e6);
 		const hdrF = base + '.hdr';
+		const bodyF = base + '.bin';
 		const run = (extra) => {
 			// 必须 -L 跟随重定向：真实播放链路会跟随（binHttp 也是手动跟 3 跳），
 			// 不跟随就会把 301/302 误判成不可播（0.8.5 现场：长青音源的直链是 301，被误杀）
 			const a = ['curl', '-sS', '-L', '--max-redirs', '3', '--max-time', String(tmo),
-				'-o', '/dev/null', '-D', hdrF, '-A', 'Mozilla/5.0'];
+				'-A', 'Mozilla/5.0', '-D', hdrF, '-o', bodyF, '--max-filesize', '400000'];
 			for (const x of extra) a.push(x);
 			a.push(url);
 			try { os.exec(a, { block: true }); } catch (e) {}
@@ -552,14 +547,37 @@ async function main(std, os) {
 			try { os.remove(hdrF); } catch (e) {}
 			return text;
 		};
-		let text = run(['-I']);
-		let method = 'HEAD';
+		const readBody = (max) => {
+			const bytes = [];
+			try {
+				const f = std.open(bodyF, 'r');
+				if (f) {
+					for (;;) {
+						const b = f.getByte();
+						if (b < 0) break;
+						bytes.push(b);
+						if (bytes.length >= max) break;
+					}
+					f.close();
+				}
+			} catch (e) {}
+			return bytes;
+		};
+		// 先 Range GET 取实体头（服务器不支持 Range 会给 200 + 全量；--max-filesize 让 curl 早停）
+		let bytes = [];
+		let text = run(['-r', '0-2047']);
+		let method = 'RANGE';
 		let m = text.match(/^HTTP\/[\d.]+\s+(\d{3})/m);
 		if (!m || Number(m[1]) >= 400) {
-			text = run(['-r', '0-0']);
-			method = 'RANGE';
+			bytes = [];
+			text = run(['-I']);
+			method = 'HEAD';
 			m = text.match(/^HTTP\/[\d.]+\s+(\d{3})/m);
 		}
+		else {
+			bytes = readBody(2048);
+		}
+		try { os.remove(bodyF); } catch (e) {}
 		// -L 会保留中间跳的响应头块：只看最后一个块（否则会读到 301 而不是最终 200）
 		const blocks = text.split(/\r?\n\r?\n/).filter(b => /^HTTP\//m.test(b));
 		const final = blocks.length ? blocks[blocks.length - 1] : text;
@@ -569,18 +587,81 @@ async function main(std, os) {
 		};
 		m = final.match(/^HTTP\/[\d.]+\s+(\d{3})/m);
 		const status = m ? Number(m[1]) : 0;
+		// ---- 音频魔数嗅探（取到的前 2KB 里认头）----
+		const hx = (i) => (bytes[i] || 0).toString(16).padStart(2, '0');
+		let magic = '';
+		const tag = (s) => bytes.slice(0, s.length).map(c => String.fromCharCode(c)).join('') === s;
+		if (tag('ID3')) magic = 'mp3';
+		else if (tag('fLaC')) magic = 'flac';
+		else if (tag('OggS')) magic = 'ogg';
+		else if (tag('RIFF')) magic = 'wav';
+		else if (tag('MAC ')) magic = 'ape';
+		else if (bytes.length > 11 && String.fromCharCode.apply(null, bytes.slice(4, 8)) === 'ftyp') magic = 'm4a';
+		else if (bytes.length > 1 && bytes[0] === 0xff && (bytes[1] & 0xe0) === 0xe0) magic = 'mp3';
+		else if (bytes.length > 3 && bytes[0] === 0x1a && bytes[1] === 0x45 && bytes[2] === 0xdf && bytes[3] === 0xa3) magic = 'mkv';
+		const head = bytes.slice(0, 32).map(c => (c >= 32 && c < 127) ? String.fromCharCode(c) : '.').join('');
+		const looksHtml = /^\s*(<!doctype|<html|<\?xml|\{|\[)/i.test(head);
 		const out = {
 			status, method,
 			type: hdr('content-type'),
 			length: Number(hdr('content-length')) || 0,
 			range: hdr('content-range'),
 			acceptRanges: hdr('accept-ranges'),
+			bytes: bytes.length,
+			magic,
+			head: head,
 		};
-		const ok = status >= 200 && status < 300;
-		print('LOG probe ' + JSON.stringify(out));
-		print('RESULT ' + JSON.stringify({ ok, data: out, error: ok ? undefined : (status ? 'HTTP ' + status : 'no response') }));
+		const typeAudio = /^(?:audio\/|video\/|application\/(?:octet-stream|x-|ogg|flac|mp4))/i.test(out.type || '');
+		const bad = status < 200 || status >= 300
+			|| (bytes.length && (looksHtml || magic === 'mkv' && false));
+		// 判定：状态码 OK + （认得出音频魔数 或 至少不是 HTML/空壳且声明的类型像音频）
+		const ok = !bad && (!!magic || (bytes.length > 0 && !looksHtml && typeAudio));
+		print('LOG probe ' + JSON.stringify(out) + ' ok=' + (ok ? 1 : 0));
+		const why = !ok ? ((status >= 200 && status < 300)
+			? ('not playable: ' + (looksHtml ? 'HTML body' : (bytes.length ? ('bytes=' + bytes.length + ' magic=<none>') : 'empty body')))
+			: (status ? 'HTTP ' + status : 'no response')) : undefined;
+		return { ok, data: out, error: why };
+	}
+
+
+	// ---------- probe 模式：直链可播性探测（M0.6"取链后校验"）----------
+	// qjs shim.mjs <任意存在的文件> probe {"url":"...","timeout":8}
+	//   → RESULT { ok, data:{ status, method, type, length, range, acceptRanges } }
+	// 先 HEAD；CDN 不允许 HEAD（403/405）时退 Range 0-0（只传 1 字节）。
+	// 目的：把 403/HTML 错误页挡在播放器之外——那是"选了 flac 却无声"的常见成因。
+	if (action === 'probe') {
+		let payload = {};
+		try { payload = JSON.parse(infoJson || '{}') || {} } catch (e) {}
+		if (payload && payload.info && typeof payload.info === 'object') payload = payload.info;
+		const r = probeOnce(payload);
+		print('RESULT ' + JSON.stringify(r));
 		std.out.flush();
-		std.exit(ok ? 0 : 1);
+		std.exit(r.ok ? 0 : 1);
+	}
+
+	// ---------- 探测 worker（M0.10）：argv[1] = '-' ⇒ 不加载任何订阅源 ----------
+	// 校验探测（每次取链一条 HEAD）原本要现起一个 qjs 进程（~0.3s 里绝大部分是进程+脚本解析）。
+	// 单独一个"不加载源"的常驻进程服务 probe：与取链 worker 分开，长探测不会卡住取链。
+	if (action === 'serve' && sourcePath === '-') {
+		print('READY ' + JSON.stringify({ name: 'probe', version: '' }));
+		std.out.flush();
+		for (;;) {
+			const line = std.in.getline();
+			if (line === null || line === undefined) break;
+			const t = String(line).trim();
+			if (!t) continue;
+			let req;
+			try { req = JSON.parse(t); }
+			catch (e) { print('RESULT 0 ' + JSON.stringify({ ok: false, error: 'bad request json' })); continue; }
+			const id = req.id != null ? req.id : 0;
+			const t0 = Date.now();
+			let r;
+			try { r = probeOnce(req.info || {}); } catch (e) { r = { ok: false, error: String((e && e.message) || e) }; }
+			r.ms = Date.now() - t0;
+			print('RESULT ' + id + ' ' + JSON.stringify(r));
+		}
+		print('LOG probe worker: stdin closed, exiting');
+		std.exit(0);
 	}
 
 	// ---------- SDK 模式（vendored musicSdk，无需订阅源） ----------
@@ -895,70 +976,93 @@ async function main(std, os) {
 
 	print('LOG h0 calling handler, action=' + action
 		+ ' args=' + JSON.stringify({ source, action, info: infoArg }).slice(0, 300));
-	let ret;
-	try {
-		ret = handlers[EVENT_NAMES.request]({ source, action, info: infoArg });
-	} catch (e) {
-		// 把源自己的 **堆栈** 一并吐出：`not a function` 这类错误只有栈能定位到源的第几行
-		// （M0.9：ikun 等源调用了宿主未实现的成员，仅凭 message 无法定位）
-		const stk = String((e && e.stack) || '').replace(/\s+/g, ' ').slice(0, 500);
-		print('LOG handler throw stack: ' + stk);
-		print('RESULT ' + JSON.stringify({
-			ok: false,
-			error: 'handler sync throw: ' + String((e && e.message) || e),
-			stack: stk,
-		}));
-		std.exit(1);
+	// ---------- 请求执行器（单次 fork 与常驻 worker 共用）----------
+	async function callHandler(act, argInfo, srcName) {
+		const h = handlers[EVENT_NAMES.request];
+		if (typeof h !== 'function') throw new Error('source did not register request handler');
+		print('LOG h0 calling handler, action=' + act
+			+ ' args=' + JSON.stringify({ source: srcName || '', action: act, info: argInfo }).slice(0, 300));
+		let done = false, val, err;
+		try {
+			const ret = h({ source: srcName || '', action: act, info: argInfo });
+			print('LOG h1 ret=' + (ret && ret.then ? 'promise' : typeof ret) + ' fnParams=' + h.length);
+			Promise.resolve(ret).then(x => { val = x; done = true; }, e => { err = e; done = true; });
+		} catch (e) {
+			// 同步抛：把源自己的堆栈带出来（"not a function" 只有栈能定位到源的第几行）
+			const stk = String((e && e.stack) || '').replace(/\s+/g, ' ').slice(0, 500);
+			print('LOG handler throw stack: ' + stk);
+			const ne = new Error('handler sync throw: ' + String((e && e.message) || e));
+			ne.lxStack = stk;
+			throw ne;
+		}
+		// 看门狗：promise 不 settle 时显式报错（不能让宿主静默退出）
+		let wd = 0;
+		while (!done && wd < 3000) {
+			wd++;
+			const batch = __timers.splice(0, __timers.length);
+			for (const t of batch) {
+				try { t.fn.apply(null, t.args); }
+				catch (e) { print('LOG timer ERR: ' + String((e && e.message) || e)); }
+			}
+			if (wd % 200 === 0) print('LOG watchdog: rounds=' + wd + ' pendingTimers=' + __timers.length);
+			await null;
+		}
+		if (!done) {
+			throw new Error('source handler promise never settled (watchdog ' + wd + ' rounds, pendingTimers='
+				+ __timers.length + '; source awaits something that never resolves)');
+		}
+		if (err) throw err;
+		print('LOG t1 type=' + typeof val + ' keys=' + (val && typeof val === 'object' ? Object.keys(val).join(',') : '-'));
+		return val;
 	}
-	const fn = handlers[EVENT_NAMES.request];
-	print('LOG h1 ret=' + (ret && ret.then ? 'promise' : typeof ret)
-		+ ' fnCtor=' + (fn.constructor && fn.constructor.name) + ' fnParams=' + fn.length
-		+ ' thenPresent=' + !!(ret && typeof ret.then === 'function'));
 
-	// ---------- 看门狗：源的 promise 若不 settle，宿主会"静默退出"（父进程只看到 no RESULT line）----------
-	// 这里在 armed 之后继续泵定时器/微任务；到上限仍未 settle 就显式报错，并带上轮数/待处理定时器数。
-	let settled = false;
-	Promise.resolve(ret).then(r => {
-		settled = true;
-		print('LOG t1 type=' + typeof r);
-		print('LOG t2 keys=' + (r ? Object.keys(r).join(',') : 'null'));
-		const s = JSON.stringify({ ok: true, data: r == null ? null : r });
-		print('LOG t3 stringify len=' + s.length);
-		print('RESULT ' + s);
-		print('LOG t4 before flush');
+	function fmtErr(e) {
+		const o = { ok: false, error: String((e && e.message) || e) };
+		const stk = (e && e.lxStack) || String((e && e.stack) || '').replace(/\s+/g, ' ').slice(0, 400);
+		if (stk) o.stack = stk;
+		return JSON.stringify(o);
+	}
+
+	// ---------- 常驻 worker（M0.10）：源脚本加载 + 初始化只付一次，之后按行协议处理请求 ----------
+	// stdin 一行 = {"id":N,"action":"musicUrl","source":"kw","info":{...}}
+	// stdout 一行 = READY {...} | RESULT <id> {json} | LOG ...
+	if (action === 'serve') {
+		const info0 = globalThis.lx.currentScriptInfo || {};
+		print('READY ' + JSON.stringify({ name: info0.name || '', version: info0.version || '' }));
 		std.out.flush();
-		print('LOG t5 flushed, exiting');
+		for (;;) {
+			const line = std.in.getline();
+			if (line === null || line === undefined) break;      // stdin 关闭 → 退出
+			const t = String(line).trim();
+			if (!t) continue;
+			let req;
+			try { req = JSON.parse(t); }
+			catch (e) { print('RESULT 0 ' + JSON.stringify({ ok: false, error: 'bad request json' })); continue; }
+			const id = req.id != null ? req.id : 0;
+			const act = req.action || 'musicUrl';
+			const t0 = Date.now();
+			try {
+				const r = await callHandler(act, req.info || {}, req.source || '');
+				print('RESULT ' + id + ' ' + JSON.stringify({ ok: true, data: r == null ? null : r, ms: Date.now() - t0 }));
+			}
+			catch (e) {
+				const o = JSON.parse(fmtErr(e));
+				o.ms = Date.now() - t0;
+				print('RESULT ' + id + ' ' + JSON.stringify(o));
+			}
+		}
+		print('LOG serve: stdin closed, exiting');
 		std.exit(0);
-	}).catch(e => {
-		settled = true;
-		print('RESULT ' + JSON.stringify({ ok: false, error: String((e && e.message) || e) }));
-		std.out.flush();
-		std.exit(1);
-	});
-	print('LOG h3 promise chain armed, entering job loop');
+	}
 
-	let wd = 0;
-	while (!settled && wd < 3000) {
-		wd++;
-		const batch = __timers.splice(0, __timers.length);
-		for (const t of batch) {
-			try { t.fn.apply(null, t.args); }
-			catch (e) { print('LOG timer ERR: ' + String((e && e.message) || e)); }
-		}
-		if (wd % 200 === 0) {
-			print('LOG watchdog: rounds=' + wd + ' pendingTimers=' + __timers.length + ' settled=' + settled);
-		}
-		await null;
+	// ---------- 单次模式（fork 每请求一进程）：与 serve 等价的执行流程，跑完即退 ----------
+	try {
+		const r = await callHandler(action, infoArg, source);
+		print('RESULT ' + JSON.stringify({ ok: true, data: r == null ? null : r }));
 	}
-	if (!settled) {
-		// 典型成因：源 await 了一个永不 resolve 的 Promise（内部 HTTP 没回调、或吞掉了异常）。
-		// pendingTimers=0 说明它连定时器都没挂——纯等外部事件，宿主侧已无能为力，必须显式报错。
-		print('RESULT ' + JSON.stringify({
-			ok: false,
-			error: 'source handler promise never settled (watchdog ' + wd + ' rounds, pendingTimers='
-				+ __timers.length + '; source awaits something that never resolves)',
-		}));
-		std.out.flush();
-		std.exit(2);
+	catch (e) {
+		print('RESULT ' + fmtErr(e));
 	}
+	std.out.flush();
+	std.exit(0);
 }

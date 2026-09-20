@@ -23,11 +23,13 @@ use warnings;
 
 use Config ();
 use Encode ();
+use Fcntl qw(F_GETFL F_SETFL O_NONBLOCK);
 use File::Copy qw(copy);
 use File::Path qw(mkpath rmtree);
 use File::Spec;
 use JSON::XS ();
 use POSIX ();
+use Time::HiRes ();
 
 use Slim::Utils::Log;
 use Slim::Utils::Prefs;
@@ -48,6 +50,11 @@ my $JSON = JSON::XS->new->utf8->allow_nonref;
 
 my %JOBS;    # pid => job
 my @WAITQ;   # 超出并发闸的请求闭包队列（FIFO）
+
+# 常驻 worker 状态（声明必须在最前：shutdown 定义在 worker 段之前，词法变量不会向后可见）
+my %WORKER;  # key => { pid, rd, wr, buf, ready, queue=>[], jobs=>{}, last, recent=>[], info, src, key }
+my $WID = 0; # worker 请求自增 id（源内唯一即可）
+my $PROBE_KEY = '__probe';   # 探测专用 worker（argv[1]='-'，shim 不加载任何订阅源）
 
 # 并发上限改由设置页控制（每次判定读 prefs，改完立即生效）
 sub _maxChildren {
@@ -140,6 +147,36 @@ sub _secsOf {
 	return $s > 0 ? $s : undef;
 }
 
+# 魔数/后缀 -> LMS 内部格式名（注意 LMS 用 flc 表示 flac、mp4 表示 m4a，见 types.conf）
+my %LMS_FORMAT = (
+	mp3 => 'mp3', flac => 'flc', fla => 'flc', ogg => 'ogg', oga => 'ogg',
+	m4a => 'mp4', mp4 => 'mp4', m4b => 'mp4', wav => 'wav', ape => 'ape', aac => 'aac',
+);
+
+# "播放器友好"直链：末段带音频后缀（.mp3/.flac/...）。达菲现场实测：
+#   - 带后缀（如 kuwo 的 .../xxx.mp3）→ LMS 代理/转码链路正常，播放位置正常前进；
+#   - 不带后缀的脚本中转链（如 yinyue.haitangw.net/kw/kw.php?type=mp3&id=...&level=exhigh）
+#     → LMS 判不出代理流格式（contentType=unk），要么静默无声（位置停在 0 秒），
+#       要么在补上 formatOverride 后直接把主循环卡死（2026-09-21 两次实测，需重启达菲）。
+# 所以默认优先挑带后缀的直链，把中转链留作兜底（pref preferStreamable 可关）。
+sub streamFriendly {
+	my ($class, $url) = @_;
+	return 0 unless defined $url && length $url;
+	return $url =~ m%\.(?:mp3|mp2|flac|fla|m4a|mp4|m4b|ogg|oga|opus|wav|ape|aac|wma)(?:[?#].*)?$%i ? 1 : 0;
+}
+
+# 判定取链结果的真实格式（给 LMS 的 formatOverride 用）：
+# 优先用探测嗅探到的魔数，其次看直链后缀，都不知道就返回 undef（让 LMS 自己判断）。
+sub lmsFormat {
+	my ($class, $magic, $url) = @_;
+	return $LMS_FORMAT{$magic} if $magic && $LMS_FORMAT{$magic};
+	if (defined $url && $url =~ m%\.([A-Za-z0-9]{2,4})(?:[?#].*)?$%) {
+		my $e = lc $1;
+		return $LMS_FORMAT{$e} if $LMS_FORMAT{$e};
+	}
+	return undef;
+}
+
 # 直链可播性探测（走 shim 的 probe：curl -I，不允许 HEAD 时退 Range 0-0）
 sub probeUrl {
 	my ($class, $url, $cb) = @_;
@@ -152,17 +189,23 @@ sub probeUrl {
 			my $d    = (ref($res->{data}) eq 'HASH') ? $res->{data} : {};
 			my $code = $d->{status} || 0;
 			my $type = lc($d->{type} // '');
-			# 只要不是 text/*（HTML 错误页）就放行：CDN 常用 octet-stream / 空 type
+			my $magic = $d->{magic} // '';
+			# 判定以 shim 的实体嗅探为主（魔数认得就放行）；没有魔数时退回 Content-Type 白名单，
+			# 但 text/*（HTML 错误页）一律拒绝 —— 这类"HEAD 200 但 GET 是空壳"的直链会静默无声。
 			my $ok = $res->{ok} && $code >= 200 && $code < 300
-				&& ($type eq '' || $type =~ m{^(?:audio/|video/|application/(?:octet-stream|x-))});
+				&& ($magic ne '' || $type eq '' || $type =~ m{^(?:audio/|video/|application/(?:octet-stream|x-))});
 			$cb->({
 				ok     => $ok ? 1 : 0,
 				status => $code,
 				type   => $d->{type},
 				length => $d->{length},
 				method => $d->{method},
-				error  => $ok ? undef : ($code ? "HTTP $code" : ($res->{error} // 'no response'))
-					. ($type ne '' ? " type=$type" : ''),
+				magic  => $magic,
+				bytes  => $d->{bytes},
+				error  => $ok ? undef : (($res->{error} // ($code ? "HTTP $code" : 'no response'))
+					. ($type ne '' ? " type=$type" : '')
+					. ($magic ne '' ? " magic=$magic" : '')
+					. (defined $d->{bytes} ? " bytes=$d->{bytes}" : '')),
 			});
 		},
 	);
@@ -194,10 +237,76 @@ sub resolveTrack {
 	}
 
 	my @tries;
+	my @deferred;          # 能取到、但不"播放器友好"的候选（无音频后缀的脚本中转链）
+	my $preferFriendly = defined $a{preferFriendly} ? $a{preferFriendly} : _pref('preferStreamable', 1);
 	my $next;
+
+	# 交付一个候选（写 tries + 回调）；$friendly 标记是否播放器友好
+	my $finish = sub {
+		my ($src, $q, $url, $tm, $friendly, $verified, $kbps, $magic) = @_;
+		my $suspect = ($kbps && $kbps < 64) ? 1 : 0;
+		if ($suspect) {
+			$log->warn("LxMusic resolve: SUSPECT short/preview file ([" . ($src->{name} // '?')
+				. "] type=$q -> ~${kbps}kbps) — 可能是试听片段或残缺文件");
+		}
+		my $fmt = $class->lmsFormat($magic, $url);
+		push @tries, { source => $src->{name}, quality => $q, ok => 1, verified => $verified,
+			kbps => $kbps, suspect => $suspect, magic => $magic, format => $fmt,
+			friendly => $friendly, %$tm };
+		$log->warn("LxMusic resolve OK: [" . $src->{name} . "] type=$q verified=$verified"
+			. (defined $kbps ? " ~${kbps}kbps" : '') . ($suspect ? ' (SUSPECT)' : '')
+			. " total=" . ($tm->{ms} // '?') . 'ms path=' . ($tm->{path} // '?')
+			. (defined $tm->{handler} ? " handler=$tm->{handler}ms" : '')
+			. ' friendly=' . $friendly
+			. ' url=' . substr($url, 0, 90));
+		$cb->({
+			ok         => 1,
+			url        => $url,
+			source     => $src->{name},
+			sourceId   => $src->{id},
+			quality    => $q,
+			verified   => $verified,
+			actualKbps => $kbps,
+			suspect    => $suspect,
+			magic      => $magic,
+			format     => $fmt,
+			friendly   => $friendly,
+			tries      => \@tries,
+		});
+		return;
+	};
+
+	# 校验后交付（verifyUrl 关掉则直接交付）
+	my $verifyThenFinish = sub {
+		my ($src, $q, $url, $tm, $friendly) = @_;
+		return $finish->($src, $q, $url, $tm, $friendly, 0, undef, undef) unless $wantVerify;
+		my $tv = Time::HiRes::time();
+		$class->probeUrl($url, sub {
+			my ($pi) = @_;
+			$tm->{verify} = int((Time::HiRes::time() - $tv) * 1000 + 0.5);
+			$tm->{ms} = ($tm->{ms} || 0) + $tm->{verify};   # 总耗时 = 取链 + 校验
+			if ($pi->{ok}) {
+				my $secs = _secsOf($track);
+				my $kbps = ($pi->{length} && $secs) ? int($pi->{length} * 8 / 1000 / $secs) : undef;
+				return $finish->($src, $q, $url, $tm, $friendly, 1, $kbps, $pi->{magic});
+			}
+			push @tries, { source => $src->{name}, quality => $q, why => 'verify: ' . ($pi->{error} // '?'), %$tm };
+			$log->warn("LxMusic resolve: verify rejected [" . $src->{name} . "] $q: " . ($pi->{error} // '?'));
+			$next->();
+		});
+		return;
+	};
+
 	$next = sub {
 		my $cand = shift @cand;
 		unless ($cand) {
+			# 没有"播放器友好"的直链 ⇒ 退而求其次，用兜底的中转链（先校验一次再交付）
+			if (@deferred) {
+				my $d = shift @deferred;
+				$log->warn('LxMusic resolve: 没有"播放器友好"直链，改用兜底中转链 ['
+					. ($d->{src}{name} // '?') . '] ' . substr($d->{url}, 0, 80));
+				return $verifyThenFinish->($d->{src}, $d->{q}, $d->{url}, $d->{tm}, 0);
+			}
 			my @last = @tries > 3 ? @tries[ -3 .. -1 ] : @tries;
 			my $why = join('; ', map {
 				($_->{source} // '?') . '@' . ($_->{quality} // '?') . ': ' . ($_->{why} // '?')
@@ -213,6 +322,9 @@ sub resolveTrack {
 			return $next->();
 		}
 		$log->warn("LxMusic resolve: try [" . $src->{name} . "] type=$q");
+		# 计时用 HiRes：页面上的 1.04s 级精度就靠它；这里记「宿主墙钟」与「源内 handler 耗时」
+		# 两个数（后者只有常驻 worker 能报，因为它由 shim 在源内自测）。
+		my $t0 = Time::HiRes::time();
 		$class->request(
 			source   => $path,
 			action   => 'musicUrl',
@@ -221,6 +333,9 @@ sub resolveTrack {
 			timeout  => ($a{timeout} || 20),
 			cb       => sub {
 				my ($res) = @_;
+				my $el = Time::HiRes::time() - $t0;
+				my %tm = (ms => int($el * 1000 + 0.5), path => ($res->{why} // 'fork'));
+				$tm{handler} = int($res->{ms} + 0.5) if defined $res->{ms};
 				my $url = $res->{data};
 				unless ($res->{ok} && defined $url && !ref($url) && $url =~ m{^https?://}) {
 					# 把子进程日志尾部并进 why：否则像 "no RESULT line" 这种失败在现场完全无痕
@@ -229,45 +344,20 @@ sub resolveTrack {
 					@tail = @tail[ -2 .. -1 ] if @tail > 2;
 					my $why = ($res->{error} // 'no url')
 						. (@tail ? ' {' . join(' | ', map { substr($_, 0, 100) } @tail) . '}' : '');
-					push @tries, { source => $src->{name}, quality => $q, why => $why };
+					push @tries, { source => $src->{name}, quality => $q, why => $why, %tm };
 					return $next->();
 				}
-				my $done = sub {
-					my ($verified, $kbps) = @_;
-					# 码率异常低 ⇒ 很可能是试听片段/残缺文件（实测：长青 kg flac24bit 只有 ~48kbps）
-					my $suspect = ($kbps && $kbps < 64) ? 1 : 0;
-					if ($suspect) {
-						$log->warn("LxMusic resolve: SUSPECT short/preview file ([" . ($src->{name} // '?')
-							. "] type=$q -> ~${kbps}kbps) — 可能是试听片段或残缺文件");
-					}
-					push @tries, { source => $src->{name}, quality => $q, ok => 1, verified => $verified,
-						kbps => $kbps, suspect => $suspect };
-					$log->warn("LxMusic resolve OK: [" . $src->{name} . "] type=$q verified=$verified"
-						. (defined $kbps ? " ~${kbps}kbps" : '') . ($suspect ? ' (SUSPECT)' : ''));
-					$cb->({
-						ok         => 1,
-						url        => $url,
-						source     => $src->{name},
-						sourceId   => $src->{id},
-						quality    => $q,
-						verified   => $verified,
-						actualKbps => $kbps,
-						suspect    => $suspect,
-						tries      => \@tries,
-					});
-				};
-				return $done->(0) unless $wantVerify;
-				$class->probeUrl($url, sub {
-					my ($pi) = @_;
-					if ($pi->{ok}) {
-						my $secs = _secsOf($track);
-						my $kbps = ($pi->{length} && $secs) ? int($pi->{length} * 8 / 1000 / $secs) : undef;
-						return $done->(1, $kbps);
-					}
-					push @tries, { source => $src->{name}, quality => $q, why => 'verify: ' . ($pi->{error} // '?') };
-					$log->warn("LxMusic resolve: verify rejected [" . $src->{name} . "] $q: " . ($pi->{error} // '?'));
-					$next->();
-				});
+				my $friendly = $class->streamFriendly($url) ? 1 : 0;
+				# 不友好的候选先挂起，不当场花一次 HEAD 校验：只有确实找不到友好直链时才回头用它
+				if ($preferFriendly && !$friendly) {
+					my $tmr = { %tm };
+					push @tries, { source => $src->{name}, quality => $q, ok => 1, deferred => 1,
+						friendly => 0, why => 'no audio suffix (script relay), deferred', %tm };
+					$log->warn("LxMusic resolve: [" . $src->{name} . "] $q 直链无音频后缀（脚本中转链），暂缓");
+					push @deferred, { src => $src, q => $q, url => $url, tm => $tmr, t0 => $t0 };
+					return $next->();
+				}
+				return $verifyThenFinish->($src, $q, $url, \%tm, $friendly);
 			},
 		);
 	};
@@ -392,6 +482,35 @@ sub request {
 	}
 	-f $QJS && -x _ or do { $cb->(_err('engine not initialised (call init)')); return };
 
+	my $timeout = $args{timeout} || 20;
+	$timeout = 60 if $timeout > 60;          # lx 宿主 20s 硬超时同量级，上限 60
+
+	# 常驻 worker 路径（M0.10）：只有「订阅源取链」(musicUrl) 与「可播校验」(probe) 值得常驻——
+	# 冷启动成本（起 qjs + 解析 shim/源脚本 + 源 rconfig 握手）在设备上占了每首曲子的主要固定开销。
+	# sdk 类动作（搜索、榜单）语义不同且成本占比小，继续走 fork。
+	# 返回 0 = worker 不可用（起不来/写失败/积压），落回下面的 fork 路径。
+	if (workerEnabled()) {
+		if ($action eq 'musicUrl' && $source && $source ne $SHIM && $source ne $SDK) {
+			return if $class->_worker_submit(
+				source   => $source,
+				sourceId => $args{sourceId},
+				action   => $action,
+				info     => $args{info},
+				cb       => $cb,
+				timeout  => $timeout,
+			);
+		}
+		elsif ($action eq 'probe') {
+			return if $class->_worker_submit(
+				probe   => 1,
+				action  => $action,
+				info    => $args{info},
+				cb      => $cb,
+				timeout => $timeout,
+			);
+		}
+	}
+
 	# 并发闸（M0.3）：整单 m3u 入队时 LMS 会并发解析几十个 lxm://，全 fork 会打满设备 CPU
 	# 并拖垮上游（0.4.0 现场：全部 'timeout: no RESULT line'）。排队串行放行，max 2 并发。
 	if (scalar(keys %JOBS) >= _maxChildren()) {
@@ -400,8 +519,6 @@ sub request {
 		return;
 	}
 
-	my $timeout = $args{timeout} || 20;
-	$timeout = 60 if $timeout > 60;          # lx 宿主 20s 硬超时同量级，上限 60
 	my $infoJson = eval {
 		$JSON->encode({ source => ($args{sourceId} // ''), info => ($args{info} // {}) });
 	} or do { $cb->(_err('bad info json')); return };
@@ -475,6 +592,9 @@ sub _poll {
 # ---------- shutdown ----------
 sub shutdown {
 	my ($class) = @_;
+	for my $src (keys %WORKER) {
+		$class->_worker_kill($WORKER{$src});
+	}
 	for my $pid (keys %JOBS) {
 		my $job = $JOBS{$pid};
 		Slim::Utils::Timers::killTimers($job, \&_poll);
@@ -482,6 +602,277 @@ sub shutdown {
 		_finish($job, 'shutdown');
 	}
 	rmtree($TMPDIR);
+	return 1;
+}
+
+# ---------- 常驻 qjs worker（M0.10）----------
+# 动机：每请求 fork 一个 qjs 时，冷启动要付「qjs 起进程 + shim 解析 + 源脚本解析 + 源初始化
+# （rconfig 握手等）」——设备实测 ~2.3s，而真正取链只占一小部分。常驻 worker 把这份成本
+# 摊销到进程生命周期里：初始化一次，之后每请求只走 shim 的 serve 行协议。
+#
+# 通道：POSIX 双向管道（不用 Perl 的 open(STDOUT) —— 那会死在 Log::Trapper 的 tie 上，
+# 见 §5.2.6）。父进程：写 stdin、用 Timers 轮询 sysread 读 stdout(+stderr)。
+# 协议：stdin 一行 {"id":N,"action":"musicUrl","source":"kw","info":{...}}
+#       stdout 行 READY {...} / RESULT <id> {json} / LOG ...
+# 兜底：worker 起不来、写失败、超时、进程死 —— 任一情况都 kill 掉并让该请求走原来的 fork 路径。
+sub workerEnabled { my ($class) = @_; return _pref('workerEnable', 1) ? 1 : 0 }
+
+sub workerStatus {
+	my ($class) = @_;
+	return [ map {
+		my $w = $WORKER{$_};
+		{ key => $_, src => $w->{src}, pid => $w->{pid}, ready => $w->{ready} ? 1 : 0,
+		  jobs => scalar(keys %{ $w->{jobs} }), info => ($w->{info} // '') }
+	} sort keys %WORKER ];
+}
+
+sub _worker_spawn {
+	my ($class, $key, $arg1) = @_;
+	-f $QJS && -x _ or return undef;
+	$arg1 = $key unless defined $arg1;
+	my $src = $arg1;
+	pipe(my $rd, my $wr) or do { $log->warn("LxMusic worker: pipe: $!"); return undef };
+	pipe(my $crd, my $cwr) or do { $log->warn("LxMusic worker: pipe2: $!"); return undef };
+
+	my $pid = fork();
+	if (!defined $pid) { $log->warn("LxMusic worker: fork: $!"); return undef }
+
+	if ($pid == 0) {                                  # ---- child ----
+		POSIX::dup2(fileno($crd), 0);                 # 请求来自父进程
+		POSIX::dup2(fileno($wr),  1);                 # 结果回父进程
+		POSIX::dup2(1, 2);                            # stderr 合流（LOG 行也能看到）
+		close $rd; close $wr; close $crd; close $cwr;
+		$ENV{PATH} = '/usr/bin:/bin:/usr/sbin:/sbin';
+		$ENV{LX_BRIDGE_TIMEOUT} = _bridgeTimeout();
+		chdir('/');
+		exec($QJS, $SHIM, $src, 'serve', '{}');
+		POSIX::_exit(127);
+	}
+
+	close $crd; close $wr;
+	# 非阻塞读：主循环里绝不能阻塞在管道上（阻塞 sysread 空管道 = 整个 LMS 卡死）。
+	# 若拿不到 O_NONBLOCK，宁可不启用 worker（退回 fork 路径），也不冒卡死主循环的险。
+	my $fl = eval { fcntl($rd, F_GETFL, 0) };
+	if (!defined $fl || !fcntl($rd, F_SETFL, $fl | O_NONBLOCK)) {
+		$log->warn('LxMusic worker: cannot set O_NONBLOCK on read pipe, not using worker'
+			. ' (' . ($@ || $!) . ')');
+		kill 'KILL', $pid;
+		waitpid($pid, 0);
+		close $rd; close $cwr;
+		return undef;
+	}
+	my $w = {
+		key => $key, src => $src, pid => $pid, rd => $rd, wr => $cwr, buf => '', ready => 0,
+		queue => [], jobs => {}, id => 0, last => time(), recent => [], info => '',
+	};
+	$WORKER{$key} = $w;
+	$log->warn("LxMusic worker: spawned pid=$pid for $key (argv1=$src, warming)");
+	$w->{due} = Time::HiRes::time() + 0.1;
+	Slim::Utils::Timers::setTimer($w, $w->{due}, \&_worker_poll);
+	return $w;
+}
+
+# 请求下发后把轮询"叫醒"：空闲时轮询间隔是 2s（省 CPU），但新请求不该等这个 tick
+# ——设备实测：不叫醒会白等最多 ~2s（每次取链多花 1.5s）。
+sub _worker_wake {
+	my ($class, $w, $delay) = @_;
+	$delay = 0.05 unless defined $delay;
+	if ($w->{in_poll}) { $w->{wake} = 1; return; }   # 正在 poll 里：让收尾重排用短间隔
+	my $due = Time::HiRes::time() + $delay;
+	return if $w->{due} && $w->{due} <= $due + 0.001;
+	Slim::Utils::Timers::killTimers($w, \&_worker_poll);
+	Slim::Utils::Timers::setTimer($w, $due, \&_worker_poll);
+	$w->{due} = $due;
+	return;
+}
+
+sub _worker_send {
+	my ($class, $w, $line) = @_;
+	local $SIG{PIPE} = 'IGNORE';
+	my $off = 0;
+	my $len = length $line;
+	while ($off < $len) {
+		my $n = syswrite($w->{wr}, $line, $len - $off, $off);
+		return 0 unless defined $n && $n > 0;
+		$off += $n;
+	}
+	$w->{last} = time();
+	return 1;
+}
+
+# 真正下发一个 job：超时计时从「下发」开始算（排队等待不该吃请求超时）
+sub _worker_send_job {
+	my ($class, $w, $job) = @_;
+	return 0 unless $class->_worker_send($w, $job->{line});
+	$job->{sent}     = time();
+	$job->{deadline} = $job->{sent} + $job->{timeout};
+	return 1;
+}
+
+sub _worker_fail_all {
+	my ($class, $w, $why) = @_;
+	for my $id (keys %{ $w->{jobs} }) {
+		my $job = delete $w->{jobs}{$id};
+		$job->{cb}->({ ok => 0, data => undef, error => $why, logs => $job->{logs}, alerts => [], why => 'worker' });
+	}
+	@{ $w->{queue} } = ();
+	return;
+}
+
+sub _worker_kill {
+	my ($class, $w) = @_;
+	return unless $w;
+	Slim::Utils::Timers::killTimers($w, \&_worker_poll);
+	$class->_worker_fail_all($w, 'worker stopped');
+	kill 'KILL', $w->{pid} if $w->{pid};
+	waitpid($w->{pid}, POSIX::WNOHANG()) if $w->{pid};
+	close $w->{rd}; close $w->{wr};
+	delete $WORKER{ $w->{key} };
+	return;
+}
+
+sub _worker_poll {
+	my ($w) = @_;
+	my $src = $w->{src};
+	return if $w->{dead};
+	local $w->{in_poll} = 1;    # 作用域退出自动复位（含各 return 分支）
+
+	my $alive = kill(0, $w->{pid}) ? 1 : 0;
+	if (!$alive) {
+		$log->warn("LxMusic worker($src): process gone");
+		$w->{dead} = 1;
+		Plugins::LxMusic::Helper->_worker_fail_all($w, 'worker process gone');
+		Plugins::LxMusic::Helper->_worker_kill($w);
+		return;
+	}
+
+	while (1) {
+		my $n = sysread($w->{rd}, my $chunk, 65536);
+		last unless defined $n && $n > 0;
+		$w->{buf} .= $chunk;
+	}
+
+	while ($w->{buf} =~ s/^([^\n]*)\n//) {
+		my $line = $1;
+		$line =~ s/\r$//;
+		next unless length $line;
+		$w->{last} = time();
+
+		if ($line =~ /^READY (.*)$/) {
+			$w->{ready} = 1;
+			$w->{info} = $1;
+			$log->warn("LxMusic worker($src): READY $1 (warm)");
+			while (defined(my $qid = shift @{ $w->{queue} })) {
+				my $qjob = $w->{jobs}{$qid} or next;
+				last unless Plugins::LxMusic::Helper->_worker_send_job($w, $qjob);
+			}
+			next;
+		}
+		if ($line =~ /^RESULT (\d+) (.*)$/s) {
+			my ($id, $json) = ($1, $2);
+			my $job = delete $w->{jobs}{$id};
+			next unless $job;
+			my $dec = eval { $JSON->decode($json) };
+			my ($ok, $data, $err);
+			if ($dec && ref $dec) {
+				if ($dec->{ok}) { $ok = 1; $data = $dec->{data} }
+				else {
+					$ok  = 0;
+					$err = ($dec->{error} // 'worker error')
+						. ((defined $dec->{stack} && length $dec->{stack}) ? ' || ' . $dec->{stack} : '');
+				}
+			}
+			else { $err = 'bad worker RESULT json' }
+			$log->warn(sprintf('LxMusic worker(%s): job %s done ok=%d%s', $src, $id, $ok ? 1 : 0,
+				(defined $dec->{ms} ? " ms=$dec->{ms}" : '')));
+			$job->{cb}->({
+				ok => $ok ? 1 : 0, data => $data, error => $err,
+				logs => [ @{ $w->{recent} }, @{ $job->{logs} || [] } ], alerts => [], why => 'worker',
+				ms => $dec->{ms},
+			});
+			next;
+		}
+		if ($line =~ /^LOG (.*)$/s) {
+			push @{ $w->{recent} }, substr($1, 0, 200);
+			shift @{ $w->{recent} } while @{ $w->{recent} } > 20;
+			next;
+		}
+		push @{ $w->{recent} }, substr($line, 0, 200);
+		shift @{ $w->{recent} } while @{ $w->{recent} } > 20;
+	}
+
+	# 请求超时：worker 可能卡在源的上游；杀进程让后续请求重新起（并回一个明确错误）
+	# 只算已下发的 job——排队等 worker 冷启动的 job 不该吃请求超时
+	my $now = time();
+	for my $id (keys %{ $w->{jobs} }) {
+		my $job = $w->{jobs}{$id};
+		next unless $job->{sent};
+		if ($now - $job->{deadline} >= 0) {
+			$log->warn("LxMusic worker($src): job $id timed out after " . ($now - $job->{started}) . 's, recycling worker');
+			delete $w->{jobs}{$id};
+			my $cb = $job->{cb};
+			my @logs = @{ $w->{recent} };
+			Plugins::LxMusic::Helper->_worker_kill($w);
+			$cb->({ ok => 0, data => undef, error => 'timeout: worker request exceeded ' . ($job->{timeout} || '?') . 's',
+				logs => \@logs, alerts => [], why => 'timeout' });
+			return;
+		}
+	}
+
+	# 空闲回收：没有在跑的请求且长时间没人用就退出（不要常驻占内存）
+	# ⚠️ 判空必须用 scalar(keys %h)：Perl 里 %h 的标量值是 "used/allocated"（空时也是 "0/8"，为真）
+	my $busy = scalar(keys %{ $w->{jobs} });
+	my $idle = _pref('workerIdle', 600);
+	if (!$busy && $idle && $now - $w->{last} > $idle) {
+		$log->warn("LxMusic worker($src): idle > ${idle}s, exiting");
+		Plugins::LxMusic::Helper->_worker_kill($w);
+		return;
+	}
+
+	# 轮询节奏：有在跑的请求（或被叫醒）→ 50ms 细粒度；空闲 → 2s（只在回收计时上花力气）
+	my $iv = ($busy || $w->{wake}) ? 0.05 : 2.0;
+	$w->{wake} = 0;
+	$w->{due}  = Time::HiRes::time() + $iv;
+	Slim::Utils::Timers::setTimer($w, $w->{due}, \&_worker_poll);
+	return;
+}
+
+# 把一个请求交给常驻 worker；返回 1 = 已接管，0 = 调用方应退回 fork 路径
+sub _worker_submit {
+	my ($class, %a) = @_;
+	# 探测 worker：与取链 worker 分开（argv1='-'），长探测不会卡住取链
+	my ($key, $arg1) = $a{probe} ? ($PROBE_KEY, '-') : ($a{source}, undef);
+	my $w = $WORKER{$key};
+	$w = $class->_worker_spawn($key, $arg1) unless $w && !$w->{dead} && kill(0, $w->{pid});
+	return 0 unless $w;
+
+	# 背压：worker 是串行的，堆积过多就让调用方退回 fork 路径（那边有并发闸）
+	return 0 if scalar(keys %{ $w->{jobs} }) >= 24;
+
+	my $id = ++$WID;
+	my $timeout = $a{timeout} || 20;
+	my $job = {
+		id => $id, cb => $a{cb}, timeout => $timeout, logs => [],
+		line => $JSON->encode({
+			id => $id, action => $a{action}, source => ($a{sourceId} // ''), info => ($a{info} // {}),
+		}) . "\n",
+	};
+	$w->{jobs}{$id} = $job;
+
+	if ($w->{ready}) {
+		unless ($class->_worker_send_job($w, $job)) {
+			$log->warn('LxMusic worker: write failed, recycling');
+			delete $w->{jobs}{$id};
+			$class->_worker_kill($w);
+			return 0;
+		}
+		$log->debug("LxMusic worker($key): submitted job $id");
+	}
+	else {
+		push @{ $w->{queue} }, $id;    # 冷启动中，等 READY 再灌
+		$log->debug("LxMusic worker($key): queued job $id (warming)");
+	}
+	$class->_worker_wake($w);
 	return 1;
 }
 

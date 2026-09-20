@@ -73,10 +73,11 @@ sub prefs {
 	return ($prefs, qw(
 		quality bridgeTimeout helperConcurrency resolveTtl coverProxy
 		boardsKg boardsTx boardsWy boardsMg qualityFallback verifyUrl autoSkipOnError
+		workerEnable workerIdle preferStreamable
 	));
 }
 
-my @BOOL_PREFS = qw(coverProxy boardsKg boardsTx boardsWy boardsMg qualityFallback verifyUrl autoSkipOnError);
+my @BOOL_PREFS = qw(coverProxy boardsKg boardsTx boardsWy boardsMg qualityFallback verifyUrl autoSkipOnError workerEnable preferStreamable);
 
 sub handler {
 	my ($class, $client, $params, $callback, $httpClient, $response) = @_;
@@ -185,6 +186,35 @@ sub handler {
 	my $logLevel = eval { Slim::Utils::Log->allCategories()->{'plugin.lxmusic'} }
 		|| '默认 ERROR（可在「高级 → 日志」调整）';
 	$params->{lxLogLevel} = _ent($logLevel);
+
+	# M0.10：常驻 worker 现场（有则显示：在服务哪个源 / pid / 就绪状态 / 在跑请求数）
+	if (Plugins::LxMusic::Helper->workerEnabled) {
+		my @w = @{ Plugins::LxMusic::Helper->workerStatus };
+		unless (@w) {
+			$params->{lxWorkers} = _ent('未启动（首个取链请求时预热）');
+		}
+		else {
+			# 源文件路径 -> 源名（给现场看得懂的标签）
+			my %byPath;
+			for my $rec (@{ Plugins::LxMusic::Sources->list }) {
+				my $p = Plugins::LxMusic::Sources->pathFor($rec->{id});
+				$byPath{$p} = $rec->{name} if $p;
+			}
+			my @lbl;
+			for my $w (@w) {
+				my $who = $w->{key} eq '__probe' ? _chars('可播校验')
+					: ($byPath{ $w->{src} } ? _chars($byPath{ $w->{src} })
+						: ($w->{src} && $w->{src} ne '-' ? _chars($w->{src}) : _chars('未知源')));
+				push @lbl, _m($who, ' pid ', $w->{pid}, ' ',
+					($w->{ready} ? _chars('已预热') : _chars('预热中')),
+					($w->{jobs} ? _m(' 在跑 ', $w->{jobs}, ' 个请求') : ()));
+			}
+			$params->{lxWorkers} = _ent(join(_chars('；'), @lbl));
+		}
+	}
+	else {
+		$params->{lxWorkers} = _ent('已关闭（每请求现起 qjs 进程）');
+	}
 
 	return $class->SUPER::handler($client, $params, $callback, $httpClient, $response);
 }
