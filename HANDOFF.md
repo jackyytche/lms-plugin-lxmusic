@@ -514,8 +514,19 @@ XMLBrowser 菜单 / 网页  ← Plugin.pm（feed handlers / webHandler）
       `_50x50.png`（src）+ `_100x100.png`（srcset 2x），并带 `onerror` 回退到
       `html/images/<category>.svg`）；② `Slim::Plugin::Base::initPlugin` 会把它注册成
       页面图标（`Slim::Web::Pages->addPageLinks("icons", {<token> => <icon>})`）；
-      ③ **My Apps / apps 菜单**：`Slim::Plugin/MyApps/Plugin.pm` 给 app 项填
-      `icon => $app->_pluginDataFor('icon')` ⇒ 应用列表里也换成我们的图标。
+      ③ **apps / My Apps 菜单**（达菲与 Material 都会显示的那份"应用列表"）：
+      `Slim::Plugin/MyApps/Plugin.pm` 给 app 项填 `icon => $app->_pluginDataFor('icon')`，
+      而 `Slim::Plugin::OPMLBased` 在**没有** icon 时会兜底注册 `html/images/radio.png`
+      （L38-39）——所以此前 LX Music 在应用列表里是个**收音机**图标。
+    - **CLI 直接可查（装机前后对照，最省事的判据）**：
+      `python tmp/lx_cli.py "apps 0 60"`。装机前实测：
+      ```
+      icon:plugins/Spotty/html/images/93aac68f….png   name:Spotty   cmd:spotty
+      icon:plugins/Ximalaya/html/images/logo.png      name:Ximalaya cmd:ximalaya
+      icon:html/images/radio.png                      name:LX Music  cmd:lxmusic   ← 兜底收音机图
+      ```
+      装机后 LX Music 那项应变成 `icon:plugins/LxMusic/html/images/logo.png`
+      （与 Ximalaya 同形状）。
     - **repo.xml 里要再给一条绝对 URL 的 `<icon>`**（`pack.py` 已生成
       `<icon>{base}/lxmusic_logo.png</icon>`，并把图标拷进 `dist/`）。原因：
       `Slim/Web/Settings/Server/Plugins.pm` 的 `prepareDetails` 对**未安装**的插件会把
@@ -604,10 +615,11 @@ XMLBrowser 菜单 / 网页  ← Plugin.pm（feed handlers / webHandler）
 
 0. **【本轮 0.11.20】装机看图标**：`install.xml` 与 `pack.py` 已改好、LAN 仓库已更新（`?v=97`，
    `dist/LxMusic-0.11.20.zip` SHA1 `51d4fce14d5f6dfe7fe95ffb19d89c4148609024`，图标
-   `dist/lxmusic_logo.png` 已在仓库根可取）。装机（设置→插件→更新，可能要重启两次）后跑
-   `python tmp/dump_plugin_imgs.py`：应看到 LxMusic 行的 `<img src="/plugins/LxMusic/html/images/logo_50x50.png"
-   srcset="…_100x100.png 2x">`，而不再是灰色的 `musicservices.svg` 兜底图；顺带看 My Apps / apps 菜单里的
-   LX Music 项是否也换成了新图标（§5.11.81 说明它是同一行 `<icon>` 驱动的）。
+   `dist/lxmusic_logo.png` 已在仓库根可取）。装机（设置→插件→更新，可能要重启两次）后跑两条：
+   ① `python tmp/lx_cli.py "apps 0 60"` —— LX Music 项应从 `icon:html/images/radio.png`
+   变成 `icon:plugins/LxMusic/html/images/logo.png`；② `python tmp/dump_plugin_imgs.py` ——
+   LxMusic 行应出现 `<img src="/plugins/LxMusic/html/images/logo_50x50.png" srcset="…_100x100.png 2x">`，
+   而不再是 `musicservices.svg` + `class="pluginFallbackIcon"`（§5.11.81）。
    ⚠️ 若发 GitHub release，记得把 `lxmusic_logo.png` 一起作为 release 资产上传。
 1. ✅ **【上一轮 0.11.19】mg https 修复已装机验收 + 两个新订阅源已验收**（详见 §5.11.80 与 §八"订阅源现状"）
    - 0.11.19 已装机（工具页版本号 **0.11.19**，用户手工装）。验收脚本：`python tmp/accept_011_19.py check`
