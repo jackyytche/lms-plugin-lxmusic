@@ -219,13 +219,13 @@ XMLBrowser 菜单 / 网页  ← Plugin.pm（feed handlers / webHandler）
 25. 首次打包/升级的隐形前提：**Helper init 会重建 `/tmp/LXMusic`**；init 曾因 qjs 拷贝失败提前 return 导致 shim 停在旧版（已加固：shim/sdk 先拷、qjs 失败仅降级）
 
 ### 5.5 LMS 设置页 / TT 模板 / 打包（M0.5 现场，8 条全是设备实测踩出来的）
-26. **TT 模板里的非 ASCII 会被双重编码**（本页第一乱码源）：`Slim/Web/Template/SkinManager.pm` 的 `Template->new({...})` **没有 ENCODING** ⇒模板文件里的 UTF-8 字面量按 latin-1 当字符读入，输出时再 UTF-8 编码 ⇒浏览器看到`å°é¢ä»£ç`（实测`封面代理`）**做法：本插件设置页模板一律"纯 ASCII + HTML 数字实体"**，由 `tmp/mk_settings_template.py` 生成（改文案改生成器后重跑）；Perl 侧动态串用`Settings::_ent()`（非 ASCII 与`&<>"'` 一起转实体）实体是 ASCII，管道里任何编码环节都改不坏，也不依赖服务器语言（达菲是 EN，照显示中文）*对照*：喜马拉雅设置页全用 `strings.txt` token + `| string`，在 EN 服务器上渲染英文——想让设置页显示中文就别走 token 路线
-27. **LMS 设置模板的 stash 是顶层**：`$params->{lxVersion}` 在模板里必须写`[% lxVersion %]`！写成 `[% params.lxVersion %]` 会静默变空串（0.6.0 现场：诊断块三个值全是空的，最容易误判成"后端没数据"）只有 `prefs.pref_x` 带前缀（基类专门往 stash 塞了 `prefs` 键）
+26. **TT 模板里的非 ASCII 会被双重编码**（本页第一乱码源）：`Slim/Web/Template/SkinManager.pm` 的 `Template->new({...})` **没有 ENCODING** ⇒模板文件里的 UTF-8 字面量按 latin-1 当字符读入，输出时再 UTF-8 编码 ⇒浏览器看到`å°é¢ä»£ç`（实测`封面代理`）**做法：本插件设置页模板一律"纯 ASCII + HTML 数字实体"**，由 `tmp/mk_settings_template.py` 生成（改文案改生成器后重跑）；Perl 侧动态串用`Settings::_ent()`（非 ASCII 与`&<>"'` 一起转实体）实体是 ASCII，管道里任何编码环节都改不坏，也不依赖服务器语言（达菲是 EN，照显示中文）。*对照*：喜马拉雅设置页全用 `strings.txt` token + `| string`，在 EN 服务器上渲染英文——想让设置页显示中文就别走 token 路线
+27. **LMS 设置模板的 stash 是顶层**：`$params->{lxVersion}` 在模板里必须写`[% lxVersion %]`！写成 `[% params.lxVersion %]` 会静默变空串（0.6.0 现场：诊断块三个值全是空的，最容易误判成"后端没数据"）。只有 `prefs.pref_x` 带前缀（基类专门往 stash 塞了 `prefs` 键）
 28. **页面里有两个 `<form>`**：皮肤顶部的 `setup_chooser`（action=`/setup.html`）与真正的 `settingsForm`（action=`/plugins/LxMusic/settings/basic.html?playerid=…`）。表单回放脚本必须认 `name="settingsForm"`。另外`settings/footer.html` 自带 `<input type="hidden" name="saveSettings" value="1">`，所以自定义按钮（`name="lxAction"`）提交时 `saveSettings` 也在，不必自己加但**同名参数出现两次会被 LMS 解析成数组引发**（`lxAction` 重复 ⇒`eq 'import'` 恒假、静默不导入）
 29. **复选框 pref 的"取消勾选"会在重启后自己弹回**：未勾选⇒表单不带该字段⇒基类 `set($pref, undef)`，而`Prefs::Base::init` 把`undef` 当"未初始化"，下次启动重灌默认值(1)**修法：handler 里在调 SUPER 之前，把表单未出现的布尔 pref 显式置 `0`**（才是持久值）
 30. **zip 内的固定时间戳会让 TT 编译缓存永久命中**：`Archive::Zip::extractTree`（PluginDownloader）解压**保留 zip 的 mtime**，而 TT 按 mtime 判编译缓存（`COMPILE_DIR=<cachedir>/templates`、`STAT_TTL=3600`）pack.py 曾写死`(2026,9,18)` ⇒0.6.1 改了设置页模板，设备仍渲染 0.6.0 的编译结果（**页面逐字节相同**）**pack.py 现在用打包时刻**（`SOURCE_DATE_EPOCH` 可复现）。判据：改 `.html` 没生效时，先比对页面字节数与文案代次（旧代次缓存命中），再怀疑装机
 31. **URL 下载来的订阅源是字节流**：`_fetch`/curl 给的是原始字节，而`installSource` 用`:encoding(UTF-8)` 落盘 ⇒必须先 decode 成字符，否则每个非 ASCII 字节被再编码一次（实测：4094 B 的源落盘成**72249 B**！源被改坏 ⇒签名握手失败、取不到直链）。已收敛到`Helper::installSource` 一处（字节串→字符；非纯 UTF-8 原样保留）
-32. **导入订阅源绝不能裁剪首尾空白**：lx 源的完整性签名基于原始字节，尾部少一个换行落盘就坏（**64093 B**，0.6.2 现场，`_installSource` 多了一次`s/^\s+|\s+$//g`）。判形态可以裁剪副本，落盘必须原样另：LMS 9.0 已无 `logLevelForCategory`，取日志级别用`Slim::Utils::Log->allCategories()->{category}`
+32. **导入订阅源绝不能裁剪首尾空白**：lx 源的完整性签名基于原始字节，尾部少一个换行落盘就坏（**64093 B**，0.6.2 现场，`_installSource` 多了一次`s/^\s+|\s+$//g`）。判形态可以裁剪副本，落盘必须原样。另：LMS 9.0 已无 `logLevelForCategory`，取日志级别用`Slim::Utils::Log->allCategories()->{category}`
 33. **设置入口是两道独立手续，缺一个就是"没有入口"**（0.6.3 现场，用户报"settings 的入口没有"）：
     - **插件行的 Settings 链接**来自 `install.xml` 的**`<optionsURL>`**（`Slim/Utils/ExtensionsManager.pm` `settings => $entry->{optionsURL}`）；漏了它 = 设置 →插件 那一行没有 Settings 可点
     - **设置下拉/页面标题的可见文字**来自 `Slim::Web::Settings::name()`，而它的契约是**返回 strings.txt 的 token**（基类把它当键做 `addPageLinks`，皮肤用 `| string` 渲染）。返回显示串会渲染成**空标签**（实测`<option value="LX Music" label="">`，下拉里是一行空白）。修法：`name()` 返回 `PLUGIN_LXMUSIC` + 插件根加 `strings.txt`（EN/ZH_CN）；`install.xml` 的`<name>`/`<description>` 同理必须是 token
@@ -235,12 +235,12 @@ XMLBrowser 菜单 / 网页  ← Plugin.pm（feed handlers / webHandler）
 ### 5.6 多源 / 音质 / 编码（M0.6 现场，3 条）
 34. **"混旗标串"会把中文字面量按字节逐个转义 ⇒双重编码乱码**：本插件的`.pm` 中文字面量是**字节串**，而 JSON 解出的值（源名/路径）是**旗标串**；`'已添加在线订阅：' . $rec->{name}` 一拼，整串变旗标串，字面量的每个字节被当成一个字符⇒上层 `_ent`/`encode_entities` 逐字节转义⇒页面显示 `å·²æ·»å ` **修法：拼文案一律走 `_m(@parts)`（先把每个片段 `_chars` 归一，再 join）**，`Settings.pm` 与`Sources.pm` 各有一份。同族坑见§5.3.19（join 分隔符）。判据：消息里出现"部分中文正常、部分乱码"就是它
 35. **prefs 里存 JSON 不要用`JSON::XS->utf8`**：`utf8` 模式产出的是"含高位字节的字节串"，落到 `YAML::XS::Dump`（`Prefs/Namespace.pm:327`）会出二进制/乱码风险。用**字符模式**（非 ASCII 转`\uXXXX`，落盘纯 ASCII，读写往返稳定）。另：`plugin/t_local/JSON/XS.pm` 原来是手写假实现（不转义非 ASCII，decode 直接喀 decode_json），会把"存进去读不出"这类问题在本地测试里静默掩盖——已换成 **JSON::PP 薄封装**
-36. **`Set-Content` 又写坏了一次中文**（install.xml 注释，第四次）：改文件**只用 write/edit 工具**！"哪怕只改个版本号"也别用 PowerShell（`-replace | Set-Content` 会按 ANSI 读、UTF8 写）另：在`.pm` 里中文时若用脚本批量替换，替换后务必 `perl -c` + 跑一次设备页面验收
+36. **`Set-Content` 又写坏了一次中文**（install.xml 注释，第四次）：改文件**只用 write/edit 工具**！"哪怕只改个版本号"也别用 PowerShell（`-replace | Set-Content` 会按 ANSI 读、UTF8 写）。另：在`.pm` 里中文时若用脚本批量替换，替换后务必 `perl -c` + 跑一次设备页面验收
 
 ### 5.7 打包门禁与"插件被 LMS 摘除"的恢复（M0.7 现场，5 条，含一次自伤事故）
-37. **【事故】编译失败仍打包上机 ⇒LMS 把插件从"已安装"列表摘掉**（0.8.0 的 Plugin.pm 有 `Global symbol "$src"`（我改搜索时漏了变量作用域），`perl -c` 的失败我没当门禁，pack 照跑；装机时 LMS 加载失败（`Slim::bootstrap::tryModuleLoad` 警告 "failed to load"），后果不是"插件不工作"而是 **插件从已安装列表消失**：插件页只剩仓库候选（`<input name="LxMusic" class="unsafePlugin">` + 空的`install:LxMusic`），所有插件页面 404，且**此后所有 POST 都装不上也启不了**（因为 `update:<plugin>` 对未安装的插件是空操作）修法：**先立门禁** `powershell -ExecutionPolicy Bypass -File tmp/precheck.ps1`（所有 .pm 必须 `syntax OK` + 模板纯 ASCII + shim.mjs 过 `node --check`），**通过才允许 pack**；再用 `tmp/repair_install.py`（见 38）重新安装启用 + 重启即可恢复
+37. **【事故】编译失败仍打包上机 ⇒LMS 把插件从"已安装"列表摘掉**（0.8.0 的 Plugin.pm 有 `Global symbol "$src"`（我改搜索时漏了变量作用域），`perl -c` 的失败我没当门禁，pack 照跑；装机时 LMS 加载失败（`Slim::bootstrap::tryModuleLoad` 警告 "failed to load"），后果不是"插件不工作"而是 **插件从已安装列表消失**：插件页只剩仓库候选（`<input name="LxMusic" class="unsafePlugin">` + 空的`install:LxMusic`），所有插件页面 404，且**此后所有 POST 都装不上也启不了**（因为 `update:<plugin>` 对未安装的插件是空操作）。修法：**先立门禁** `powershell -ExecutionPolicy Bypass -File tmp/precheck.ps1`（所有 .pm 必须 `syntax OK` + 模板纯 ASCII + shim.mjs 过 `node --check`），**通过才允许 pack**；再用 `tmp/repair_install.py`（见 38）重新安装启用 + 重启即可恢复
 38. **插件设置页表单有重复字段名（`repos` 两条），必须用保序 (name,value) 列表回放**：我用 dict 收字段（`d[n]=v`）跑"修复"脚本，把两条 repos 并成一条⇒`Slim::Web::Settings::Server::Plugins` 按提交的 repos 集合与当前集合做增量⇒**把 LAN 仓库删了**，插件候选直接从页面消失（比事故本身更难查）。正解：沿用 `tmp/repair_install.py`（列表式 + 浏览器语义 + `--repos=` 覆盖 + `install:<name>` 标记 + `<name>` 勾选）回放
-39. **单源搜索返回 hashref、跨源返回 arrayref**：`_webSearch` 里`@{$res->{data}}` 在单源时直接 die（"Not an ARRAY reference"）⇒ 页面挂到超时（浏览器/urllib 都只看到 hang，没有错误页）正解：`my @groups = length $src ? ($res->{data}) : @{ $res->{data} };`
+39. **单源搜索返回 hashref、跨源返回 arrayref**：`_webSearch` 里`@{$res->{data}}` 在单源时直接 die（"Not an ARRAY reference"）⇒ 页面挂到超时（浏览器/urllib 都只看到 hang，没有错误页）。正解：`my @groups = length $src ? ($res->{data}) : @{ $res->{data} };`
 40. **解析缓存会污染故障注入测试**：同一 `lxm://` URL 只要曾经解析成功就会命中缓存 ⇒故意"注入失败"的测试会得到"能播"的假象。做失败路径测试必须让 URL 唯一（改 `n=` 查询参数即可）
 41. **LMS 本身在"取不到 URL"时就会跳下一首**：实测把 `autoSkipOnError` 关掉、禁用全部订阅源，LMS 照样从 index 0 跳到 1。所以本开关的真实语义是「**立即跳**（不等 LMS 自己的错误流程）+ **限流(429)时不跳** + **防连跳风暴（60s 内最多 3 次）**」，而不是"是否跳"若用户要"失败即停住不跳"，得另想办法（LMS 的行为不可由插件关闭）
 
@@ -264,15 +264,15 @@ XMLBrowser 菜单 / 网页  ← Plugin.pm（feed handlers / webHandler）
 49. **一个源仓库里能用的往往只有少数几个，且失败要分清责任**：`pdone/lx-music-source` 的 10 个源实测只有 2 个可用（见§八矩阵）：链接真死（qdy 410）= **源侧**；`no RESULT line` / `not a function` / `curl exit 35/56` = **引擎侧或设备网络侧**。别把两者混为一谈
 
 ### 5.10 M0.10：常驻 worker + 播放链路（0.10.x 轮，9 条，全部设备实测）
-50. **每请求 fork 的固定开销是"取链"里最大的一块**：常驻 worker（`shim.mjs <src> serve`，stdin 行＝`{"id":N,"action":..,"source":..,"info":{}}`，stdout `READY{}`/`RESULT <id> {}`/`LOG ..`）把「起 qjs + 解析 shim/源脚本 + 源 rconfig 握手」摊到进程生命周期里。同曲目 A/B（工具页 4 首不同曲）：**固定开销 306ms→51ms**，总耗时 0.87s→0.52s；冷启动 0.94s ≈ fork（首曲不亏）通道选**POSIX 双向管道 + Timers 轮询 `sysread`**（不能用 `open(STDOUT)`：撞 Log::Trapper tie，0.2.6）worker 起不来/写失败/超时/进程死⇒一律 kill 后**回退 fork 路径**（重试即在 fork 里完成）
+50. **每请求 fork 的固定开销是"取链"里最大的一块**：常驻 worker（`shim.mjs <src> serve`，stdin 行＝`{"id":N,"action":..,"source":..,"info":{}}`，stdout `READY{}`/`RESULT <id> {}`/`LOG ..`）把「起 qjs + 解析 shim/源脚本 + 源 rconfig 握手」摊到进程生命周期里。同曲目 A/B（工具页 4 首不同曲）：**固定开销 306ms→51ms**，总耗时 0.87s→0.52s（冷启动 0.94s ≈ fork，首曲不亏）。通道选**POSIX 双向管道 + Timers 轮询 `sysread`**（不能用 `open(STDOUT)`：撞 Log::Trapper tie，0.2.6）worker 起不来/写失败/超时/进程死⇒一律 kill 后**回退 fork 路径**（重试即在 fork 里完成）
 51. **三个把收益吃光的坑（都在父进程侧）**：
-    (a) **轮询节奏**：空闲时 2s 一次的回收 tick 会让新请求白等最多 2s（实测每首多花 1.5s）。修法：下发时`_worker_wake`（kill+重排到+50ms），在跑时 50ms 细粒度，空闲 2s⚠️ 在 poll 回调内部不要 kill+重排（会与自己抢 timer），用`local $w->{in_poll}` 标记 + `wake` 标志
+    (a) **轮询节奏**：空闲时 2s 一次的回收 tick 会让新请求白等最多 2s（实测每首多花 1.5s）。修法：下发时`_worker_wake`（kill+重排到+50ms），在跑时 50ms 细粒度，空闲 2s。⚠️ 在 poll 回调内部不要 kill+重排（会与自己抢 timer），用`local $w->{in_poll}` 标记 + `wake` 标志
     (b) **`%hash` 在布尔语境永远为真**（Perl 的标量值是 `"0/8"`）⇒ 空闲回收判断 `!%{$w->{jobs}}` 永不成立、worker 永不回收。一律写 `scalar(keys %h)`
     (c) **必须拿到 `O_NONBLOCK`**：阻塞 `sysread` 空管道= 整个 LMS 卡死。拿不到则**不启用 worker**（回退 fork），别赌
     另外：job 的超时**从真正下发那一刻起算**（排队等冷启动不该吃请求超时），背压 ≈4 个在跑就回退 fork
-52. **校验探测从"HEAD"升级为"取实体 + 嗅探魔数"**：HEAD 200 完全可能是空壳/错误页。现在`probe` 是 `curl -r 0-2047 -o body --max-filesize 400000`（跟 `-L` 且只取最后一段响应头），读回前 2KB 按 ID3/fLaC/OggS/ftyp/RIFF/ff-fb/APE，并拒绝 HTML/JSON 开头；`data.magic/bytes/head` 一并回给页面⚠️ Range 响应的总长度在 `Content-Range` 里（`Content-Length` 只是这一片）——量码率要用总长
+52. **校验探测从"HEAD"升级为"取实体 + 嗅探魔数"**：HEAD 200 完全可能是空壳/错误页。现在`probe` 是 `curl -r 0-2047 -o body --max-filesize 400000`（跟 `-L` 且只取最后一段响应头），读回前 2KB 按 ID3/fLaC/OggS/ftyp/RIFF/ff-fb/APE，并拒绝 HTML/JSON 开头；`data.magic/bytes/head` 一并回给页面。⚠️ Range 响应的总长度在 `Content-Range` 里（`Content-Length` 只是这一片）——量码率要用总长
 53. **真凶不是插件，是"无音频后缀的脚本中转链"**：长青的直链形如 `http://yinyue.haitangw.net/kw/kw.php?type=mp3&id=228908&level=exhigh`（末段没有`.mp3`）设备实测：**同一 URL 直接喂播放器 →正常出声（位置前进）**；走 `lxm://` →`mode=play` 但**位置永远 0 秒**（LMS 用`Slim::Music::Info::contentType($track)` 判代理流格式，lxm:// 没后缀 ⇒`unk` ⇒`Couldn't create command line for unk playback`）。而**独家音源的直链 `.../M800000bYDlc2XxKLs.mp3` 正常播放**
-54. **⚠️ 达菲雷区：不要给这类 URL 加 `formatOverride`**。LMS 在`Slim/Player/Song.pm::open` 里留了 `if ($handler->can('formatOverride'))` 钩子，看似是正解；实测两次把 LMS 主循环彻底卡死（TCP 不 accept、CLI/Web 全无响应，只能重启达菲：`http://192.168.2.111/cgi-bin/Settings?ACTION=restart`）最终采用**两遍策略**（pref `preferStreamable`，默认 1）：第一遍只认播放器友好（末段带 `.mp3/.flac/.m4a/.ogg/.wav/.ape/.aac`）的直链，友好的直接交付；不友好的**当场不做 HEAD**，只挂起当兜底，等确实没有友好直链时才回头校验并使用它（兜底实测：无声但不卡死）代价：源顺序里排在前面的中转链会被跳过（每首多花 ~50ms），收益：**不再无声**
+54. **⚠️ 达菲雷区：不要给这类 URL 加 `formatOverride`**。LMS 在`Slim/Player/Song.pm::open` 里留了 `if ($handler->can('formatOverride'))` 钩子，看似是正解；实测两次把 LMS 主循环彻底卡死（TCP 不 accept、CLI/Web 全无响应，只能重启达菲：`http://192.168.2.111/cgi-bin/Settings?ACTION=restart`）最终采用**两遍策略**（pref `preferStreamable`，默认 1）：第一遍只认播放器友好（末段带 `.mp3/.flac/.m4a/.ogg/.wav/.ape/.aac`）的直链，友好的直接交付；不友好的**当场不做 HEAD**，只挂起当兜底，等确实没有友好直链时才回头校验并使用它（兜底实测：无声但不卡死）。代价：源顺序里排在前面的中转链会被跳过（每首多花 ~50ms），收益：**不再无声**
 55. **⚠️ "随手加个诊断日志"会改变行为、甚至打断播放链路**（0.10.4 现场）：我在播放期回调 `ProtocolHandler::new` 里打了`$args->{song}->url`——`Slim::Player::Song` 在那一刻**没有 `url` 方法**，直接抛异常，而它抛在 `Slim::Networking::Async::HTTP::_http_read_body` 的调用栈里⇒流打不开规则：① 播放期诊断一律 `blessed($x) && $x->can('m')` 守卫 + `$log->is_info` 门控；② 诊断**验完就删**（0.10.5 已删干净）；③ 改过日志级别（`tmp/lx_set_loglevel.py` / `tmp/set_debug.py`）**收尾必须复原**（0.10.x 轮曾把`plugin.lxmusic`/`player.source` 留成 INFO/DEBUG，已复原为 ERROR——这种"现场残留"下个 session 要先查）
 56. **定位"没声/卡死"要用可重复的对照实验，别只靠日志**：设备日志端点延迟 10+ 分钟（0.10.x 轮再次确认），照它下结论会跑偏。0.10.x 轮靠三条对照把假说逐个否掉：① 同一 URL「裸播（`tmp/test_url_play.py`）vs 走`lxm://`（`tmp/test_play.py`）」；② worker「开 vs 关」（改`pref_workerEnable` 即可，无需重启）；③ 探测「先跑 vs 不跑」（`tmp/test_raw_play.py` 解析出直链后再裸播）——曾误判"校验探测把中转链用掉了（毒化）/ LMS 的 UA 被拒"，两者都被实验否掉（同一 URL 裸播正常）
 57. **"取链成功 / mode=play / 有 dur"都不等于能播**——本项目的播放验收口径（**必守**）：
@@ -297,12 +297,12 @@ XMLBrowser 菜单 / 网页  ← Plugin.pm（feed handlers / webHandler）
 
 59. **wbd 签名端点的死法要分层看**：`wbd.kuwo.cn/api/bd/bang/bang_info` 对旧实现返回 `{"code":10006,"msg":"DECRYPT_ERROR"}`——但**裸请求（无 data 参数）返回`10004 AppId错误`**，说明 `appId=y67sprxhhpws` 还在白名单里，**只是 AES key 被上游换掉了**。refs/ 各克隆（desktop/mobile/lxmusic2api）全是同一套旧实现，本地没有现成新签名。别再回去试旧 key
 60. **换端点比补签名划算**：洛雪 PC 端的免签名端点`kbangserver.kuwo.cn/ksong.s` 还活着（`from=pc&fmt=json&pn=<0基>&rn=100&type=bang&data=content&id=<bangid>&show_copyright_off=0&pcmp4=1&isbang=1`），**静态榜单 25/25 全部返回有效数据**（本机+设备双端）。注意`from=phone`/`from=mbox` 会报 `no bangid`——只有`from=pc` 这条形态能用
-61. **老端点的载荷也被瘦身过，字段名全变了**：没有`n_minfo`/`pic`/`albumId`/`duration`，取而代之：`formats`（`|` 分隔令牌串）/`albumid`/`song_duration`（秒；`duration` 现在是"在榜时长"，别用错）音质声明由 formats 映射：`MP3128→128k`、`MP3H→320k`、`ALFLAC→flac`、`ZP*`（臻品母带/全景声/黎音）→`DTSX→flac24bit`，其余（MV*/SMP4*/EX*/WMA*/AAC*/OGG*/BCMS）忽略。types 不是纯展示——**Perl 侧`qualityLadder` 和订阅源脚本都靠它裁剪档位**（Helper.pm:125）；映射只影响"多试几档"，映射错的代价 = 多一次失败重试，不会播不出
+61. **老端点的载荷也被瘦身过，字段名全变了**：没有`n_minfo`/`pic`/`albumId`/`duration`，取而代之：`formats`（`|` 分隔令牌串）/`albumid`/`song_duration`（秒；`duration` 现在是"在榜时长"，别用错）。音质声明由 formats 映射：`MP3128→128k`、`MP3H→320k`、`ALFLAC→flac`、`ZP*`（臻品母带/全景声/黎音）→`DTSX→flac24bit`，其余（MV*/SMP4*/EX*/WMA*/AAC*/OGG*/BCMS）忽略。types 不是纯展示——**Perl 侧`qualityLadder` 和订阅源脚本都靠它裁剪档位**（Helper.pm:125）；映射只影响"多试几档"，映射错的代价 = 多一次失败重试，不会播不出
 62. **封面缺失不是问题**：插件本来就有 kw 兜底（Plugin.pm `_coverOf`：无 img 的 kw 曲目走 `kw:<songmid>` →封面代理 →`artistpicserver.kuwo.cn/pic.web?...&rid=<songmid>`），榜单条目 `img:null` 即可，设备实测封面正常走 `/imageproxy/.../cover?u=a3c6...`
-63. **动态榜单目录（`qukudata q.k tree`）活着但别用**：它返回的 sourceid 子集与 kbangserver 的 id **不同且不完整**（12 个子节点，不是 93/16 这些主榜），静态 boardList 反而更全更稳探明的死路（别再试）：`bd-api.kuwo.cn/api/service/rank/*` 全 404；`nplserver pl.svc` 不吃榜单 id（pid=93 返回空 musiclist）
+63. **动态榜单目录（`qukudata q.k tree`）活着但别用**：它返回的 sourceid 子集与 kbangserver 的 id **不同且不完整**（12 个子节点，不是 93/16 这些主榜），静态 boardList 反而更全更稳。探明的死路（别再试）：`bd-api.kuwo.cn/api/service/rank/*` 全 404；`nplserver pl.svc` 不吃榜单 id（pid=93 返回空 musiclist）
 64. **榜单 id 传参约定**：菜单透传的是**裸 bangid**（Plugin.pm passthrough `$_->{bangid}`），但防御起见 kg/tx 的`getList` 内部都做了`id.replace('<src>__','')`，kw 现在也照做（0.11.0 首版就是因为没剥前缀把`kw__16` 直接拼进 URL 而`try max num`；harness 一跑就现形）——`node node-sdk-harness.mjs boardlist kw 16 1` 是 kw 榜单的标准本机验证
 65. **`_trackItems` 返回数组引用，不是列表**（0.11.1 致命坑）：`my @items = _trackItems(...)` 在列表语境把引用变成"单元素"，`items => \@items` 得到 `[[50 首]]` →LMS CLI 路径拿 ARRAYREF 当`{ignore}` →`Not a HASH reference at Slim/Control/XMLBrowser.pm L1012`，**feed 查询静默无响应**（无 die 标签指向插件代码！）。正确写法：`my $items = _trackItems(...); items => $items`（songlist 详情 L714 的 `push @items, @$tracks` 是佐证）。凡 die 在 Timer 回调里，日志行首是`Timer …:_poll failed:`
-66. **LMS 对相同版本号的重装会静默跳过**（0.11.1 排查大弯路）：`?v=N` 只 bust 我方 repo.xml 的缓存，LMS 侧仍按 install.xml 的`<version>` 决定是否重装——0.11.1(坏) →修好后仍用 0.11.1 →POST 安装「成功」但设备跑的还是坏版。**凡修 bug 重发，版本号必须 +1**（这也是 precheck 之外的隐性门禁）症状：日志里同一 die 的时间戳一直在更新 = 修的代码根本没上机
+66. **LMS 对相同版本号的重装会静默跳过**（0.11.1 排查大弯路）：`?v=N` 只 bust 我方 repo.xml 的缓存，LMS 侧仍按 install.xml 的`<version>` 决定是否重装——0.11.1(坏) →修好后仍用 0.11.1 →POST 安装「成功」但设备跑的还是坏版。**凡修 bug 重发，版本号必须 +1**（这也是 precheck 之外的隐性门禁）。症状：日志里同一 die 的时间戳一直在更新 = 修的代码根本没上机
 67. **查 LMS 服务器日志的正确入口**：`http://<设备>:9000/server.log?lines=N`（`?full=1` 全量）——Daphile 的/cgi-bin/Info 页是 JS 渲染拿不到日志链接，:9000 的`settings/server/debugging.html` 页面里能 grep 出这些端点。这轮全靠它定位（裸 CLI 查询 + 日志时间戳交叉验证）
 68. **达菲 CLI「响应慢」多半是自己的客户端读循环**：`lx_cli.py` 的 recv 循环在响应分多个 TCP 段时会等到 25s 超时才返回（表现=恰好 25.1s）。判别真慢 vs 假慢用**裸 socket + 每包时间戳**探针（本轮临时脚本思路：connect →send →逐 recv 打`%.1fs N B`）。`version ?` 0.0s 回= 服务器没病
 69. **榜单/专辑「页头」配方（喜马拉雅 0.1.34→0.1.54 验证过的组合，本项目 0.11.2 落地）**：feed 回调（CLI 与 Web 同一路径）在返回哈希上加 feed 级`image`（Web 页顶部大图，经封面代理）、`play => 'lxm://b/<src>/<bangid>'`（触发 songinfo 页头，**同时抑制模板的 All Songs 行**）、`actions => {playall|addall|insert => {command => ['playlist',…URL], fixedParams => {}}}`（只留 *all 键！普通 play/add 留在 feed 级会盖到每一行的行内按钮）、`albumData`（页头文字行）配套 `ProtocolHandler::explodePlaylist` 认`lxm://b/` 前缀：fetch 整榜→`buildUrl` 逐曲→`_publish_cover` + `publishQueueMetadata` 后回 `\@urls`（LMS Commands L1383-1400 机制）
@@ -591,6 +591,12 @@ XMLBrowser 菜单 / 网页  ← Plugin.pm（feed handlers / webHandler）
       U+FFFD、典型乱码模式（`锟斤拷`、UTF-8 被当 GBK/latin1）、代码围栏奇偶、表格管道数、
       标题层级、重复长行。**判据**：UTF-8 解码 OK + 0 个 U+FFFD + 围栏偶数 + 无重复长行；
       文档里出现的 `å¨æ°ä¼¦` 这类是**故意引用的乱码样例**（讲编码坑用的），不是损坏。
+    - **残留粘连扫描**：`python tmp/doc_glue_scan.py` + `tmp/doc_glue_audit.py` —— 乱码事故那次是靠
+      "确定性反演"恢复的，**行文里留下若干"两句并作一行、句号丢失"的粘连**（典型：
+      `（…）修法：`、`（…）正解：`、`…空闲 2s⚠️ 在 poll…`）。这两个脚本按「）紧跟汉字 / 中置引导词 /
+      中置 ⚠️ / 超长无句号行」列候选；本轮（2026-09-21）已按它逐条修好 §5.2~§5.10 里能找到的 12 处，
+      再发现新的按同样办法补。**注意**：技术事实没被破坏，坏的只是标点与断行 —— 修的时候**只补标点/断行，
+      不要顺手改写结论**。
     - 同族纪律：`install.xml` 的中文注释也被 PowerShell 写坏过（§5.5.36），改 XML 同样只用 edit 工具。
 85. **订阅源不会因升级而丢 —— 但仍要留本地副本（用户要求）**
     - **事实**：导入的源正文存在 LMS prefs 目录 `<prefsdir>/lxmusic/sources/<id>.js`，元数据在 prefs
@@ -614,7 +620,7 @@ XMLBrowser 菜单 / 网页  ← Plugin.pm（feed handlers / webHandler）
 0. **开工/收尾自检**：`python tmp/session_check.py` —— 一条命令看：① LMS 主循环是否活着（CLI+Web）② 运行中的插件版本 ③ `plugin.lxmusic`/`player.source` 日志级别是否都是 ERROR（诊断残留检查）④ 常驻 worker 现场 ⑤ 订阅源启停 ⑥ 内部播放器是否在播（应为 stop）。**开工第一步、收尾最后一步都跑它**
 1. **改代码** →本地校验：`perl -I plugin\t_local -I plugin\t -I plugin -c plugin\LxMusic\<Module>.pm`（需要`plugin/t/**` 存根）；`node --check engine/shim.mjs`；shim 侧行为验证用 `tmp/shim-sim/`**打包前必须**跑门禁：`powershell -ExecutionPolicy Bypass -File tmp\precheck.ps1`（所有 .pm 都要 `syntax OK` + 模板纯 ASCII + shim 过）！**不通过就不许 pack**（0.8.0 事故的教训，§5.7.37）
 2. **打包发布（LAN）**：`$env:LX_REPO_BASE='http://192.168.2.68:8765'; python plugin\LxMusic\pack.py`（产物进 `dist/`，LAN 即时生效）→ 同步 `repo/plugin/**`（本 session 只改 5 个文件，可用 `Copy-Item` 逐个覆盖）→ `git -C repo add -A plugin; git -C repo commit`（**新提交**，别 amend：远端 main 已有 CI 提交，新提交才能快进推送）
-3. **装机**：`python _research/ximalaya-daphile-plugin/m0/diag_plugin_install.py post LxMusic '--repos=http://192.168.2.68:8765/repo.xml?v=<N>'`（**N 每次 +1**，用于破 LMS 300s 仓库缓存；0.11.16 用 **v=95**、0.11.19 用 **v=96**）→ `重启`（有"正在播放则中止"守卫）→ 轮询页面版本号⚠️ 重启后 30~60s 内`:9000` 可能连不上（0.10.x 轮遇到两次`WinError 10060`）：那是**还没起完**，等一会儿重试若**长时间** Web 超时且 CLI 也无响应，就是主循环卡死，走 §5.10.54 的 Daphile CGI 重启设备
+3. **装机**：`python _research/ximalaya-daphile-plugin/m0/diag_plugin_install.py post LxMusic '--repos=http://192.168.2.68:8765/repo.xml?v=<N>'`（**N 每次 +1**，用于破 LMS 300s 仓库缓存；0.11.16 用 **v=95**、0.11.19 用 **v=96**）→ `重启`（有"正在播放则中止"守卫）→ 轮询页面版本号。⚠️ 重启后 30~60s 内`:9000` 可能连不上（0.10.x 轮遇到两次`WinError 10060`）：那是**还没起完**，等一会儿重试若**长时间** Web 超时且 CLI 也无响应，就是主循环卡死，走 §5.10.54 的 Daphile CGI 重启设备
 4. **取证**：
    - CLI 9090：`tmp/lx_cli.py "lxmusic items 0 40"`（顶层菜单）、`"lxmusic items 0 8 item_id:2"`（下钻榜单）、`"lxmusic items 0 4 item_id:2.0"`（榜单曲目，**输出带 image 字段**，可验证封面代理开关）；`<playerid> status - 1 tags:cgAl`（播放状态）。裸 socket 版：`tmp/raw_cli.py "serverstatus 0 3"`（连通性/卡死判据）
    - JSONRPC：`/jsonrpc.js` POST `{"id":1,"method":"slim.request","params":["<playerid>",["playlist","play",["<url>"]]]}`
@@ -622,7 +628,7 @@ XMLBrowser 菜单 / 网页  ← Plugin.pm（feed handlers / webHandler）
    - 设置页自证：`tmp/verify_settings.py`（纯 ASCII / 12 分区 / 诊断块含 worker 现场 / 全部 pref 控件）
    - 日志：设备日志端点（**延迟 10+ 分钟，0.10.x 轮确认不可用**）；插件自身 `LOG …` 行会渲染在搜索/歌单页的 logs 块里
 5. **播放验证（0.10.x 起的口径，见 §5.10.57）**：`playlist clear` →`playlist add <lxm://…>`×N →`playlist jump 0` →`play` →`<playerid> status`
-   - **唯一判据 = 位置持续推进**（不是`mode=play`、不是`dur`）：`python tmp/test_play.py <查询> <src> <档位> [轮数]`（走 `lxm://`，内部播放器，结束必 stop）对照实验用`python tmp/test_url_play.py "<直链>"`（裸 URL，绕过插件）或`python tmp/test_raw_play.py <查询> <src>`（插件解析出的直链再裸播）
+   - **唯一判据 = 位置持续推进**（不是`mode=play`、不是`dur`）：`python tmp/test_play.py <查询> <src> <档位> [轮数]`（走 `lxm://`，内部播放器，结束必 stop）。对照实验用`python tmp/test_url_play.py "<直链>"`（裸 URL，绕过插件）或`python tmp/test_raw_play.py <查询> <src>`（插件解析出的直链再裸播）
    - **每次验证后必跑** `python tmp/liveness.py`（CLI 有响应= 主循环没卡死；CLI 有响应而 Web 超时 = 卡死前兆）
    - 取链侧验证：`python tmp/check_worker.py <查询> <src> [首数]`（含 tries 耗时拆解 + 设置页 worker 状态）、`python tmp/check_resolve.py [词] [源]`（老口径，输出 `OK (n.nn s)`）
    - ⚠️ **达菲卡死只能重启**：`http://192.168.2.111/cgi-bin/Settings?ACTION=restart`（Daphile 自己的 CGI 在 80 独立于 LMS，LMS 卡死时仍可用；见 §5.10.54）。重启会中断播放，别在用户听歌时做
@@ -673,6 +679,8 @@ XMLBrowser 菜单 / 网页  ← Plugin.pm（feed handlers / webHandler）
    - 发版/文档一轮新增（§5.11.83/84 的配套工具）：
      **`tmp/audit_repo_contents.py`（发布前体检：跟踪文件全表 + 订阅源/凭据特征扫描）**、
      **`tmp/doc_audit.py [文件]`（交接文档体检：编码/乱码/结构/重复）**、
+     `tmp/doc_glue_scan.py` / `tmp/doc_glue_audit.py`（找乱码事故遗留的"粘连/缺句读"）、
+     `tmp/verify_remote_tree.py`（发布后远端体检：main 树里不得出现订阅源/凭据路径）、
      **`tmp/lx_gh_release.py <ver> [--verify]`（建 release + 传三资产 + 终验 `releases/latest/download`）**、
      `tmp/prep_release_check.py [ver]`（发版前一览：zip 内容/图标/两份 repo.xml 的 URL 与 sha 一致性 + LAN 可达性）、
      `tmp/check_daphile_shell.py`、`tmp/grep_daphile_js_icon.py`（达菲皮肤图标相关取证）
