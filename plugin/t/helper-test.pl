@@ -84,16 +84,21 @@ sub check {
 
 # ---------- 6. installSource：名字清洗 + 落盘（内容过短会被拒，用真实形状的桩） ----------
 {
-	# Sources::addContent 的校验：≥50 字节 + 必须有 @name 头；描述里带唯一串保证每次内容不同
-	# （否则同一台机器跑第二遍会命中"内容完全相同，已跳过"而拿不到路径）
-	my $uniq = $$ . '-' . time();
+	# Sources::addContent 的校验：≥50 字节 + 必须有 @name 头。
+	# 桩内容**保持确定性**（不带 pid/时间），这样 CI 的日志每次一样、回写步骤报 "no change"，
+	# 不会每次推送都多一条 ci: regression log 提交；代价是同一台机器跑第二遍会命中
+	# "内容完全相同，已跳过"（Sources 按内容 sha1 去重）——下面按"已装"分支取回已有路径。
 	my $src = "/**\n"
 		. " * \@name Test Fixture Source\n"
-		. " * \@description regression fixture, uniq $uniq\n"
+		. " * \@description deterministic fixture for t/helper-test.pl\n"
 		. " */\n"
 		. "const { EVENT_NAMES, on, send } = globalThis.lx;\n"
 		. "on(EVENT_NAMES.request, () => { send(EVENT_NAMES.inited, { status: 'success', sources: {} }); });\n";
 	my $p = Plugins::LxMusic::Helper->installSource('../evil?name.js', $src);
+	if (!defined $p) {
+		my ($rec) = grep { ($_->{name} // '') eq 'Test Fixture Source' } @{ Plugins::LxMusic::Sources->list };
+		$p = $rec ? Plugins::LxMusic::Sources->pathFor($rec->{id}) : undef;
+	}
 	check('installSource returns a path',  defined $p && $p =~ /\.js$/, $p // '(undef)');
 	check('installSource path sanitised',  defined $p && $p !~ /[?;]/ && $p !~ m{\.\.}, $p // '');
 	check('installSource wrote the file',  defined $p && -s $p && (-s $p) >= 50, defined $p ? (-s $p) : 'no path');
