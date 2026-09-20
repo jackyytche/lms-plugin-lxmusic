@@ -209,6 +209,12 @@ export default {
         limit: this.limit,
         page,
         source: 'kw',
+        // 榜单页头（0.11.1）：v9_pic2 是完整封面 URL（/120/ 路径段可换成 /500/，实测 200/26KB）；
+        // pic 是目录级基址（非图片），仅作兜底
+        info: {
+          name: body.name || '',
+          img: String(body.v9_pic2 || body.pic || '').replace('/120/', '/500/'),
+        },
       }
     })
   },

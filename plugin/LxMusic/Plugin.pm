@@ -381,13 +381,13 @@ sub _boardItems {
 		name        => _u($_->{name} || '?'),
 		type        => 'link',
 		url         => \&sdkBoardTracksHandler,
-		passthrough => [ 'tracks', $src, ($_->{bangid} || $_->{id} || '') ],
+		passthrough => [ 'tracks', $src, ($_->{bangid} || $_->{id} || ''), ($_->{name} || '') ],
 	} } @$boards ];
 }
 
-# 榜单曲目（source/bangid 由 passthrough 传入）；支持 XMLBrowser 窗口（index/quantity）
+# 榜单曲目（source/bangid/榜单名 由 passthrough 传入）；支持 XMLBrowser 窗口（index/quantity）
 sub sdkBoardTracksHandler {
-	my ($client, $cb, $args, $mode, $src, $bangid) = @_;
+	my ($client, $cb, $args, $mode, $src, $bangid, $bname) = @_;
 	$src    ||= 'kg';
 	$bangid ||= '';
 
@@ -413,13 +413,57 @@ sub sdkBoardTracksHandler {
 				$cb->({ items => [ { name => _u('获取失败: ') . ($res->{error} || 'unknown'), type => 'text' } ] });
 				return;
 			}
-			my @list = @{ $res->{data}{list} };
+			my @all  = @{ $res->{data}{list} };
+			my @list = @all;
 			@list = @list[ $skip .. $#list ] if $skip && @list > $skip;
 			@list = @list[ 0 .. $window - 1 ] if @list > $window;
-			$cb->({ items => _trackItems(\@list, _u("[$src] ")) });
+
+			# ---- 0.11.1 榜单页头（喜马拉雅 0.1.40-0.1.54 同款，达菲实测过的组合）----
+			#   feed 级 image    -> Slim::Web::XMLBrowser stash -> Web 页顶部大封面
+			#   feed 级 play     -> stash playUrl -> 页头 play/add 按钮（songinfo 页头，
+			#                       它一出现模板就不再渲染自动的 "All Songs" 行）
+			#   feed 级 actions  -> 页头 playall/addall/insert 命令（经 lxm://b/ 整榜展开）
+			#   albumData        -> 页头 details 行（榜单名 / 来源·总数）
+			# 封面优先级：榜单自带封面（kw kbangserver v9_pic2）→ 第一首的封面兜底。
+			my $info = $res->{data}{info} || {};
+			my $cover;
+			if ($info->{img} && $info->{img} =~ m{^https?://}) {
+				$cover = $prefs->get('coverProxy') ? _coverProxyUrl($info->{img}) : $info->{img};
+			}
+			elsif (@all && $all[0]) {
+				$cover = _coverOf($all[0]);
+			}
+			my $title  = ($bname && length $bname) ? $bname : ($info->{name} || (_u($src) . _u('榜单')));
+			my $total  = $res->{data}{total};
+			my @items = _trackItems(\@list, _u("[$src] "));
+			$cb->({
+				items => \@items,
+				($cover    ? (image => $cover) : ()),
+				($bangid ne '' ? (play => "lxm://b/$src/$bangid") : ()),
+				($bangid ne '' ? (actions => _board_play_actions($src, $bangid)) : ()),
+				(albumData => [
+					{ name => $title, type => 'text', label => 'ALBUM' },
+					((defined $total && $total)
+						? { name => _u('[' . $src . '] · ' . int($total) . ' 首'), type => 'text', label => 'ARTIST' }
+						: ()),
+				]),
+			});
 		},
 	);
 	return;
+}
+
+# 页头播放按钮命令（喜马拉雅 _album_play_actions 同形，只留 *all 键——
+# 普通 play/add 留在 feed 级会把整榜命令盖到每一行的行内按钮上）。
+# 命中 lxm://b/<src>/<bangid>，由 ProtocolHandler::explodePlaylist 展开整榜。
+sub _board_play_actions {
+	my ($src, $bangid) = @_;
+	my $u = "lxm://b/$src/$bangid";
+	return {
+		playall => { command => [ 'playlist', 'play',   $u ], fixedParams => {} },
+		addall  => { command => [ 'playlist', 'add',    $u ], fixedParams => {} },
+		insert  => { command => [ 'playlist', 'insert', $u ], fixedParams => {} },
+	};
 }
 
 # track(search/boardlist 产出) -> lxm:// audio 项（$prefixOf 可按曲给不同前缀，如聚合搜索的来源标签）

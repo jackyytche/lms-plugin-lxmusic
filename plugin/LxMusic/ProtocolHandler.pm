@@ -453,10 +453,70 @@ sub new {
 	return $class->SUPER::new($args);
 }
 
+# 整榜/单曲双语义（0.11.1 榜单页头引入 lxm://b/）：
+#   lxm://b/<src>/<bangid> -> 展开为全榜 lxm:// 曲目 URL（上限 100，防超榜拖慢入队）
+# 喜马拉雅 xmly://album/<id> 同款机制：LMS 对带 explodePlaylist 的协议做
+# playlist play/add 时，先向协议要全量 URL 列表再 playtracks/addtracks
+# （Slim::Control::Commands.pm L1383-1400）。曲目 URL 展开为自身（原语义不变）。
 sub explodePlaylist {
 	my ($class, $client, $url, $cb) = @_;
+
+	if (my ($src, $bangid) = $url =~ m{^lxm://b/([a-z]+)/([A-Za-z0-9_-]+)$}) {
+		Plugins::LxMusic::Helper->request(
+			action  => 'boardlist',
+			info    => { source => $src, bangid => $bangid, page => 1 },
+			timeout => 45,
+			cb      => sub {
+				my ($res) = @_;
+				unless ($res->{ok} && $res->{data} && $res->{data}{list} && @{ $res->{data}{list} }) {
+					$log->error('LxMusic: board explode failed: ' . ($res->{error} || 'empty list'));
+					$cb->([]);
+					return;
+				}
+
+				my @list = @{ $res->{data}{list} };
+				@list = @list[ 0 .. 99 ] if @list > 100;
+				my $q = $prefs->get('quality') || '320k';
+				my @urls;
+				for my $t (@list) {
+					next unless $t && ref($t) eq 'HASH';
+					my $name = ($t->{singer} ? $t->{singer} . ' - ' : '') . ($t->{name} || '?');
+					my $u = $class->buildUrl(
+						music => $t,
+						src   => ($t->{source} || $src),
+						type  => $q,
+						name  => $name,
+					);
+					next unless $u;
+					# 入队前发布队列元数据（歌名/时长/封面）——队列行渲染靠它，零额外 API
+					$class->_publish_cover($u, ($t->{source} || $src), $t);
+					$class->publishQueueMetadata($u, {
+						title   => $name,
+						secs    => _secs_of_interval($t->{interval}),
+						quality => $q,
+					});
+					push @urls, $u;
+				}
+				$cb->(\@urls);
+			},
+		);
+		return;
+	}
+
 	$cb->([$url]);
 	return;
+}
+
+# 'mm:ss' / 秒数 -> 秒（与 Plugin::_secsOf 同语义，PH 侧自持一份避免包反向依赖）
+sub _secs_of_interval {
+	my ($iv) = @_;
+	return undef unless defined $iv && $iv ne '';
+	return int($iv) if $iv =~ /^\d+$/;
+	my @p = split(/:/, $iv);
+	return undef unless @p;
+	my $s = 0;
+	$s = $s * 60 + ($_ || 0) for @p;
+	return $s > 0 ? $s : undef;
 }
 
 # ---------- 元数据 ----------
