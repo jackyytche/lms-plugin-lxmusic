@@ -405,9 +405,21 @@ sub sdkBoardTracksHandler {
 	$window = 1   if $window < 1;
 	$window = 300 if $window > 300;     # fan-out 上限（300 首 = 至多 6 个上游页）
 	my $index      = $args->{index} || 0;
-	my $first_page = int($index / 50) + 1;   # 上游页宽 50
-	my $skip       = $index % 50;
+
+	# ⚠️ 上游页宽不是固定的 50：各源 SDK 的 getList 自带 limit —— kw=100、kg=100、
+	# tx=300、mg=200、wy=100000（整榜一次给）。旧代码硬编码 50 ⇒ 第 2 页起取到的
+	# 曲目整体错位（页宽 100 时 start=50 取到第 101-150 首），越界页直接上游报错
+	# （2026-09-21 设备实测：kw 热歌榜 start=250 渲染出「获取失败: try max num」）。
+	# 真实页宽由响应里的 limit 告知；下表只是让首次请求的页号就落在正确页上——
+	# 否则猜错页号会越界报错、响应里没有 limit，就永远学不到真实宽度（0.11.6 现场：
+	# start ≥ 150 全部失败，正是因为第 4 个上游页不存在）。
+	my %UPW_DEFAULT = ( kw => 100, kg => 100, tx => 300, mg => 200, wy => 100000 );
+	my $upw        = $UPW_DEFAULT{$src} || 50;
+	my $first_page = int($index / $upw) + 1;
+	my $skip       = $index % $upw;
 	my $max_pages  = 8;
+	my $retuned    = 0;    # 是否已按响应 limit 校正过页宽
+	my $probed     = 0;    # 是否已为学 limit 探过第 1 页
 
 	# ---- WINDOW FILLING（喜马拉雅 0.1.51）：顺序取上游页，攒够 [skip, skip+window)
 	# 才切——窗口比上游页宽时绝不吐空行（0.11.3 前身曾把窗口夹到 50 导致缺位空行）----
@@ -428,6 +440,42 @@ sub sdkBoardTracksHandler {
 			cb      => sub {
 				my ($res) = @_;
 				$pages_fetched++;
+
+				# 页宽校正（见 handler 顶部注释）：首响应给出 limit 就据此重算重取；
+				# 若首个请求本身就失败（页号猜错越界），先探第 1 页把 limit 学回来
+				if (!$retuned) {
+					my $limit = ($res->{ok} && $res->{data}) ? $res->{data}{limit} : undef;
+					if (defined $limit && $limit > 0) {
+						$retuned = 1;
+						if ($limit != $upw) {
+							$upw        = $limit;
+							$first_page = int($index / $upw) + 1;
+							$skip       = $index % $upw;
+							$max_pages  = int(($skip + $window) / $upw) + 2;
+							$max_pages  = 8 if $max_pages > 8;
+							$page          = $first_page;
+							$pages_fetched = 0;
+							@$acc    = ();
+							$info    = undef;
+							$total   = undef;
+							$lastErr = undef;
+							$again->();
+							return;
+						}
+					}
+					elsif (!$probed) {
+						my $has = ($res->{data} && $res->{data}{list}
+							&& @{ $res->{data}{list} }) ? 1 : 0;
+						if (!$has) {
+							$probed        = 1;
+							$page          = 1;
+							$pages_fetched = 0;
+							$again->();
+							return;
+						}
+					}
+				}
+
 				my $up = ($res->{ok} && $res->{data} && $res->{data}{list})
 					? $res->{data}{list} : [];
 				if (@$up) {
@@ -481,7 +529,7 @@ sub board_render {
 	# _trackItems 返回数组引用（勿再套 @ 展开成单元素列表——0.11.1 首版
 	# 曾写成 my @items = _trackItems(...)，items 变成 [[...]]，CLI 路径炸
 	# "Not a HASH reference"（XMLBrowser.pm L1012），榜单 feed 全空）
-	my $tracks = _trackItems($list, _u("[$src] "));
+	my $tracks = _trackItems($list, _u("[$src] "), undef, $index);
 
 	# 原生翻页契约：offset=窗口首曲绝对下标，total=全榜数（Slim/Control/XMLBrowser
 	# L787 count=total、L1002 start-=offset、L1009 按其切窗）。UI 自己渲染页码，
@@ -516,9 +564,12 @@ sub _board_play_actions {
 }
 
 # track(search/boardlist 产出) -> lxm:// audio 项（$prefixOf 可按曲给不同前缀，如聚合搜索的来源标签）
+# $offset：列表在整榜中的绝对起始下标（原生翻页时传窗口 index），让编号跨页连续
+# （0.11.5 前按页内 1 起编，翻到第 2 页仍显示 001-050，肉眼像"没翻页"）
 sub _trackItems {
-	my ($list, $prefix, $prefixOf) = @_;
+	my ($list, $prefix, $prefixOf, $offset) = @_;
 	$prefix ||= '';
+	$offset ||= 0;
 	my $q     = $prefs->get('quality') || '320k';
 	my @items;
 	my $n = 0;
@@ -544,7 +595,7 @@ sub _trackItems {
 			quality => $q,
 		});
 		push @items, {
-			name => sprintf('%03d %s%s%s', $n, $pfx, $name, ($singer ne '' ? " - $singer" : '')),
+			name => sprintf('%03d %s%s%s', $n + $offset, $pfx, $name, ($singer ne '' ? " - $singer" : '')),
 			type => 'audio',
 			url  => $url,
 			(length $cover ? (image => $cover) : ()),
