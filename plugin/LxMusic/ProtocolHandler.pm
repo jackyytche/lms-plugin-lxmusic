@@ -66,7 +66,13 @@ sub isRemote { 1 }
 sub getNextTrack {
 	my ($class, $song, $successCb, $errorCb) = @_;
 	my $su = (blessed($song) && $song->can('streamUrl')) ? $song->streamUrl : undef;
-	my $u  = (blessed($song) && $song->can('url')) ? $song->url : undef;
+	# ⚠️ 0.11.22：`Slim::Player::Song` **没有 url 方法**（§5.10.55 同款坑）⇒ 旧写法
+	# `$song->can('url') ? $song->url : undef` 恒为 undef，导致下面这段"开播前最后一刻校正"
+	# 一直是**死代码**（设备日志里始终是 `song=?` 与 `fmt=<nocache>`），tx 那种 CDN 谎报
+	# CT 的平台因此拿不到我们发布的码率/格式（"正在播放"那行空白）。
+	# 正确来源是 currentTrack()->url（getSeekData 用的就是它）。
+	my $u = (blessed($song) && $song->can('currentTrack')) ? eval { $song->currentTrack->url } : undef;
+	$u = $song->url if (!$u && blessed($song) && $song->can('url'));
 
 	# ⚠️ 播放前最后一刻校正流格式：LMS 扫描/开流时会用 CDN 声明的 Content-Type 覆盖
 	# 类型缓存（QQ/网易的 .flac 直链声明 audio/x-ogg），不修就会把 FLAC 数据交给
@@ -561,16 +567,43 @@ sub scanUrl {
 		return;
 	}
 
-	# 同步快路：命中缓存直接交父类，省掉 qjs fork + 上游请求（桌面版级别的瞬时起播）
+	# 命中缓存：**先验证这条直链还活着**再用（0.11.22）。
+	# 背景（设备实测 2026-09-21）：网易的签名直链**十几分钟就 403**（本机 13 分钟后复测同一 URL
+	# 直接 `HTTP 403 Forbidden`），而 `resolveTtl` 默认 600s ⇒ 缓存里躺着死链。把死链交给
+	# `SUPER::scanUrl` 的后果特别隐蔽：LMS 的远端扫描请求拿不到有效响应，**回调永远不来**
+	# ⇒ 我们连 `cb(undef)` 都没机会发 ⇒ 点了没声、几秒后 stop（日志里只有 `resolve cache HIT`
+	# 后面什么都没有，既没有 getNextTrack、也没有 RemoteStream）。
+	# 所以命中缓存也要探一次（设备侧 Range GET 2KB + 魔数，约 150~400ms；探测 worker 常驻），
+	# 死链就丢掉缓存**重新取链**——这也是"同一首歌有时能放有时不能"的真凶。
 	if (my $cached = _cache_get($url)) {
-		$log->info('LxMusic: resolve cache HIT (' . ($info->{name} || '') . ')');
-		$class->_finish_resolve($song, $url, $info, $cached->{direct}, $args, $cb, $cached->{fmt});
-		$class->_prefetch_next($song, $url);
+		$log->info('LxMusic: resolve cache HIT (' . ($info->{name} || '') . ') — verifying link');
+		Plugins::LxMusic::Helper->probeUrl($cached->{direct}, sub {
+			my ($p) = @_;
+			if ($p && $p->{ok}) {
+				$class->_finish_resolve($song, $url, $info, $cached->{direct}, $args, $cb,
+					$cached->{fmt}, $cached->{kbps}, $cached->{secs});
+				$class->_prefetch_next($song, $url);
+				return;
+			}
+			$log->warn('LxMusic: cached link is stale ('
+				. ($p ? ($p->{error} // "HTTP " . ($p->{status} // '?')) : 'no probe result')
+				. ') -> dropping cache and re-resolving');
+			delete $RESOLVE_CACHE{$url};
+			delete $RESOLVE_CACHE{ $cached->{direct} } if $cached->{direct};
+			$class->_resolve_fresh($song, $url, $info, $args, $cb);
+		});
 		return;
 	}
 
-	# M0.6：多订阅源聚合 + 音质降级链 + 取链后校验（Helper::resolveTrack）
-	# 以前的"无源就 cb(undef) 静默失败"改成把原因写进元数据，客户端/日志都看得见
+	$class->_resolve_fresh($song, $url, $info, $args, $cb);
+	return;
+}
+
+# 真正取链（缓存未命中 / 缓存已失效时走这里）：多订阅源聚合 + 音质降级链 + 取链后校验（Helper::resolveTrack）
+# 以前的"无源就 cb(undef) 静默失败"改成把原因写进元数据，客户端/日志都看得见
+sub _resolve_fresh {
+	my ($class, $song, $url, $info, $args, $cb) = @_;
+
 	$log->info('LxMusic: resolving src=' . $info->{src} . ' want=' . $info->{type});
 
 	Plugins::LxMusic::Helper->resolveTrack(
