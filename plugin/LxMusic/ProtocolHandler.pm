@@ -51,7 +51,7 @@ use Slim::Player::ProtocolHandlers;
 use Slim::Control::Request;
 use Slim::Utils::Log;
 use Slim::Utils::Prefs;
-# 注：0.11.28 起不再需要 Slim::Utils::Timers（曲末预取已停用，见 _prefetch_next 头注释）
+use Slim::Utils::Timers;      # 0.11.29：整榜入队后延迟补发队列元数据（见 explodePlaylist）
 
 use Plugins::LxMusic::Helper;
 my $log = logger('plugin.lxmusic');
@@ -455,20 +455,24 @@ sub _coverFromMusic {
 	return '';
 }
 
+# 封面 URL 推导（0.11.28 起**两条发布路径共用**这一份）。
+# 现场（2026-09-21 用户报"队列小图/正在播放大图忽有忽无"）：列表与解析各写一份推导，
+# 对同一首歌发布了**两个不同的封面 URL** ——
+#   · kg：列表走封面代理（getPic 真图），解析路径却给 `imge.kugou.com/stdmusic/240/<albumId>.jpg`
+#     （**已知对不同 albumId 返回同一张占位图**，见 Plugin::_coverOf 顶部注释）；
+#   · kw：列表走代理（pic.web 解析），解析路径给裸 pic.web URL（无 UA/Referer，CDN 多半拒绝）。
+# 统一到 `Plugin::_coverOf` 之后，队列行与正在播放行拿到的是同一个 URL。
+sub _cover_url {
+	my ($src, $music) = @_;
+	my $cover = eval { Plugins::LxMusic::Plugin::_coverOf($music) } // '';
+	$cover = _coverFromMusic($src, $music) unless $cover;
+	return $cover;
+}
+
 sub _publish_cover {
 	my ($class, $url, $src, $music) = @_;
 
-	# 0.11.28：**必须与列表行共用同一套推导**（`Plugins::LxMusic::Plugin::_coverOf`）。
-	# 现场（用户 2026-09-21 报"队列小图/正在播放大图忽有忽无"）：两条路各写一份推导，结果对同一首歌
-	# 发布了**两个不同的封面 URL** ——
-	#   · kg：列表走封面代理（getPic 真图），播放时 `_coverFromMusic` 却给
-	#     `imge.kugou.com/stdmusic/240/<albumId>.jpg`（**已知对不同 albumId 返回同一张占位图**，
-	#     见 Plugin::_coverOf 顶部注释）；
-	#   · kw：列表走代理（pic.web 解析），播放时给裸 pic.web URL（没有 UA/Referer，LMS 侧多半取不到）。
-	# 播放中 coverid 因此变化 ⇒ 客户端把图撤掉重取，表现为"点到哪首哪首的图就没了"；
-	# 反过来列表那一步没图（payload 缺 img）而播放时倒是取到了，就表现为"加入时没有、播放时有"。
-	my $cover = eval { Plugins::LxMusic::Plugin::_coverOf($music) } // '';
-	$cover = _coverFromMusic($src, $music) unless $cover;
+	my $cover = _cover_url($src, $music);
 	if ($cover) {
 		Slim::Music::Info::setRemoteMetadata($url, { cover => $cover });
 		$class->cache_metadata($url, { cover => $cover });
@@ -715,7 +719,7 @@ sub explodePlaylist {
 				my @list = @{ $res->{data}{list} };
 				@list = @list[ 0 .. 99 ] if @list > 100;
 				my $q = $prefs->get('quality') || '320k';
-				my @urls;
+				my (@urls, @repub);
 				for my $t (@list) {
 					next unless $t && ref($t) eq 'HASH';
 					my $name = ($t->{singer} ? $t->{singer} . ' - ' : '') . ($t->{name} || '?');
@@ -746,9 +750,42 @@ sub explodePlaylist {
 						kbps    => $est,
 						quality => $q,
 					});
+					# 0.11.29：记下来，**建队之后再补发一次**（见下面 Timer 的注释）
+					push @repub, {
+						u       => $u,
+						cover   => _cover_url(($t->{source} || $src), $t),
+						title   => $name,
+						secs    => $secs,
+						kbps    => $est,
+						quality => $q,
+					};
 					push @urls, $u;
 				}
 				$cb->(\@urls);
+
+				# 0.11.29：**整榜入队后补发一次元数据/封面**。
+				# 现场（用户 2026-09-21）：页首"全部播放/添加"一次入队 N 首时，**除正在播/预读的那一两首外，
+				# 队列行全都没封面**；而逐行手动入队正常。实测（kw 热歌榜 100 首）：
+				#     整榜入队后   → 有封面 0 / 100
+				#     事后重渲染榜单页 → 有封面 50 / 100    ← 说明"入队前发的封面不会被新建的队列行采用"
+				# ⇒ 必须在**建队之后**再发一遍。延迟 4 秒（LMS 把 100 行建好需要一点时间），
+				# 只做一次，成本 = N 次 updateOrCreate + 缓存写（每建一次队一次）。
+				if (@repub) {
+					my @snapshot = @repub;
+					Slim::Utils::Timers::setTimer($client, time() + 4, sub {
+						for my $r (@snapshot) {
+							$class->publishQueueMetadata($r->{u}, {
+								title   => $r->{title},
+								secs    => $r->{secs},
+								kbps    => $r->{kbps},
+								cover   => $r->{cover},
+								quality => $r->{quality},
+							});
+						}
+						$log->info('LxMusic: re-published queue metadata for '
+							. scalar(@snapshot) . ' items (after the playlist was built)');
+					});
+				}
 			},
 		);
 		return;
