@@ -383,8 +383,14 @@ sub _finish_resolve {
 sub _prefetch_next {
 	my ($class, $song, $url, $when_due) = @_;
 
+	$log->info('LxMusic: prefetch entry (when_due=' . ($when_due ? 1 : 0) . ', blessed='
+		. (blessed($song) ? 1 : 0) . ')') if $when_due;
+
 	return unless blessed($song) && $song->can('master');
-	my $client = $song->master() or return;
+	my $client = $song->master() or do {
+		$log->info('LxMusic: prefetch skip: no client') if $when_due;
+		return;
+	};
 
 	unless ($when_due) {
 		my $c    = _cache_get($url);
@@ -394,6 +400,9 @@ sub _prefetch_next {
 			my $delay = $secs - $lead;
 			$log->info("LxMusic: prefetch scheduled in ${delay}s (track ${secs}s, PC-parity)");
 			Slim::Utils::Timers::setTimer($client, time() + $delay, sub {
+				# 0.11.27 诊断：确认定时器到底有没有触发
+				# （0.11.26 现场：到点那一刻日志里完全没有插件行为，怀疑 $song 已被释放）
+				$log->info("LxMusic: prefetch timer FIRED (scheduled ${delay}s after track start)");
 				$class->_prefetch_next($song, $url, 1);
 			});
 			return;
@@ -401,11 +410,17 @@ sub _prefetch_next {
 	}
 
 	my $tracks = eval { Slim::Player::Playlist::tracks($client) };
-	return unless $tracks && ref($tracks) eq 'ARRAY' && @$tracks;
+	unless ($tracks && ref($tracks) eq 'ARRAY' && @$tracks) {
+		$log->info('LxMusic: prefetch skip: empty playlist') if $when_due;
+		return;
+	}
 
 	my ($idx) = grep { blessed($tracks->[$_]) && $tracks->[$_]->can('url') && $tracks->[$_]->url eq $url }
 		0 .. $#$tracks;
-	return unless defined $idx && $idx < $#$tracks;
+	unless (defined $idx && $idx < $#$tracks) {
+		$log->info('LxMusic: prefetch skip: current url not found or no next item') if $when_due;
+		return;
+	}
 
 	my $nextTrack = $tracks->[ $idx + 1 ];
 	return unless blessed($nextTrack) && $nextTrack->can('url');
@@ -413,7 +428,11 @@ sub _prefetch_next {
 	return unless $nextUrl && $nextUrl =~ m{^lxm://};
 	# 已有"新鲜"缓存就不必再取；但过老的条目要重取（否则预取出来的也是死链，见 _fresh_window）
 	my $nc = _cache_get($nextUrl);
-	return if $nc && (time() - ($nc->{born} || 0)) < _fresh_window();
+	if ($nc && (time() - ($nc->{born} || 0)) < _fresh_window()) {
+		$log->info('LxMusic: prefetch skip: next already fresh (age=' . (time() - ($nc->{born} || 0)) . 's)')
+			if $when_due;
+		return;
+	}
 
 	my $ninfo = eval { $class->parseUrl($nextUrl) } or return;
 
