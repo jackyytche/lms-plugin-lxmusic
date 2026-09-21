@@ -47,6 +47,7 @@ use Scalar::Util qw(blessed);
 use Slim::Music::Info;
 use Slim::Networking::SimpleAsyncHTTP;
 use Slim::Player::Playlist;
+use Slim::Player::Client;      # 0.11.30：republish_queued_rows 要遍历所有播放器队列
 use Slim::Player::ProtocolHandlers;
 use Slim::Control::Request;
 use Slim::Utils::Log;
@@ -469,6 +470,44 @@ sub _cover_url {
 	return $cover;
 }
 
+# 0.11.30：**建队之后**再给"真的进了队列"的行补发一次元数据/封面。
+# 现场（用户 2026-09-21）：页首"全部播放/添加"一次入队整榜（如 tx 热歌榜 300 首）时，
+# **除正在播/预读的那一两首外，队列行全没封面**；实测（kw 榜 100 首）：
+#     整榜入队 0/100 有图  →  事后重渲染一次榜单页 50/100 有图
+# ⇒ **建队之前发布的封面不会被新建的队列行采用**，必须在建队之后再发一次。
+# 这里遍历所有播放器的队列，**只补发真的在队列里的 URL**（所以单纯浏览页面时不会白干）。
+# 调用方（`Plugin::_trackItems` 的 feed 路径 与 `explodePlaylist`）都用它。
+sub republish_queued_rows {
+	my ($class, $rows) = @_;
+
+	return 0 unless $rows && ref($rows) eq 'ARRAY' && @$rows;
+	my %want = map { $_->{url} => $_ } grep { $_ && $_->{url} } @$rows;
+	return 0 unless %want;
+
+	my $n = 0;
+	for my $client (Slim::Player::Client::clients()) {
+		my $pl = eval { Slim::Player::Playlist::playList($client) };
+		next unless $pl && ref($pl) eq 'ARRAY';
+		for my $item (@$pl) {
+			my $u = blessed($item) ? eval { $item->url } : $item;
+			next unless $u && $want{$u};
+			my $r = $want{$u};
+			eval {
+				$class->publishQueueMetadata($u, {
+					title   => $r->{title},
+					secs    => $r->{secs},
+					kbps    => $r->{kbps},
+					cover   => $r->{cover},
+					quality => $r->{quality},
+				});
+			};
+			$n++;
+		}
+	}
+	$log->info("LxMusic: re-published queue metadata for $n queued rows (after the playlist was built)");
+	return $n;
+}
+
 sub _publish_cover {
 	my ($class, $url, $src, $music) = @_;
 
@@ -773,17 +812,7 @@ sub explodePlaylist {
 				if (@repub) {
 					my @snapshot = @repub;
 					Slim::Utils::Timers::setTimer($client, time() + 4, sub {
-						for my $r (@snapshot) {
-							$class->publishQueueMetadata($r->{u}, {
-								title   => $r->{title},
-								secs    => $r->{secs},
-								kbps    => $r->{kbps},
-								cover   => $r->{cover},
-								quality => $r->{quality},
-							});
-						}
-						$log->info('LxMusic: re-published queue metadata for '
-							. scalar(@snapshot) . ' items (after the playlist was built)');
+						$class->republish_queued_rows(\@snapshot);
 					});
 				}
 			},

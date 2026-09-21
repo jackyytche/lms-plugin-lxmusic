@@ -26,6 +26,7 @@ use Time::HiRes qw(time);
 
 use Slim::Utils::Log;
 use Slim::Utils::Prefs;
+use Slim::Utils::Timers;     # 0.11.30：建队后补发队列元数据（见 _trackItems 末尾）
 use Slim::Utils::Network;
 use Slim::Web::Pages;
 use Slim::Networking::SimpleAsyncHTTP;
@@ -592,6 +593,7 @@ sub _trackItems {
 	$offset ||= 0;
 	my $q     = $prefs->get('quality') || '320k';
 	my @items;
+	my @pub;          # 0.11.30：稍后给"真的进了队列"的那些行补发
 	my $n = 0;
 	for my $t (@$list) {
 		next unless $t && ref($t) eq 'HASH';
@@ -633,6 +635,15 @@ sub _trackItems {
 			cover   => $cover,
 			quality => $q,
 		});
+		# 0.11.30：记下来，稍后**对真的进了队列的行**再发一遍（见文件末尾 Timer 的注释）
+		push @pub, {
+			url     => $url,
+			title   => ($singer ne '' ? "$singer - $name" : $name),
+			secs    => $secs,
+			kbps    => $est_kbps,
+			cover   => $cover,
+			quality => $q,
+		};
 		push @items, {
 			name => sprintf('%03d %s%s%s', $n + $offset, $pfx, $name, ($singer ne '' ? " - $singer" : '')),
 			type => 'audio',
@@ -645,6 +656,20 @@ sub _trackItems {
 	$log->debug('LxMusic: rows=' . scalar(@items) . ' without-cover='
 		. scalar(grep { !$_->{image} } @items)
 		. ' without-duration=' . scalar(grep { !defined $_->{duration} } @items));
+
+	# 0.11.30：**建队之后再补发一次封面/元数据**。
+	# 现场（用户 2026-09-21）：页首"全部播放/添加"一次入队整榜时，**除正在播/预读的一两首外，队列行全没封面**；
+	# 实测（kw 榜单 100 首）"整榜入队 0/100 有图，事后重渲染榜单页 50/100 有图" ⇒
+	# **建队之前发布的封面不会被新建的队列行采用**。而这个 300 首的队列走的是"浏览 feed + 批量加入"
+	# （explode 有 100 上限，所以队列 >100 必然是这条路），所以补发也必须挂在 feed 这里。
+	# 4 秒后只对**真的进了某个播放器队列**的 URL 重发（遍历 `Slim::Player::Client::clients()`），
+	# 于是单纯浏览页面时不会白干。
+	if (@pub) {
+		my @snapshot = @pub;
+		Slim::Utils::Timers::setTimer(__PACKAGE__, time() + 4, sub {
+			Plugins::LxMusic::ProtocolHandler->republish_queued_rows(\@snapshot);
+		});
+	}
 
 	# 渲染期预热前几首（点哪首都是缓存命中）——异步，不阻塞页面
 	Plugins::LxMusic::ProtocolHandler->warmTracks([ map { $_->{url} } @items ], 3) if @items;
