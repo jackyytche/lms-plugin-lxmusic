@@ -42,6 +42,13 @@ jobs:
           perl -I t -I t_build t/helper-test.pl 2>&1 | tee helper-test.log
           exit ${PIPESTATUS[0]}
 
+      - name: Resolve parallel regression (0.11.24)
+        run: |
+          cd plugin
+          set -o pipefail
+          perl -I t -I t_build t/resolve-parallel-test.pl 2>&1 | tee -a helper-test.log
+          exit ${PIPESTATUS[0]}
+
       - name: CHECK Helper.pm
         run: cd plugin && perl -I t -I t_build -c t_build/Plugins/LxMusic/Helper.pm
 

@@ -239,11 +239,24 @@ sub resolveTrack {
 	my @tries;
 	my @deferred;          # 能取到、但不"播放器友好"的候选（无音频后缀的脚本中转链）
 	my $preferFriendly = defined $a{preferFriendly} ? $a{preferFriendly} : _pref('preferStreamable', 1);
-	my $next;
+
+	# 0.11.24：**并行尝试候选**。原来是串行的（上一个彻底失败才试下一个），而现场最常见的形态是
+	# "排在前面的源自己上游超时 ~4s → 才轮到后面的源成功"（wy 行 46 实测 `resolved OK (8.86s)`：
+	# 独家音源@flac 先失败、星海@flac 才成功）⇒ 串起来就超过 LMS 的耐心（约 4~8s），
+	# 表现为"点了没声"。这里开一个 **2 个候选的并行窗口**：谁先给出可用直链就用谁
+	# （仍尊重 preferStreamable：无音频后缀的中转链只挂起、等友好直链）。
+	# 窗口保守取 2：每个源一个常驻 worker，设备是双核达菲。
+	# 全程对外语义不变（tries/source/quality/deferred 都照旧记录）。
+	my $K        = 2;
+	my $inflight = 0;
+	my $done     = 0;
+	my $dispatch;
 
 	# 交付一个候选（写 tries + 回调）；$friendly 标记是否播放器友好
 	my $finish = sub {
 		my ($src, $q, $url, $tm, $friendly, $verified, $kbps, $magic, $len) = @_;
+		return if $done;                 # 并行窗口下只交付一次
+		$done = 1;
 		my $suspect = ($kbps && $kbps < 64) ? 1 : 0;
 		if ($suspect) {
 			$log->warn("LxMusic resolve: SUSPECT short/preview file ([" . ($src->{name} // '?')
@@ -283,7 +296,7 @@ sub resolveTrack {
 
 	# 校验后交付（verifyUrl 关掉则直接交付）
 	my $verifyThenFinish = sub {
-		my ($src, $q, $url, $tm, $friendly) = @_;
+		my ($src, $q, $url, $tm, $friendly, $settle) = @_;
 		return $finish->($src, $q, $url, $tm, $friendly, 0, undef, undef) unless $wantVerify;
 		my $tv = Time::HiRes::time();
 		$class->probeUrl($url, sub {
@@ -297,76 +310,99 @@ sub resolveTrack {
 			}
 			push @tries, { source => $src->{name}, quality => $q, why => 'verify: ' . ($pi->{error} // '?'), %$tm };
 			$log->warn("LxMusic resolve: verify rejected [" . $src->{name} . "] $q: " . ($pi->{error} // '?'));
-			$next->();
+			$settle->();
 		});
 		return;
 	};
 
-	$next = sub {
-		my $cand = shift @cand;
-		unless ($cand) {
-			# 没有"播放器友好"的直链 ⇒ 退而求其次，用兜底的中转链（先校验一次再交付）
-			if (@deferred) {
-				my $d = shift @deferred;
-				$log->warn('LxMusic resolve: 没有"播放器友好"直链，改用兜底中转链 ['
-					. ($d->{src}{name} // '?') . '] ' . substr($d->{url}, 0, 80));
-				return $verifyThenFinish->($d->{src}, $d->{q}, $d->{url}, $d->{tm}, 0);
+	# 派发器：窗口未满就继续启动候选；某个候选结算（成功/失败/挂起/校验被拒）时补位。
+	# 候选耗尽且没有"在飞"的之后，才走"兜底中转链 → 全失败"的收尾。
+	$dispatch = sub {
+		return if $done;
+
+		while ($inflight < $K) {
+			my $cand = shift @cand;
+			last unless $cand;
+
+			my ($q, $src) = @$cand;
+			my $path = Plugins::LxMusic::Sources->pathFor($src->{id});
+			unless ($path && -f $path) {
+				push @tries, { source => $src->{name}, quality => $q, why => 'file missing' };
+				next;                       # 不占窗口，继续取下一个候选
 			}
-			my @last = @tries > 3 ? @tries[ -3 .. -1 ] : @tries;
-			my $why = join('; ', map {
-				($_->{source} // '?') . '@' . ($_->{quality} // '?') . ': ' . ($_->{why} // '?')
-			} @last);
-			$why = '无候选' unless length $why;
-			$log->warn('LxMusic resolve FAILED after ' . scalar(@tries) . " tries: $why");
-			return $cb->({ ok => 0, error => "全部订阅源都取不到直链（$why）", tries => \@tries });
+
+			$inflight++;
+			my $settled = 0;
+			my $settle = sub {              # 每个候选只结算一次，并立刻补位
+				return if $settled;
+				$settled = 1;
+				$inflight--;
+				$dispatch->();
+			};
+
+			$log->warn("LxMusic resolve: try [" . $src->{name} . "] type=$q");
+			# 计时用 HiRes：页面上的 1.04s 级精度就靠它；这里记「宿主墙钟」与「源内 handler 耗时」
+			# 两个数（后者只有常驻 worker 能报，因为它由 shim 在源内自测）。
+			my $t0 = Time::HiRes::time();
+			$class->request(
+				source   => $path,
+				action   => 'musicUrl',
+				sourceId => ($a{src} // ''),
+				info     => { musicInfo => $track, type => $q },
+				timeout  => ($a{timeout} || 20),
+				cb       => sub {
+					my ($res) = @_;
+					my $el = Time::HiRes::time() - $t0;
+					my %tm = (ms => int($el * 1000 + 0.5), path => ($res->{why} // 'fork'));
+					$tm{handler} = int($res->{ms} + 0.5) if defined $res->{ms};
+					my $url = $res->{data};
+					unless ($res->{ok} && defined $url && !ref($url) && $url =~ m{^https?://}) {
+						# 把子进程日志尾部并进 why：否则像 "no RESULT line" 这种失败在现场完全无痕
+						# （qjs 子进程最后几行才是真正原因，M0.9 现场吃了这个亏）
+						my @tail = grep { defined && length } @{ $res->{logs} || [] };
+						@tail = @tail[ -2 .. -1 ] if @tail > 2;
+						my $why = ($res->{error} // 'no url')
+							. (@tail ? ' {' . join(' | ', map { substr($_, 0, 100) } @tail) . '}' : '');
+						push @tries, { source => $src->{name}, quality => $q, why => $why, %tm };
+						return $settle->();
+					}
+					my $friendly = $class->streamFriendly($url) ? 1 : 0;
+					# 不友好的候选先挂起，不当场花一次 HEAD 校验：只有确实找不到友好直链时才回头用它
+					if ($preferFriendly && !$friendly) {
+						my $tmr = { %tm };
+						push @tries, { source => $src->{name}, quality => $q, ok => 1, deferred => 1,
+							friendly => 0, why => 'no audio suffix (script relay), deferred', %tm };
+						$log->warn("LxMusic resolve: [" . $src->{name} . "] $q 直链无音频后缀（脚本中转链），暂缓");
+						push @deferred, { src => $src, q => $q, url => $url, tm => $tmr, t0 => $t0 };
+						return $settle->();
+					}
+					return $verifyThenFinish->($src, $q, $url, \%tm, $friendly, $settle);
+				},
+			);
 		}
-		my ($q, $src) = @$cand;
-		my $path = Plugins::LxMusic::Sources->pathFor($src->{id});
-		unless ($path && -f $path) {
-			push @tries, { source => $src->{name}, quality => $q, why => 'file missing' };
-			return $next->();
+
+		return if $done || $inflight > 0;    # 还有在飞的候选 ⇒ 等它结算
+
+		# 没有"播放器友好"的直链 ⇒ 退而求其次，用兜底的中转链（先校验一次再交付）
+		if (@deferred) {
+			my $d = shift @deferred;
+			$log->warn('LxMusic resolve: 没有"播放器友好"直链，改用兜底中转链 ['
+				. ($d->{src}{name} // '?') . '] ' . substr($d->{url}, 0, 80));
+			$inflight++;
+			my $settled = 0;
+			my $settle = sub { return if $settled; $settled = 1; $inflight--; $dispatch->(); };
+			return $verifyThenFinish->($d->{src}, $d->{q}, $d->{url}, $d->{tm}, 0, $settle);
 		}
-		$log->warn("LxMusic resolve: try [" . $src->{name} . "] type=$q");
-		# 计时用 HiRes：页面上的 1.04s 级精度就靠它；这里记「宿主墙钟」与「源内 handler 耗时」
-		# 两个数（后者只有常驻 worker 能报，因为它由 shim 在源内自测）。
-		my $t0 = Time::HiRes::time();
-		$class->request(
-			source   => $path,
-			action   => 'musicUrl',
-			sourceId => ($a{src} // ''),
-			info     => { musicInfo => $track, type => $q },
-			timeout  => ($a{timeout} || 20),
-			cb       => sub {
-				my ($res) = @_;
-				my $el = Time::HiRes::time() - $t0;
-				my %tm = (ms => int($el * 1000 + 0.5), path => ($res->{why} // 'fork'));
-				$tm{handler} = int($res->{ms} + 0.5) if defined $res->{ms};
-				my $url = $res->{data};
-				unless ($res->{ok} && defined $url && !ref($url) && $url =~ m{^https?://}) {
-					# 把子进程日志尾部并进 why：否则像 "no RESULT line" 这种失败在现场完全无痕
-					# （qjs 子进程最后几行才是真正原因，M0.9 现场吃了这个亏）
-					my @tail = grep { defined && length } @{ $res->{logs} || [] };
-					@tail = @tail[ -2 .. -1 ] if @tail > 2;
-					my $why = ($res->{error} // 'no url')
-						. (@tail ? ' {' . join(' | ', map { substr($_, 0, 100) } @tail) . '}' : '');
-					push @tries, { source => $src->{name}, quality => $q, why => $why, %tm };
-					return $next->();
-				}
-				my $friendly = $class->streamFriendly($url) ? 1 : 0;
-				# 不友好的候选先挂起，不当场花一次 HEAD 校验：只有确实找不到友好直链时才回头用它
-				if ($preferFriendly && !$friendly) {
-					my $tmr = { %tm };
-					push @tries, { source => $src->{name}, quality => $q, ok => 1, deferred => 1,
-						friendly => 0, why => 'no audio suffix (script relay), deferred', %tm };
-					$log->warn("LxMusic resolve: [" . $src->{name} . "] $q 直链无音频后缀（脚本中转链），暂缓");
-					push @deferred, { src => $src, q => $q, url => $url, tm => $tmr, t0 => $t0 };
-					return $next->();
-				}
-				return $verifyThenFinish->($src, $q, $url, \%tm, $friendly);
-			},
-		);
+
+		my @last = @tries > 3 ? @tries[ -3 .. -1 ] : @tries;
+		my $why = join('; ', map {
+			($_->{source} // '?') . '@' . ($_->{quality} // '?') . ': ' . ($_->{why} // '?')
+		} @last);
+		$why = '无候选' unless length $why;
+		$log->warn('LxMusic resolve FAILED after ' . scalar(@tries) . " tries: $why");
+		return $cb->({ ok => 0, error => "全部订阅源都取不到直链（$why）", tries => \@tries });
 	};
-	$next->();
+	$dispatch->();
 	return;
 }
 
