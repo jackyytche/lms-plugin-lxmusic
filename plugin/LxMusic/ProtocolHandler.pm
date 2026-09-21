@@ -51,7 +51,7 @@ use Slim::Player::ProtocolHandlers;
 use Slim::Control::Request;
 use Slim::Utils::Log;
 use Slim::Utils::Prefs;
-use Slim::Utils::Timers;      # 0.11.26：曲末预取的定时器（对齐落雪 PC 的"剩余 <10s 才预取"）
+# 注：0.11.28 起不再需要 Slim::Utils::Timers（曲末预取已停用，见 _prefetch_next 头注释）
 
 use Plugins::LxMusic::Helper;
 my $log = logger('plugin.lxmusic');
@@ -376,94 +376,14 @@ sub _finish_resolve {
 	return;
 }
 
-# 预取下一首：**按落雪 PC 的做法，等到"快播完"再取**（0.11.26，§5.11.94）。
-# 旧版是"本首一开始就预取"（0.5.1），但那条缓存根本撑不到下一首——直链寿命实测 4s~13min，
-# 白花一次解析，还容易把死链写进缓存。现在用缓存里的曲长算出"曲末前 15 秒"，到点再取
-# （PC 端是剩余 <10s，同款思路）。$when_due=1 表示"定时器到点了，直接取"。
-sub _prefetch_next {
-	my ($class, $song, $url, $when_due) = @_;
-
-	$log->info('LxMusic: prefetch entry (when_due=' . ($when_due ? 1 : 0) . ', blessed='
-		. (blessed($song) ? 1 : 0) . ')') if $when_due;
-
-	return unless blessed($song) && $song->can('master');
-	my $client = $song->master() or do {
-		$log->info('LxMusic: prefetch skip: no client') if $when_due;
-		return;
-	};
-
-	unless ($when_due) {
-		my $c    = _cache_get($url);
-		my $secs = ($c && $c->{secs}) ? $c->{secs} : 0;
-		my $lead = 15;
-		if ($secs > $lead * 2) {
-			my $delay = $secs - $lead;
-			$log->info("LxMusic: prefetch scheduled in ${delay}s (track ${secs}s, PC-parity)");
-			Slim::Utils::Timers::setTimer($client, time() + $delay, sub {
-				# 0.11.27 诊断：确认定时器到底有没有触发
-				# （0.11.26 现场：到点那一刻日志里完全没有插件行为，怀疑 $song 已被释放）
-				$log->info("LxMusic: prefetch timer FIRED (scheduled ${delay}s after track start)");
-				$class->_prefetch_next($song, $url, 1);
-			});
-			return;
-		}
-	}
-
-	my $tracks = eval { Slim::Player::Playlist::tracks($client) };
-	unless ($tracks && ref($tracks) eq 'ARRAY' && @$tracks) {
-		$log->info('LxMusic: prefetch skip: empty playlist') if $when_due;
-		return;
-	}
-
-	my ($idx) = grep { blessed($tracks->[$_]) && $tracks->[$_]->can('url') && $tracks->[$_]->url eq $url }
-		0 .. $#$tracks;
-	unless (defined $idx && $idx < $#$tracks) {
-		$log->info('LxMusic: prefetch skip: current url not found or no next item') if $when_due;
-		return;
-	}
-
-	my $nextTrack = $tracks->[ $idx + 1 ];
-	return unless blessed($nextTrack) && $nextTrack->can('url');
-	my $nextUrl = $nextTrack->url;
-	return unless $nextUrl && $nextUrl =~ m{^lxm://};
-	# 已有"新鲜"缓存就不必再取；但过老的条目要重取（否则预取出来的也是死链，见 _fresh_window）
-	my $nc = _cache_get($nextUrl);
-	if ($nc && (time() - ($nc->{born} || 0)) < _fresh_window()) {
-		$log->info('LxMusic: prefetch skip: next already fresh (age=' . (time() - ($nc->{born} || 0)) . 's)')
-			if $when_due;
-		return;
-	}
-
-	my $ninfo = eval { $class->parseUrl($nextUrl) } or return;
-
-	$log->info('LxMusic: prefetch next (' . ($ninfo->{name} || '') . ')');
-	Plugins::LxMusic::Helper->resolveTrack(
-		music   => $ninfo->{music},
-		src     => $ninfo->{src},
-		type    => $ninfo->{type},
-		timeout => 20,
-		# 0.11.25：预取**也要校验**（对齐落雪 PC 的 usePreloadNextMusic：先 getMusicUrl 缓存，
-		# 再用真实媒体元素 checkMusicUrl 验证，不行就 isRefresh 重取）。校验失败的候选会被
-		# resolveTrack 的阶梯自动跳过（现在还是并行的）⇒ 落进缓存的必然是"探针能取到音频字节"的链。
-		# 这段是后台行为，慢一点无所谓（用户看不到），换来的是点击那一刻不再赌 URL 还活着。
-		verify  => 1,
-		cb      => sub {
-			my ($res) = @_;
-			if ($res->{ok} && $res->{url}) {
-				# 必须写全记录：只写 direct 会让播放路径拿不到 fmt/kbps/secs，
-				# 表现就是 tx 那种"正在播放"缺格式码率（0.11.22 修过同类问题）
-				_cache_put($nextUrl, $res->{url}, $res->{format}, $res->{actualKbps},
-					$res->{secs}, $res->{length});
-				$log->info('LxMusic: prefetched ok via [' . ($res->{source} // '?') . ']'
-					. (defined $res->{actualKbps} ? " ~$res->{actualKbps}kbps" : '') . ' verified');
-			}
-			else {
-				$log->debug('LxMusic: prefetch failed: ' . ($res->{error} || 'unknown'));
-			}
-		},
-	);
-	return;
-}
+# ⚠️ 0.11.28：**曲末预取已整体删除**（原 `_prefetch_next`）。原因（0.11.27 诊断实证）：
+#   ① 它从 0.5.1 起**从未生效**：用的是 `Slim::Player::Playlist::tracks()` —— 这个 API **不存在**
+#      （`Slim::Player/Playlist.pm` 里只有 `playList`/`count`），每次都在 `$tracks` 为 undef 时静默 return；
+#      日志现场：`prefetch timer FIRED` → `prefetch entry (when_due=1, blessed=1)` → `prefetch skip: empty playlist`。
+#   ② 就算修对 API 也**多余**：**LMS 自己做 lookahead**——本首起播 ~8 秒就来要下一首的 URL，
+#      并一直把流准备着（`StreamingController::_PlayAndNext … already fully streaming song`）。
+#   ③ 自动连播实测切换 ~2 秒、切换点无重新取链 ⇒ 删掉它零回归，还省掉一次多余的解析与缓存写入。
+# 现在"下一首"的准备完全交给 LMS lookahead；我们只保留**渲染期预热**（`warmTracks`）。
 
 # 渲染期预热（0.5.2）：列表渲染完就后台解析前 N 首，用户点哪首都是缓存命中（秒开）。
 # 受 Helper 并发闸（max 2）保护，不会打满设备；已在缓存里的跳过。
@@ -538,7 +458,17 @@ sub _coverFromMusic {
 sub _publish_cover {
 	my ($class, $url, $src, $music) = @_;
 
-	my $cover = _coverFromMusic($src, $music);
+	# 0.11.28：**必须与列表行共用同一套推导**（`Plugins::LxMusic::Plugin::_coverOf`）。
+	# 现场（用户 2026-09-21 报"队列小图/正在播放大图忽有忽无"）：两条路各写一份推导，结果对同一首歌
+	# 发布了**两个不同的封面 URL** ——
+	#   · kg：列表走封面代理（getPic 真图），播放时 `_coverFromMusic` 却给
+	#     `imge.kugou.com/stdmusic/240/<albumId>.jpg`（**已知对不同 albumId 返回同一张占位图**，
+	#     见 Plugin::_coverOf 顶部注释）；
+	#   · kw：列表走代理（pic.web 解析），播放时给裸 pic.web URL（没有 UA/Referer，LMS 侧多半取不到）。
+	# 播放中 coverid 因此变化 ⇒ 客户端把图撤掉重取，表现为"点到哪首哪首的图就没了"；
+	# 反过来列表那一步没图（payload 缺 img）而播放时倒是取到了，就表现为"加入时没有、播放时有"。
+	my $cover = eval { Plugins::LxMusic::Plugin::_coverOf($music) } // '';
+	$cover = _coverFromMusic($src, $music) unless $cover;
 	if ($cover) {
 		Slim::Music::Info::setRemoteMetadata($url, { cover => $cover });
 		$class->cache_metadata($url, { cover => $cover });
@@ -646,11 +576,13 @@ sub scanUrl {
 	# 超过新鲜窗口就**直接重新取链**（实测 3.2s，LMS 能等；B 组 A/B 就是这样 PASS 的），不做探测。
 	my $cached = _cache_get($url);
 	my $age = $cached ? (time() - ($cached->{born} || 0)) : 0;
-	if ($cached && $age < 90) {
+	# ⚠️ 0.11.28 修：这里原本**硬编码 90**，而 0.11.24 把 `_fresh_window()` 改成 30 只改到了
+	# （当时还没被证明是死代码的）预取路径 ⇒ 播放路径实际上一直还在用 90 秒窗口
+	# （也就是 kg 实测"84 秒的直链已经死了"的那个窗口）。统一用 _fresh_window()。
+	if ($cached && $age < _fresh_window()) {
 		$log->info('LxMusic: resolve cache HIT (' . ($info->{name} || '') . ") age=${age}s — fresh, using it");
 		$class->_finish_resolve($song, $url, $info, $cached->{direct}, $args, $cb,
 			$cached->{fmt}, $cached->{kbps}, $cached->{secs});
-		$class->_prefetch_next($song, $url);
 		return;
 	}
 	if ($cached) {
@@ -707,7 +639,6 @@ sub _resolve_fresh {
 			# 直链是实际流地址；playlist 里保持稳定的 lxm:// URL
 			$class->_finish_resolve($song, $url, $info, $direct, $args, $cb,
 				$res->{format}, $res->{actualKbps}, $res->{secs});
-			$class->_prefetch_next($song, $url);
 			return;
 		},
 	);
