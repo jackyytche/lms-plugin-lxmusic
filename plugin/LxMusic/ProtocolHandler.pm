@@ -51,6 +51,7 @@ use Slim::Player::ProtocolHandlers;
 use Slim::Control::Request;
 use Slim::Utils::Log;
 use Slim::Utils::Prefs;
+use Slim::Utils::Timers;      # 0.11.26：曲末预取的定时器（对齐落雪 PC 的"剩余 <10s 才预取"）
 
 use Plugins::LxMusic::Helper;
 my $log = logger('plugin.lxmusic');
@@ -375,12 +376,29 @@ sub _finish_resolve {
 	return;
 }
 
-# 预取下一首（0.5.1）：把下一首的 2.3s 解析藏在本首播放期间，切歌近乎零等待
+# 预取下一首：**按落雪 PC 的做法，等到"快播完"再取**（0.11.26，§5.11.94）。
+# 旧版是"本首一开始就预取"（0.5.1），但那条缓存根本撑不到下一首——直链寿命实测 4s~13min，
+# 白花一次解析，还容易把死链写进缓存。现在用缓存里的曲长算出"曲末前 15 秒"，到点再取
+# （PC 端是剩余 <10s，同款思路）。$when_due=1 表示"定时器到点了，直接取"。
 sub _prefetch_next {
-	my ($class, $song, $url) = @_;
+	my ($class, $song, $url, $when_due) = @_;
 
 	return unless blessed($song) && $song->can('master');
 	my $client = $song->master() or return;
+
+	unless ($when_due) {
+		my $c    = _cache_get($url);
+		my $secs = ($c && $c->{secs}) ? $c->{secs} : 0;
+		my $lead = 15;
+		if ($secs > $lead * 2) {
+			my $delay = $secs - $lead;
+			$log->info("LxMusic: prefetch scheduled in ${delay}s (track ${secs}s, PC-parity)");
+			Slim::Utils::Timers::setTimer($client, time() + $delay, sub {
+				$class->_prefetch_next($song, $url, 1);
+			});
+			return;
+		}
+	}
 
 	my $tracks = eval { Slim::Player::Playlist::tracks($client) };
 	return unless $tracks && ref($tracks) eq 'ARRAY' && @$tracks;
@@ -695,7 +713,25 @@ sub new {
 		my $shown = length $u ? substr($u, 0, 90) : '<undef>';
 		$log->info('LxMusic: player open -> ' . $shown);
 	}
-	return $class->SUPER::new($args);
+
+	my $self = eval { $class->SUPER::new($args) };
+	if (!$self) {
+		# 0.11.26：**开流失败就踢掉解析缓存**。现场（0.11.25 验收）：
+		#   Can't open socket to [m704.music.126.net:80]: 110: Connection timed out → stream failed to open
+		# 而**同一条 URL 20 秒后又能播**（CDN 边缘/网络抖动；我们的探针用的是系统 curl，且可能命中
+		# 另一个 A 记录，所以探针通过 ≠ LMS 的 IO::Socket::INET 连得上）。
+		# 踢掉条目后，下次点击/重试会重新取链（很可能换到另一个边缘主机），不再钉着连不上的那条。
+		my $t = eval { $args->{song}->currentTrack->url } // '';
+		if ($t) {
+			my $c = $RESOLVE_CACHE{$t};
+			delete $RESOLVE_CACHE{$t};
+			delete $RESOLVE_CACHE{ $c->{direct} } if $c && $c->{direct};
+			$log->warn('LxMusic: stream open failed -> dropped resolve cache for ' . substr($t, 0, 40)
+				. ' (next try will re-resolve)');
+		}
+		return undef;
+	}
+	return $self;
 }
 
 # 整榜/整歌单/单曲三语义（0.11.1 榜单页头引入 lxm://b/；0.11.13 加 lxm://l/ 给歌单）：
