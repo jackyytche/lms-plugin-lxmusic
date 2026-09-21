@@ -1,8 +1,8 @@
 Ambiguous call resolved as CORE::warn(), qualify as such or use & at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/Slim/Utils/Log.pm line 27.
 Ambiguous call resolved as CORE::warn(), qualify as such or use & at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/Slim/Utils/Log.pm line 28.
-Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 556.
+Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 592.
 	(Maybe you meant system() when you said exec()?)
-Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 654.
+Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 690.
 	(Maybe you meant system() when you said exec()?)
 ok - parse ok=1
 ok - parse data url
@@ -19,5 +19,36 @@ ok - installSource returns a path
 ok - installSource path sanitised
 ok - installSource wrote the file
 ok - installSource rejects junk
+
+ALL PASS
+Ambiguous call resolved as CORE::warn(), qualify as such or use & at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/Slim/Utils/Log.pm line 27.
+Ambiguous call resolved as CORE::warn(), qualify as such or use & at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/Slim/Utils/Log.pm line 28.
+Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 592.
+	(Maybe you meant system() when you said exec()?)
+Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 690.
+	(Maybe you meant system() when you said exec()?)
+LOG-WARN: LxMusic resolve: try [srcA] type=flac
+LOG-WARN: LxMusic resolve: try [srcB] type=flac
+LOG-WARN: LxMusic resolve OK: [srcB] type=flac verified=1 ~1000kbps total=0ms path=worker friendly=1 url=http://cdn.example/b.flac
+LOG-WARN: LxMusic resolve: try [srcA] type=flac
+LOG-WARN: LxMusic resolve: try [srcB] type=flac
+LOG-WARN: LxMusic resolve FAILED after 2 tries: srcA@flac: a failed; srcB@flac: b failed
+LOG-WARN: LxMusic resolve: try [srcA] type=flac
+LOG-WARN: LxMusic resolve: try [srcB] type=flac
+LOG-WARN: LxMusic resolve: [srcA] flac 直链无音频后缀（脚本中转链），暂缓
+LOG-WARN: LxMusic resolve: [srcB] flac 直链无音频后缀（脚本中转链），暂缓
+LOG-WARN: LxMusic resolve: 没有"播放器友好"直链，改用兜底中转链 [srcA] http://relay.example/kw/kw.php?type=mp3&id=1
+LOG-WARN: LxMusic resolve OK: [srcA] type=flac verified=1 ~1000kbps total=0ms path=worker friendly=0 url=http://relay.example/kw/kw.php?type=mp3&id=1
+ok - window: 未回调前已启动 2 个候选
+ok - window: 两个候选来自不同源
+ok - deliver: 先到者交付
+ok - deliver: 不再二次交付
+ok - deliver: tries 记下了失败与成功
+ok - allfail: 只回调一次
+ok - allfail: ok=0
+ok - allfail: 错误里提到两个源
+ok - deferred: 只交付一次
+ok - deferred: 两个候选都先被标记为暂缓
+ok - deferred: 交付的是中转链（兜底路径）
 
 ALL PASS
