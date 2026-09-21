@@ -405,12 +405,20 @@ sub _prefetch_next {
 		src     => $ninfo->{src},
 		type    => $ninfo->{type},
 		timeout => 20,
-		verify  => 0,                       # 预取只预热：不额外花一次 HEAD
+		# 0.11.25：预取**也要校验**（对齐落雪 PC 的 usePreloadNextMusic：先 getMusicUrl 缓存，
+		# 再用真实媒体元素 checkMusicUrl 验证，不行就 isRefresh 重取）。校验失败的候选会被
+		# resolveTrack 的阶梯自动跳过（现在还是并行的）⇒ 落进缓存的必然是"探针能取到音频字节"的链。
+		# 这段是后台行为，慢一点无所谓（用户看不到），换来的是点击那一刻不再赌 URL 还活着。
+		verify  => 1,
 		cb      => sub {
 			my ($res) = @_;
 			if ($res->{ok} && $res->{url}) {
-				_cache_put($nextUrl, $res->{url});
-				$log->info('LxMusic: prefetched ok via [' . ($res->{source} // '?') . ']');
+				# 必须写全记录：只写 direct 会让播放路径拿不到 fmt/kbps/secs，
+				# 表现就是 tx 那种"正在播放"缺格式码率（0.11.22 修过同类问题）
+				_cache_put($nextUrl, $res->{url}, $res->{format}, $res->{actualKbps},
+					$res->{secs}, $res->{length});
+				$log->info('LxMusic: prefetched ok via [' . ($res->{source} // '?') . ']'
+					. (defined $res->{actualKbps} ? " ~$res->{actualKbps}kbps" : '') . ' verified');
 			}
 			else {
 				$log->debug('LxMusic: prefetch failed: ' . ($res->{error} || 'unknown'));
@@ -431,7 +439,9 @@ sub warmTracks {
 	for my $u (@$urls) {
 		last if $n >= $max;
 		next unless $u && $u =~ m{^lxm://};
-		next if _cache_get($u);
+		# 只跳过"还新鲜"的条目；过老的照旧重热（否则缓存的死链会让点击直接无声）
+		my $c = _cache_get($u);
+		next if $c && (time() - ($c->{born} || 0)) < _fresh_window();
 
 		my $info = eval { $class->parseUrl($u) } or next;
 
@@ -442,10 +452,21 @@ sub warmTracks {
 			src     => $info->{src},
 			type    => $info->{type},
 			timeout => 20,
-			verify  => 0,                   # 预热不校验（真正播放时还会走一次带校验的解析）
+			# 0.11.25：预热同样带校验（见 _prefetch_next 的注释）——预热本来就是后台行为，
+			# 校验失败的候选由阶梯跳过，落进缓存的就是"探针验过"的链。
+			verify  => 1,
 			cb      => sub {
 				my ($res) = @_;
-				_cache_put($u, $res->{url}) if $res->{ok} && $res->{url};
+				if ($res->{ok} && $res->{url}) {
+					_cache_put($u, $res->{url}, $res->{format}, $res->{actualKbps},
+						$res->{secs}, $res->{length});
+					$log->info('LxMusic: warm ok (' . ($info->{name} || '') . ') via ['
+						. ($res->{source} // '?') . '] verified');
+				}
+				else {
+					$log->warn('LxMusic: warm failed (' . ($info->{name} || '') . '): '
+						. ($res->{error} || 'unknown'));
+				}
 			},
 		);
 	}
