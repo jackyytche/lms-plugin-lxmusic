@@ -518,6 +518,25 @@ sub republish_queued_rows {
 # 完全不依赖计时器；300 首入队会连发大量通知，用 2 秒去抖。
 my $LAST_REPUB = 0;
 
+# 0.11.32：**尾部去抖**——最后一次队列通知之后 3 秒再补发。
+# 现场（0.11.31 实测，级别开到 INFO 才看见）：
+#   `playlist-triggered republish for 100 queued rows` 确实跑了，但那次补发发生在 LMS **还在批量建队**的过程中
+#   ⇒ 发布过的封面又被随后的建队冲掉；而"事后手工重渲染榜单页"（晚得多）就有效。
+# 所以不能"一有通知就补发"，要等"通知停下来"再补发：每次通知都（重新）排一个 +3s 的定时器，
+# 它的宿主必须是**我们自己持有的持久 hashref**（实测：`$client` 宿主的定时器会被 LMS 在队列变更时 kill 掉，
+# 而 Helper 的 worker 计时器用自持 hashref 一直好用）。
+my $REPUB_OWNER = {};
+
+sub _repub_fire {
+	Plugins::LxMusic::ProtocolHandler->republish_known_queued();
+}
+
+sub _schedule_republish {
+	Slim::Utils::Timers::killTimers($REPUB_OWNER, \&_repub_fire);
+	Slim::Utils::Timers::setTimer($REPUB_OWNER, time() + 3, \&_repub_fire);
+	return 1;
+}
+
 sub republish_known_queued {
 	my ($class) = @_;
 
@@ -542,7 +561,9 @@ sub republish_known_queued {
 			$n++;
 		}
 	}
-	$log->info("LxMusic: playlist-triggered republish for $n queued rows");
+	# ⚠️ 用 warn 而不是 info：插件默认级别是 ERROR，info 级**根本不会写进 server.log**
+	#（0.11.29/30 我因此误判"定时器没跑"，白白多绕了两轮）
+	$log->warn("LxMusic: playlist-triggered republish for $n queued rows");
 	return $n;
 }
 
@@ -550,9 +571,15 @@ sub republish_known_queued {
 my $SUBSCRIBED = eval {
 	Slim::Control::Request::subscribe(sub {
 		my $now = time();
-		return if $now - $LAST_REPUB < 2;      # 去抖（整榜入队会连发很多次 playlist 通知）
+		# 立即补发一次（小批量/单行入队时这次就够，UI 立刻能看到封面）
+		unless ($now - $LAST_REPUB < 2) {
+			$LAST_REPUB = $now;
+			Plugins::LxMusic::ProtocolHandler->republish_known_queued();
+		}
+		# 再排一次"尾部"补发：每来一条通知就把它往后推 3 秒 ⇒ 等通知彻底停下来（LMS 建队结束）才发。
+		# 这一步是 0.11.32 的关键：快速整榜入队时，上面那次立即补发发生在**建队途中**，会被随后的建队冲掉。
 		$LAST_REPUB = $now;
-		Plugins::LxMusic::ProtocolHandler->republish_known_queued();
+		Plugins::LxMusic::ProtocolHandler->_schedule_republish();
 	}, [['playlist']]);
 	1;
 };
@@ -808,7 +835,7 @@ sub explodePlaylist {
 				my @list = @{ $res->{data}{list} };
 				@list = @list[ 0 .. 99 ] if @list > 100;
 				my $q = $prefs->get('quality') || '320k';
-				my (@urls, @repub);
+				my @urls;
 				for my $t (@list) {
 					next unless $t && ref($t) eq 'HASH';
 					my $name = ($t->{singer} ? $t->{singer} . ' - ' : '') . ($t->{name} || '?');
@@ -839,32 +866,16 @@ sub explodePlaylist {
 						kbps    => $est,
 						quality => $q,
 					});
-					# 0.11.29：记下来，**建队之后再补发一次**（见下面 Timer 的注释）
-					push @repub, {
-						u       => $u,
-						cover   => _cover_url(($t->{source} || $src), $t),
-						title   => $name,
-						secs    => $secs,
-						kbps    => $est,
-						quality => $q,
-					};
+					# 0.11.32：这里不再自己攒 @repub 快照——封面/歌名已进 %METADATA，
+					# 由 playlist 通知的**尾部去抖**统一在"建队结束后"按队列实际内容补发。
 					push @urls, $u;
 				}
 				$cb->(\@urls);
 
-				# 0.11.29：**整榜入队后补发一次元数据/封面**。
-				# 现场（用户 2026-09-21）：页首"全部播放/添加"一次入队 N 首时，**除正在播/预读的那一两首外，
-				# 队列行全都没封面**；而逐行手动入队正常。实测（kw 热歌榜 100 首）：
-				#     整榜入队后   → 有封面 0 / 100
-				#     事后重渲染榜单页 → 有封面 50 / 100    ← 说明"入队前发的封面不会被新建的队列行采用"
-				# ⇒ 必须在**建队之后**再发一遍。延迟 4 秒（LMS 把 100 行建好需要一点时间），
-				# 只做一次，成本 = N 次 updateOrCreate + 缓存写（每建一次队一次）。
-				if (@repub) {
-					my @snapshot = @repub;
-					Slim::Utils::Timers::setTimer($client, time() + 4, sub {
-						$class->republish_queued_rows(\@snapshot);
-					});
-				}
+				# 0.11.29 曾在这里用 `setTimer($client, ...)` 补发；0.11.32 撤掉：
+				# 实测 **`$client` 当宿主的定时器会被 LMS 在队列变更时 kill**（同一次测量里
+				# `__PACKAGE__` 宿主的定时器照常触发，这个从不触发）⇒ 补发改由下面 playlist 通知的
+				# **尾部去抖**统一负责（宿主是我们自持的 `$REPUB_OWNER` hashref，不被 kill）。
 			},
 		);
 		return;
@@ -895,17 +906,25 @@ sub cache_metadata {
 	# 0.11.31：上限从 200 提到 2000 —— 整榜 300 首要留下全部记录，
 	# 否则 playlist 通知触发的补发会找不到早期行的封面（被自己挤掉了）。
 	%METADATA = () if keys %METADATA > 2000;
-	$METADATA{$url} = {
-		title   => $info->{title}   || '',
-		quality => $info->{quality} || '',
-		error   => $info->{error}   || '',
-		cover   => $info->{cover}   || '',
-		secs    => $info->{secs}    || 0,
+
+	# 0.11.32：**合并而不是覆盖**。整榜入队（explodePlaylist）的顺序是
+	#     _publish_cover($u,...)          # 先写入封面
+	#     publishQueueMetadata($u,{...})  # 只带歌名/时长/码率，**没有 cover**
+	# 旧实现第二个调用把整条记录替换掉 ⇒ cover 变 ''，后续补发就没封面可发（实测 0/100）。
+	# 现在只在"本次给了非空值"时覆盖对应字段。
+	my $old = $METADATA{$url} || {};
+	my %new = (
+		title   => $info->{title}   || $old->{title}   || '',
+		quality => $info->{quality} || $old->{quality} || '',
+		error   => $info->{error}   || $old->{error}   || '',
+		cover   => $info->{cover}   || $old->{cover}   || '',
+		secs    => $info->{secs}    || $old->{secs}    || 0,
 		# 解析后才知道的真实值（0.11.10）：getMetadataFor 用它们给 UI 发
 		# "格式"标签与**数字**码率（此前误把档位 key 当码率发 ⇒ 队列行显示 br=flac24bit）
-		kbps    => $info->{kbps}    || 0,
-		format  => $info->{format}  || '',
-	};
+		kbps    => $info->{kbps}    || $old->{kbps}    || 0,
+		format  => $info->{format}  || $old->{format}  || '',
+	);
+	$METADATA{$url} = \%new;
 
 	return 1;
 }
