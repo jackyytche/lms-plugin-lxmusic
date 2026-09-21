@@ -306,7 +306,41 @@ sub _finish_resolve {
 		$log->info('LxMusic: resolved ' . substr($url, 0, 40) . ' -> ' . substr($direct, 0, 80));
 	}
 	$args->{cb} = sub {
-		my ($track) = @_;
+		my ($track, @rest) = @_;
+
+		# ⚠️ 0.11.21：**LMS 扫描器拒收时的兜底**（"取链成功却完全无声"的第二类真凶）。
+		# 现场（2026-09-21 设备日志 + 对照实验）：直链 CDN 声明
+		#   Content-Type: application/octet-stream
+		# （星海音乐源的 wy → http://m804.music.126.net/…、星海/独家的 kg →
+		#   http://fsdg360.hw.kugou.com/…）时，LMS 的
+		#   Slim::Utils::Scanner::Remote::readRemoteHeaders 会把它经 mimeToType 归成
+		#   unk（不是音频）⇒ 走"这是播放列表"分支去 parsePlaylist ⇒ 二进制体解析失败
+		#   ⇒ cb(undef) ⇒ Song.pm 报 PROBLEM_OPENING_REMOTE_URL ⇒ 整首立刻 stop。
+		# 日志指纹：`resolved via [源] … fmt=flc` 之后 ~150ms 就是
+		#   `Error: Can't open remote URL: lxm://…`，中间**没有** getNextTrack、没有
+		#   RemoteStream::new（根本没去连 CDN）。
+		# 对照实验（同一台本机 HTTP 服务、同一份 fLaC 字节、只改响应头）：
+		#   audio/x-flac → 位置 1.4→5.6s；application/octet-stream → 秒停。
+		# 而 kw 一直正常，因为 kuwo CDN 老实声明 audio/x-flac；裤佬给的 wy/kg 直链落在
+		# 别的 CDN 节点（audio/mpeg[谎报]、audio/flac）也能过——所以这是"源给的节点决定"，
+		# 不是取链失败。0.11.8 的嗅探覆盖只能救"谎报成另一种音频类型"的情况
+		# （tx audio/x-ogg、裤佬 audio/mpeg），octet-stream 是扫描阶段就被丢掉，来不及覆盖。
+		# 修法：我们早就知道真实格式（probe 魔数嗅探）⇒ 扫描失败时自己补一条 track
+		# 交回 LMS，只走公开 API，且只影响原先必然失败的路径。
+		if (!$track && $fmt) {
+			my $t = eval { Slim::Music::Info::setContentType($direct, $fmt) };
+			if (blessed($t)) {
+				eval { $t->content_type($fmt) } if $t->can('content_type');
+				eval { $t->title($info->{name}) } if $info->{name} && $t->can('title');
+				$track = $t;
+				$log->warn('LxMusic: scanner refused direct URL (lying Content-Type) -> '
+					. 'synthesised track fmt=' . $fmt . ' ' . substr($direct, 0, 70));
+			}
+			else {
+				$log->error('LxMusic: scanner refused direct URL and synth failed: ' . ($@ || '?'));
+			}
+		}
+
 		if ($track && $info->{name}) {
 			$track->title($info->{name});
 			$track->url($url);
@@ -319,7 +353,9 @@ sub _finish_resolve {
 		# 扫描还会冲掉我们发布的 bitrate/secs（表现："格式码率闪一下就没"+不能拖进度条）
 		# ⇒ 扫完按真实值再发一次（见 $publish 注释）
 		$publish->() if $track;
-		$cb->($track, @_);
+		# 透传扫描器给的其余参数（原本写成 $cb->($track, @_)，$track 被传了两次、
+		# 后续参数整体错位一格；Song.pm 只读 ($newTrack,$error)，错位会让真实错误串丢失）
+		$cb->($track, @rest);
 	};
 	$class->SUPER::scanUrl($direct, $args);
 	return;
