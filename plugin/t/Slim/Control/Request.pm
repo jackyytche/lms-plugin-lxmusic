@@ -6,5 +6,7 @@ use warnings;
 
 sub executeRequest { }
 sub addDispatch    { }
+sub subscribe      { }      # 0.11.31：队列通知订阅（LxMusic 用它做"建队后补发封面"）
+sub notifyFromArray { }
 
 1;

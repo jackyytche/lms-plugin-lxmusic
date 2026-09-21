@@ -173,6 +173,9 @@ sub parseUrl {
 
 # ---------- 解析缓存（0.5.1）：同一 lxm:// 在 TTL 内直接命中，零 fork ----------
 my %RESOLVE_CACHE;      # url => { direct => 'http...', fmt => 'mp3'|'flc'|..., expires => epoch }
+# 0.11.31：`%METADATA` 的声明上移到文件顶部（`republish_known_queued` 在 528 行就要用它，
+# 词法变量必须先声明；原来它声明在 882 行的「元数据」段里，导致编译期报 "requires explicit package name"）
+my %METADATA;
 my $prefs = preferences('plugin.lxmusic');   # 设置页可调（resolveTtl）
 
 # 直链有 CDN 签名时效；TTL 由设置页控制（默认 600s）
@@ -508,6 +511,53 @@ sub republish_queued_rows {
 	return $n;
 }
 
+# 0.11.31：**事件驱动**版补发——队列一变就把"我们已知封面/元数据"的行再发一遍。
+# 为什么不用定时器：0.11.29/0.11.30 的 Timer 版实测**回调根本没跑**（日志里连一行都没有，
+# 而同一时期"手工重渲染一次榜单页"却能把封面补齐 ⇒ 手段有效、只是定时器这条路不通）。
+# 这里订阅 LMS 的 playlist 通知（`Slim::Control::Request::subscribe`），队列一变就同步补发，
+# 完全不依赖计时器；300 首入队会连发大量通知，用 2 秒去抖。
+my $LAST_REPUB = 0;
+
+sub republish_known_queued {
+	my ($class) = @_;
+
+	my $n = 0;
+	for my $client (Slim::Player::Client::clients()) {
+		my $pl = eval { Slim::Player::Playlist::playList($client) };
+		next unless $pl && ref($pl) eq 'ARRAY';
+		for my $item (@$pl) {
+			my $u = blessed($item) ? eval { $item->url } : $item;
+			next unless $u && $u =~ m{^lxm://};
+			my $m = $METADATA{$u} or next;
+			next unless $m->{cover} || $m->{title};
+			eval {
+				$class->publishQueueMetadata($u, {
+					title   => $m->{title},
+					secs    => $m->{secs},
+					kbps    => $m->{kbps},
+					cover   => $m->{cover},
+					quality => $m->{quality},
+				});
+			};
+			$n++;
+		}
+	}
+	$log->info("LxMusic: playlist-triggered republish for $n queued rows");
+	return $n;
+}
+
+# eval 包一层：万一 LMS 版本里没有 subscribe（或测试存根没实现），插件照样加载
+my $SUBSCRIBED = eval {
+	Slim::Control::Request::subscribe(sub {
+		my $now = time();
+		return if $now - $LAST_REPUB < 2;      # 去抖（整榜入队会连发很多次 playlist 通知）
+		$LAST_REPUB = $now;
+		Plugins::LxMusic::ProtocolHandler->republish_known_queued();
+	}, [['playlist']]);
+	1;
+};
+$log->warn('LxMusic: playlist subscribe unavailable (' . ($@ || 'no subscribe') . ')') unless $SUBSCRIBED;
+
 sub _publish_cover {
 	my ($class, $url, $src, $music) = @_;
 
@@ -837,12 +887,14 @@ sub _secs_of_interval {
 }
 
 # ---------- 元数据 ----------
-my %METADATA;
+# （`my %METADATA;` 已上移到文件顶部——republish_known_queued 需要先声明）
 
 sub cache_metadata {
 	my ($class, $url, $info) = @_;
 
-	%METADATA = () if keys %METADATA > 200;
+	# 0.11.31：上限从 200 提到 2000 —— 整榜 300 首要留下全部记录，
+	# 否则 playlist 通知触发的补发会找不到早期行的封面（被自己挤掉了）。
+	%METADATA = () if keys %METADATA > 2000;
 	$METADATA{$url} = {
 		title   => $info->{title}   || '',
 		quality => $info->{quality} || '',
@@ -878,6 +930,7 @@ sub publishQueueMetadata {
 		title   => $info->{title},
 		cover   => $info->{cover},
 		secs    => $info->{secs},
+		kbps    => $info->{kbps},       # 0.11.31：补发时要能带上估算码率
 		quality => $info->{quality},
 	});
 	return 1;
