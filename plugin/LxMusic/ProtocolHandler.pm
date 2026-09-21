@@ -179,6 +179,12 @@ sub _resolveTtl {
 	return (defined $n && $n >= 0 && $n <= 3600) ? int($n) : 600;
 }
 
+# 播放路径的"新鲜窗口"（秒）：条目出生时间在这个窗口内才敢直接拿去播放。
+# 依据：第三方直链的实际寿命远短于 resolveTtl（网易实测 ~13 分钟后 403，而默认 TTL 600s），
+# 而"重新取链"实测只要 2~4s（LMS 能等）——所以宁可多取一次链，也不要赌旧链还活着。
+# 注意：`resolveTtl` 仍然是缓存条目的硬 TTL（元数据/getSeekData/工具页仍在用它）。
+sub _fresh_window { 90 }
+
 my $MAX_CACHE   = 200;
 
 sub _cache_get {
@@ -197,6 +203,7 @@ sub _cache_put {
 	%RESOLVE_CACHE = () if keys %RESOLVE_CACHE > $MAX_CACHE;
 	my $rec = {
 		direct => $direct, fmt => $fmt, kbps => $kbps, secs => $secs, len => $len,
+		born   => time(),          # 出生时间：播放路径按它判"还新鲜吗"（_fresh_window）
 		expires => time() + _resolveTtl(),
 	};
 	$RESOLVE_CACHE{$url}    = $rec;
@@ -385,7 +392,9 @@ sub _prefetch_next {
 	return unless blessed($nextTrack) && $nextTrack->can('url');
 	my $nextUrl = $nextTrack->url;
 	return unless $nextUrl && $nextUrl =~ m{^lxm://};
-	return if _cache_get($nextUrl);            # 已有缓存不必再取
+	# 已有"新鲜"缓存就不必再取；但过老的条目要重取（否则预取出来的也是死链，见 _fresh_window）
+	my $nc = _cache_get($nextUrl);
+	return if $nc && (time() - ($nc->{born} || 0)) < _fresh_window();
 
 	my $ninfo = eval { $class->parseUrl($nextUrl) } or return;
 
@@ -567,32 +576,29 @@ sub scanUrl {
 		return;
 	}
 
-	# 命中缓存：**先验证这条直链还活着**再用（0.11.22）。
-	# 背景（设备实测 2026-09-21）：网易的签名直链**十几分钟就 403**（本机 13 分钟后复测同一 URL
-	# 直接 `HTTP 403 Forbidden`），而 `resolveTtl` 默认 600s ⇒ 缓存里躺着死链。把死链交给
+	# 命中缓存：**只信"年轻"的条目**（0.11.23）。
+	# 背景（设备实测 2026-09-21）：网易的签名直链**十几分钟就 403**（同一 URL 13 分钟后本机复测
+	# `HTTP 403 Forbidden`），而 `resolveTtl` 默认 600s ⇒ 缓存里躺着死链。把死链交给
 	# `SUPER::scanUrl` 的后果特别隐蔽：LMS 的远端扫描请求拿不到有效响应，**回调永远不来**
-	# ⇒ 我们连 `cb(undef)` 都没机会发 ⇒ 点了没声、几秒后 stop（日志里只有 `resolve cache HIT`
-	# 后面什么都没有，既没有 getNextTrack、也没有 RemoteStream）。
-	# 所以命中缓存也要探一次（设备侧 Range GET 2KB + 魔数，约 150~400ms；探测 worker 常驻），
-	# 死链就丢掉缓存**重新取链**——这也是"同一首歌有时能放有时不能"的真凶。
-	if (my $cached = _cache_get($url)) {
-		$log->info('LxMusic: resolve cache HIT (' . ($info->{name} || '') . ') — verifying link');
-		Plugins::LxMusic::Helper->probeUrl($cached->{direct}, sub {
-			my ($p) = @_;
-			if ($p && $p->{ok}) {
-				$class->_finish_resolve($song, $url, $info, $cached->{direct}, $args, $cb,
-					$cached->{fmt}, $cached->{kbps}, $cached->{secs});
-				$class->_prefetch_next($song, $url);
-				return;
-			}
-			$log->warn('LxMusic: cached link is stale ('
-				. ($p ? ($p->{error} // "HTTP " . ($p->{status} // '?')) : 'no probe result')
-				. ') -> dropping cache and re-resolving');
-			delete $RESOLVE_CACHE{$url};
-			delete $RESOLVE_CACHE{ $cached->{direct} } if $cached->{direct};
-			$class->_resolve_fresh($song, $url, $info, $args, $cb);
-		});
+	# ⇒ 连 `cb(undef)` 都没机会发 ⇒ 点了没声、几秒后 stop（日志里 `resolve cache HIT` 之后什么都没有）。
+	# ⚠️ 0.11.22 曾试过"命中就先 probeUrl 探活"，实测**太慢**：死链在 CDN 侧是"不响应"而不是
+	# "快速 403"，探测要等满 8s 超时（日志时间线：12:22:03 命中 → 12:22:13 才重新取链），
+	# LMS 早在 ~4s 就放弃了 ⇒ 依然无声。所以改成**按年龄判断**：条目够年轻就直接用（起播快），
+	# 超过新鲜窗口就**直接重新取链**（实测 3.2s，LMS 能等；B 组 A/B 就是这样 PASS 的），不做探测。
+	my $cached = _cache_get($url);
+	my $age = $cached ? (time() - ($cached->{born} || 0)) : 0;
+	if ($cached && $age < 90) {
+		$log->info('LxMusic: resolve cache HIT (' . ($info->{name} || '') . ") age=${age}s — fresh, using it");
+		$class->_finish_resolve($song, $url, $info, $cached->{direct}, $args, $cb,
+			$cached->{fmt}, $cached->{kbps}, $cached->{secs});
+		$class->_prefetch_next($song, $url);
 		return;
+	}
+	if ($cached) {
+		$log->info('LxMusic: cached link too old (' . ($info->{name} || '') . ") age=${age}s"
+			. ' -> dropping and re-resolving (CDN links expire well before resolveTtl)');
+		delete $RESOLVE_CACHE{$url};
+		delete $RESOLVE_CACHE{ $cached->{direct} } if $cached->{direct};
 	}
 
 	$class->_resolve_fresh($song, $url, $info, $args, $cb);
