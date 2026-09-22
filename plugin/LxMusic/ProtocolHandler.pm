@@ -208,11 +208,14 @@ sub _cache_get {
 }
 
 sub _cache_put {
-	my ($url, $direct, $fmt, $kbps, $secs, $len) = @_;
+	my ($url, $direct, $fmt, $kbps, $secs, $len, $bits) = @_;
 	return unless $url && $direct;
 	%RESOLVE_CACHE = () if keys %RESOLVE_CACHE > $MAX_CACHE;
 	my $rec = {
 		direct => $direct, fmt => $fmt, kbps => $kbps, secs => $secs, len => $len,
+		# 0.11.56：位深也要进缓存——命中路径要靠它算出**真实档位**，
+		# 否则缓存命中时会退回"请求的档位"，于是又出现 "44.1kHz/16bit + FLAC 24bit" 这种自相矛盾。
+		bits   => $bits,
 		born   => time(),          # 出生时间：播放路径按它判"还新鲜吗"（_fresh_window）
 		expires => time() + _resolveTtl(),
 	};
@@ -310,7 +313,15 @@ sub _finish_resolve {
 
 	$log->debug('LxMusic: bc/finish-2 cache');
 
-	$class->cache_metadata($url, { title => $info->{name}, quality => $qLabel, format => $fmt });
+	# 0.11.56：%METADATA 里的 `quality` 一律存**档位键**（'flac'/'flac24bit'/'320k'/…），
+	# 显示标签由 qualityLabel() 现算。旧代码在这里存的是**标签**（'FLAC 24bit'），
+	# 于是 getMetadataFor/补发 再经 qualityLabel 一过就成了 "FLAC 24BIT"（大写乱码），
+	# 而且标签里带 "24bit" 会一直传下去 ⇒ 与 LMS 自己读到的真实 16bit 自相矛盾。
+	$class->cache_metadata($url, {
+		title   => $info->{name},
+		quality => (defined $tier && length $tier ? $tier : $info->{type}),
+		format  => $fmt,
+	});
 
 	# 用真实格式覆盖 CDN 撒谎的 Content-Type（只用 LMS 公开 API）
 	if ($fmt) {
@@ -840,8 +851,10 @@ sub scanUrl {
 	# （也就是 kg 实测"84 秒的直链已经死了"的那个窗口）。统一用 _fresh_window()。
 	if ($cached && $age < _fresh_window()) {
 		$log->info('LxMusic: resolve cache HIT (' . ($info->{name} || '') . ") age=${age}s — fresh, using it");
+		# 0.11.56：命中也要算**真实档位**（此前不传 ⇒ 退回请求档位，于是永远显示 FLAC 24bit）
+		my $ctier = $class->_actualTier($cached->{fmt}, $cached->{kbps}, $cached->{bits});
 		$class->_finish_resolve($song, $url, $info, $cached->{direct}, $args, $cb,
-			$cached->{fmt}, $cached->{kbps}, $cached->{secs});
+			$cached->{fmt}, $cached->{kbps}, $cached->{secs}, $ctier);
 		return;
 	}
 	if ($cached) {
@@ -1133,12 +1146,18 @@ sub getMetadataFor {
 
 sub qualityLabel {
 	my ($class, $type) = @_;
-	return 'MP3 128kbps'  if ($type || '') eq '128k';
-	return 'MP3 320kbps'  if ($type || '') eq '320k';
-	return 'FLAC'         if ($type || '') eq 'flac';
-	return 'FLAC 24bit'   if ($type || '') eq 'flac24bit';
-	return 'Hi-Res'       if ($type || '') eq 'hires';
-	return uc($type // '');
+	$type = '' unless defined $type;
+	# 0.11.56：**幂等**——已经是人读标签（带空格，如 'FLAC 24bit' / 'MP3 320kbps'）就原样返回。
+	# 档位键永远不含空格，所以这条判断不会误伤；旧缓存/旧行里存的标签也不会再被 uc() 成
+	# "FLAC 24BIT" 那种大写乱码。
+	return $type if $type =~ /\s/;
+	return 'MP3 128kbps'  if $type eq '128k';
+	return 'MP3 320kbps'  if $type eq '320k';
+	return 'FLAC'         if $type eq 'flac';
+	return 'FLAC 24bit'   if $type eq 'flac24bit';
+	return 'Hi-Res'       if $type eq 'hires';
+	return 'AAC'          if $type eq 'aac';
+	return uc($type);
 }
 
 # 0.11.52：**从真实交付物反推档位**（而不是拿请求值当结果）。

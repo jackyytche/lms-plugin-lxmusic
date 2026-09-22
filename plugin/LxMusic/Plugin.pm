@@ -601,6 +601,21 @@ sub _trackItems {
 		next unless $url;
 		my ($secs, $cover) = (_secsOf($t), _coverOf($t));
 
+		# 0.11.56：**列表期也别乱报档位**。此前一律拿"请求档位"（pref，常见 flac24bit）当显示值，
+		# 于是上游只给到 flac/320k 的曲目也写着 "FLAC 24bit" —— 与 LMS 从真实流里读出的
+		# "44.1kHz 16bit" 直接矛盾（用户报的现象）。
+		# 这里按上游 `types[]` 求交：请求档位在 → 用它；不在 → 用该曲**实际最好的**档位；
+		# 都读不到才退回请求档位（播放后 _finish_resolve 还会用真实探测值覆盖一次）。
+		my $rowq = $q;
+		if (ref($t->{types}) eq 'ARRAY' && @{ $t->{types} }) {
+			my %has = map { (ref($_) eq 'HASH' && defined $_->{type}) ? ($_->{type} => 1) : () } @{ $t->{types} };
+			if (!$has{$q}) {
+				for my $cand (qw(flac24bit flac 320k 128k hires)) {
+					if ($has{$cand}) { $rowq = $cand; last; }
+				}
+			}
+		}
+
 		# 队列行的码率估算（0.11.11）：SDK 的 types[].size 给了各档位文件体积，
 		# 体积 ÷ 时长 = 估算码率。播放后再由真实探测值覆盖（_finish_resolve）。
 		# kw 的 types 没有 size ⇒ 估不出来（播放后仍有真值），不硬造。
@@ -611,7 +626,7 @@ sub _trackItems {
 				next unless ref $ty eq 'HASH';
 				my $b = _bytesOf($ty->{size});
 				next unless $b;
-				$exact   = $b if defined $ty->{type} && $ty->{type} eq $q;
+				$exact   = $b if defined $ty->{type} && $ty->{type} eq $rowq;
 				$biggest = $b if !defined $biggest || $b > $biggest;
 			}
 			my $bytes = $exact || $biggest;
@@ -624,7 +639,7 @@ sub _trackItems {
 			secs    => $secs,
 			kbps    => $est_kbps,
 			cover   => $cover,
-			quality => $q,
+			quality => $rowq,
 		});
 		# 0.11.30：记下来，稍后**对真的进了队列的行**再发一遍（见文件末尾 Timer 的注释）
 		push @pub, {
@@ -633,7 +648,7 @@ sub _trackItems {
 			secs    => $secs,
 			kbps    => $est_kbps,
 			cover   => $cover,
-			quality => $q,
+			quality => $rowq,
 		};
 		push @items, {
 			name => sprintf('%03d %s%s%s', $n + $offset, $pfx, $name, ($singer ne '' ? " - $singer" : '')),
@@ -641,12 +656,21 @@ sub _trackItems {
 			url  => $url,
 			(length $cover ? (image => $cover) : ()),
 			(defined $secs ? (duration => $secs) : ()),
+			__rowq => $rowq,      # 仅供上面那行 debug 统计（LMS 不认这个键，无害）
 		};
 		last if $n >= 1000;   # 安全上限（真分页见 handler 的 index/quantity 处理）
 	}
 	$log->debug('LxMusic: rows=' . scalar(@items) . ' without-cover='
 		. scalar(grep { !$_->{image} } @items)
-		. ' without-duration=' . scalar(grep { !defined $_->{duration} } @items));
+		. ' without-duration=' . scalar(grep { !defined $_->{duration} } @items)
+		# 0.11.56：把"这一页各行实际会显示的档位"打出来（诊断"档位显示矛盾"用）。
+		# 期望：请求档位若该曲不支持，应落到该曲最好的档位（如 mg 常见 flac / 320k），
+		# 而不是清一色 flac24bit。
+		. ' rowq=' . do {
+			my %c;
+			$c{ $_->{__rowq} }++ for grep { $_->{__rowq} } @items;
+			join(',', map { "$_×$c{$_}" } sort keys %c) || '-';
+		});
 
 	# 0.11.30：**建队之后再补发一次封面/元数据**。
 	# 现场（用户 2026-09-21）：页首"全部播放/添加"一次入队整榜时，**除正在播/预读的一两首外，队列行全没封面**；
