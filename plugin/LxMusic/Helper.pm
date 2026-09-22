@@ -57,6 +57,17 @@ my %WORKER;  # key => { pid, rd, wr, buf, ready, queue=>[], jobs=>{}, last, rece
 # 慢源（mg 的 3 连上游）用串行 worker 会互相拖死，标记后改走 fork（每单一进程，超时只杀自己）。
 my %WORKER_BAD;
 my $WORKER_BAD_TTL = 600;
+
+# 0.11.57：**死源熔断**（用户要求）。粒度 = **源 × 平台 × 档位**：
+#   · 太粗（只按源）会误伤——玉宁熙的 mg 有些档位会 500，但 320k/128k 是好的，kw/tx 也好；
+#   · 太细正合适：坏三元组不再重复尝试，同源其它档位/平台照旧。
+# 现场依据（2026-09-23 实测）：把三个**已死**的旧源（独家/星海/裤佬）勾回来，mg/tx 取链被拖到 39s，
+# LMS `mode=play` 却拿不到流（pos 恒 0＝无声）；关掉它们同一条曲目立刻 pos 16.96s 正常。
+# 语义：同一三元组**连续 2 次失败** ⇒ 10 分钟内不再为它生成候选（只报一条 warn）。
+my %SRC_FAIL;      # key => 连续失败次数
+my %SRC_BAD;       # key => 熔断时间
+my $SRC_BAD_N   = 2;
+my $SRC_BAD_TTL = 600;
 my $WID = 0; # worker 请求自增 id（源内唯一即可）
 my $PROBE_KEY = '__probe';   # 探测专用 worker（argv[1]='-'，shim 不加载任何订阅源）
 
@@ -221,6 +232,46 @@ sub probeUrl {
 	);
 }
 
+# 0.11.57：死源熔断——key = 源 × 平台 × 档位
+sub _src_key {
+	my ($src, $plat, $q) = @_;
+	return ($src->{id} // $src->{name} // '?') . '|' . ($plat || '?') . '|' . ($q || '?');
+}
+
+sub _src_tripped {
+	my $k = shift;
+	my $t = $SRC_BAD{$k} or return 0;
+	return (time() - $t) < $SRC_BAD_TTL ? 1 : 0;
+}
+
+# 记一次失败：连续 $SRC_BAD_N 次就给这个三元组上闸（只在"刚上闸"那一次告警）
+sub _src_failed {
+	my ($k, $label) = @_;
+	my $n = ++$SRC_FAIL{$k};
+	return if $n < $SRC_BAD_N;
+	my $fresh = !$SRC_BAD{$k};
+	$SRC_BAD{$k} = time();
+	$log->warn('LxMusic resolve: breaker tripped for ' . ($label // $k)
+		. " after $n consecutive failures -> skipping for ${SRC_BAD_TTL}s") if $fresh;
+	return;
+}
+
+# 成功即清零（失败是"连续的"才算）
+sub _src_ok {
+	my $k = shift;
+	delete $SRC_FAIL{$k};
+	delete $SRC_BAD{$k};
+	return;
+}
+
+# 0.11.57：熔断状态的**测试/诊断**口（回归用例每个新场景先清一次；
+# 设置页/日志排查也用它看"现在哪些三元组被闸住了"）
+sub _breaker_reset { %SRC_FAIL = (); %SRC_BAD = (); return 1 }
+
+sub _breaker_state {
+	return +{ fail => { %SRC_FAIL }, bad => { %SRC_BAD }, n => $SRC_BAD_N, ttl => $SRC_BAD_TTL };
+}
+
 # 多源解析：resolveTrack(music=>{}, src=>'kw', type=>'320k', cb=>sub{...})
 # cb 收到 { ok, url, source, quality, verified, actualKbps, tries=>[{source,quality,why|ok}] }
 sub resolveTrack {
@@ -241,9 +292,30 @@ sub resolveTrack {
 
 	my @ladder = $class->qualityLadder($a{type}, $track, $a{declaredQualitys});
 	# 外层音质、内层源：优先保音质，同档位再依次换源（PC 只换源不降档，我们两者都做）
+	my $plat = $a{src} || ($track->{source}) || '';
 	my @cand;
+	my @tripped;
 	for my $q (@ladder) {
-		for my $s (@$sources) { push @cand, [ $q, $s ] }
+		for my $s (@$sources) {
+			my $k = _src_key($s, $plat, $q);
+			if (_src_tripped($k)) { push @tripped, ($s->{name} // '?') . "\@$q"; next; }
+			push @cand, [ $q, $s ];
+		}
+	}
+	# 0.11.57：**全被熔断时不许静音**——清掉这个平台的所有熔断（宁可慢，也不能"点了没声"）
+	if (!@cand && @tripped) {
+		for my $q (@ladder) {
+			for my $s (@$sources) {
+				delete $SRC_BAD{ _src_key($s, $plat, $q) };
+				delete $SRC_FAIL{ _src_key($s, $plat, $q) };
+				push @cand, [ $q, $s ];
+			}
+		}
+		$log->warn('LxMusic resolve: all candidates were breaker-tripped for '
+			. ($plat || '?') . ' -> breakers cleared (' . join(', ', @tripped) . ')');
+	}
+	elsif (@tripped) {
+		$log->info('LxMusic resolve: breaker skipping ' . join(', ', @tripped) . ' for ' . ($plat || '?'));
 	}
 
 	my @tries;
@@ -267,6 +339,7 @@ sub resolveTrack {
 		my ($src, $q, $url, $tm, $friendly, $verified, $kbps, $magic, $len, $bits) = @_;
 		return if $done;                 # 并行窗口下只交付一次
 		$done = 1;
+		_src_ok(_src_key($src, $plat, $q));   # 0.11.57：成功即清零该三元组的失败计数
 		my $suspect = ($kbps && $kbps < 64) ? 1 : 0;
 		if ($suspect) {
 			$log->warn("LxMusic resolve: SUSPECT short/preview file ([" . ($src->{name} // '?')
@@ -332,6 +405,7 @@ sub resolveTrack {
 			}
 			push @tries, { source => $src->{name}, quality => $q, why => 'verify: ' . ($pi->{error} // '?'), %$tm };
 			$log->warn("LxMusic resolve: verify rejected [" . $src->{name} . "] $q: " . ($pi->{error} // '?'));
+			_src_failed(_src_key($src, $plat, $q), ($src->{name} // '?') . "\@$q");   # 0.11.57 熔断计数
 			$settle->();
 		});
 		return;
@@ -386,6 +460,7 @@ sub resolveTrack {
 						my $why = ($res->{error} // 'no url')
 							. (@tail ? ' {' . join(' | ', map { substr($_, 0, 100) } @tail) . '}' : '');
 						push @tries, { source => $src->{name}, quality => $q, why => $why, %tm };
+						_src_failed(_src_key($src, $plat, $q), ($src->{name} // '?') . "\@$q");   # 0.11.57 熔断计数
 						return $settle->();
 					}
 					my $friendly = $class->streamFriendly($url) ? 1 : 0;

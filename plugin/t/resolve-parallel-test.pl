@@ -74,6 +74,9 @@ my $track = { songmid => '1', name => 'song', singer => 'singer', interval => '0
 sub new_run {
 	@launched = ();
 	%cb = ();
+	# 0.11.57：每个场景先清"死源熔断"，否则前两个场景的失败会把某些
+	# (源×平台×档位) 三元组闸掉，后面的场景根本不会再派候选（这正是熔断的设计行为）。
+	Plugins::LxMusic::Helper::_breaker_reset();
 	my @got;
 	Plugins::LxMusic::Helper->resolveTrack(
 		music => $track, src => 'wy', type => 'flac',
