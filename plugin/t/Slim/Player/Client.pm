@@ -4,7 +4,10 @@ package Slim::Player::Client;
 use strict;
 use warnings;
 
-sub clients  { }
-sub getClient { }
+our @CLIENTS;    # 0.11.49：republish-loop-test.pl 用假播放器填充它
+
+sub clients  { return @CLIENTS }
+sub getClient { return $CLIENTS[0] }
+sub resetForTest { @CLIENTS = (); return }
 
 1;

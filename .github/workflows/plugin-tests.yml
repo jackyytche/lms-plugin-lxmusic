@@ -49,6 +49,17 @@ jobs:
           perl -I t -I t_build t/resolve-parallel-test.pl 2>&1 | tee -a helper-test.log
           exit ${PIPESTATUS[0]}
 
+      # 0.11.49: no-self-trigger regression (the 3 LMS crashes of 2026-09-22).
+      # Asserts that a simulated echo loop (every metadata write echoes a playlist
+      # notification) causes ZERO writes, and that metadata-only notifications do
+      # not even schedule a republish. ~12s (sleeps 1.05s between rounds).
+      - name: Republish loop regression (0.11.49)
+        run: |
+          cd plugin
+          set -o pipefail
+          LX_TEST_QUIET_WARN=1 perl -I t -I t_build t/republish-loop-test.pl 2>&1 | tee -a helper-test.log
+          exit ${PIPESTATUS[0]}
+
       - name: CHECK Helper.pm
         run: cd plugin && perl -I t -I t_build -c t_build/Plugins/LxMusic/Helper.pm
 

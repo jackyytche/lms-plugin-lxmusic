@@ -20,11 +20,14 @@ sub logError   { my $c = shift; Slim::Utils::Log::Stub->new->error(@_) }
 package Slim::Utils::Log::Stub;
 
 sub new   { my $c = shift; my %o = (@_ % 2 == 0) ? @_ : (); return bless \%o, $c }
-sub info  { my $s = shift; warn "LOG-INFO: @_\n" if $ENV{LX_TEST_VERBOSE} }
+sub info  { my $s = shift; CORE::warn "LOG-INFO: @_\n" if $ENV{LX_TEST_VERBOSE} }
 # 调用方可临时静音 warn（LX_TEST_QUIET_WARN=1）：用来压掉**内容可变**的日志行，
 # 让 CI 回写的回归日志逐字节稳定（否则每次运行都多一条 ci: regression log 提交）
-sub warn  { my $s = shift; warn "LOG-WARN: @_\n" unless $ENV{LX_TEST_QUIET_WARN} }
-sub error { my $s = shift; warn "LOG-ERROR: @_\n" }
-sub debug { my $s = shift; warn "LOG-DEBUG: @_\n" if $ENV{LX_TEST_VERBOSE} }
+sub warn  { my $s = shift; CORE::warn "LOG-WARN: @_\n" unless $ENV{LX_TEST_QUIET_WARN} }
+sub error { my $s = shift; CORE::warn "LOG-ERROR: @_\n" }
+sub debug { my $s = shift; CORE::warn "LOG-DEBUG: @_\n" if $ENV{LX_TEST_VERBOSE} }
+# 0.11.49：真环境（Log4perl）的 logger 有 is_debug/is_info —— ProtocolHandler 用它决定要不要记通知原文
+sub is_debug { return $ENV{LX_TEST_VERBOSE} ? 1 : 0 }
+sub is_info  { return 0 }
 
 1;

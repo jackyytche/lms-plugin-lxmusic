@@ -4,7 +4,11 @@ package Slim::Player::Playlist;
 use strict;
 use warnings;
 
-sub tracks { }
-sub add    { }
+our @PLAYLIST;   # 0.11.49：假队列（字符串 URL 即可，真代码两种形态都吃）
+
+sub playList { return \@PLAYLIST }
+sub tracks   { }
+sub add      { }
+sub resetForTest { @PLAYLIST = (); return }
 
 1;

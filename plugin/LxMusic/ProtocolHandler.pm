@@ -176,6 +176,10 @@ my %RESOLVE_CACHE;      # url => { direct => 'http...', fmt => 'mp3'|'flc'|..., 
 # 0.11.31：`%METADATA` 的声明上移到文件顶部（`republish_known_queued` 在 528 行就要用它，
 # 词法变量必须先声明；原来它声明在 882 行的「元数据」段里，导致编译期报 "requires explicit package name"）
 my %METADATA;
+# 0.11.49：`%REPUBLISHED`（补发的**内容指纹**）也上移到顶部——`republish_queued_rows`（483 行）
+# 与 `republish_known_queued`（585 行）都要用它。指纹语义：url => 上次真的写进 LMS 的内容签名；
+# 签名相同 ⇒ 一个字节都不写（写就会换来一条新的 playlist 通知，那是自激回路的原料）。
+my %REPUBLISHED;
 my $prefs = preferences('plugin.lxmusic');   # 设置页可调（resolveTtl）
 
 # 直链有 CDN 签名时效；TTL 由设置页控制（默认 600s）
@@ -487,7 +491,7 @@ sub republish_queued_rows {
 	my %want = map { $_->{url} => $_ } grep { $_ && $_->{url} } @$rows;
 	return 0 unless %want;
 
-	my $n = 0;
+	my ($n, $skip) = (0, 0);
 	for my $client (Slim::Player::Client::clients()) {
 		my $pl = eval { Slim::Player::Playlist::playList($client) };
 		next unless $pl && ref($pl) eq 'ARRAY';
@@ -495,6 +499,11 @@ sub republish_queued_rows {
 			my $u = blessed($item) ? eval { $item->url } : $item;
 			next unless $u && $want{$u};
 			my $r = $want{$u};
+			# 0.11.49：同一道内容指纹。本函数由**自持定时器**驱动（不是通知），本身不会自激，
+			# 但用户连翻几页 feed 就会重复写同一批行 ⇒ 指纹让"没变就不写"。
+			my $sig = join("\x1f", map { defined $_ ? $_ : '' }
+				@{$r}{qw(cover title secs kbps quality)});
+			if (($REPUBLISHED{$u} || '') eq $sig) { $skip++; next; }
 			eval {
 				$class->publishQueueMetadata($u, {
 					title   => $r->{title},
@@ -504,10 +513,12 @@ sub republish_queued_rows {
 					quality => $r->{quality},
 				});
 			};
+			$REPUBLISHED{$u} = $sig;
 			$n++;
 		}
 	}
-	$log->info("LxMusic: re-published queue metadata for $n queued rows (after the playlist was built)");
+	%REPUBLISHED = () if scalar(keys %REPUBLISHED) > 3000;
+	$log->info("LxMusic: re-published queue metadata for $n rows ($skip unchanged skipped, after the playlist was built)");
 	return $n;
 }
 
@@ -516,8 +527,6 @@ sub republish_queued_rows {
 # 而同一时期"手工重渲染一次榜单页"却能把封面补齐 ⇒ 手段有效、只是定时器这条路不通）。
 # 这里订阅 LMS 的 playlist 通知（`Slim::Control::Request::subscribe`），队列一变就同步补发，
 # 完全不依赖计时器；300 首入队会连发大量通知，用 2 秒去抖。
-my $LAST_REPUB = 0;
-
 # 0.11.32：**尾部去抖**——最后一次队列通知之后 3 秒再补发。
 # 现场（0.11.31 实测，级别开到 INFO 才看见）：
 #   `playlist-triggered republish for 100 queued rows` 确实跑了，但那次补发发生在 LMS **还在批量建队**的过程中
@@ -527,23 +536,64 @@ my $LAST_REPUB = 0;
 # 而 Helper 的 worker 计时器用自持 hashref 一直好用）。
 my $REPUB_OWNER = {};
 
-# ⚠️⚠️ 0.11.48：**断自激**（2026-09-22 晚三次崩溃的真凶）
-# 现场：日志里 `playlist-triggered republish for 300 queued rows` 每 **2~3 秒**一条、连着十几条，然后 LMS 死。
-# 机制：`publishQueueMetadata` 会 `setRemoteMetadata`（写轨道元数据）⇒ **LMS 发新的 `playlist` 通知** ⇒
-# 订阅者又排一次补发 ⇒ 又写 300 行……**3 秒去抖正好卡在循环周期上**，于是一个 300 行的队列变成
-# "每 3 秒 300 次元数据写入"，CPU 被点着（这台是 i386/无风扇小机）直到进程死。
-# 两道闸：
-#   ① `%REPUBLISHED` 内容指纹——**内容没变的行一个字都不写**（这才是真正的止血点：首轮之后全是 no-op，
-#      不再产生新通知，循环自然断掉）；
-#   ② `$REPUB_BUSY` 重入闸 + `$REPUB_LAST` 节流（最快 5s 一轮）——即使通知是同步重入或被反复触发，
-#      最坏也只是"每 5 秒扫一遍哈希"，不再有写入风暴。
-my %REPUBLISHED;
+# ⚠️⚠️ 0.11.48 断自激 → 0.11.49 **去自激**（2026-09-22 晚三次崩溃的真凶）
+# 现场：日志里 `playlist-triggered republish for 300 queued rows` 每 **2~3 秒**一条、连着十几条，然后 LMS 死；
+# 关键旁证：那十几秒里**队列成员一个都没变**（中间既没有 `getNextTrack` 也没有 `resolve`）。
+# 机制：我们补发元数据（`setRemoteMetadata`）⇒ LMS 发出新的 `playlist` 通知 ⇒ 订阅者又排一次补发 ⇒ 又写 300 行……
+# **+3s 尾部去抖正好等于循环周期**，于是一个 300 行的队列变成"每 3 秒 300 次元数据写入"，
+# CPU 被点着（这台是 i386/无风扇小机）直到进程死。
+#
+# 0.11.48 曾经只是"加指纹 + 把节流放宽到 5s"。**5s 不是修复**：它只是把写入风暴的周期拉长，
+# 一旦有人把间隔调小/队列更大，同样的回路照样能把机器点着。0.11.49 改成"**结构上不可能自激**"：
+#   ① **确定性触发**（主路径）：改队列的两条我们**自己知道**的路径——`explodePlaylist`（整榜入队）与
+#      `Plugin::_trackItems`（榜单页渲染/单曲入队）——各自排一次 +3s 尾部补发。
+#      补发的**输入**从此只有"我们自己的代码"，**写元数据不可能再触发补发**（没有反馈边）。
+#   ② **通知只当兜底**，且**只认改队列成员的命令**：元数据类 `playlist newmetadata`、播放状态类
+#      `playlist newsong/open/stop/pause/sync/cant_open` 一律忽略——它们不可能改变队列内容，
+#      而自激回路里收到的正是这一类（`_repub_worthy`）。
+#   ③ `%REPUBLISHED` **内容指纹**（0.11.48 引入，保留）：内容没变的行一个字都不写。
+#   ④ **自激探测器**：连续多轮"确实写了行、而队列成员却完全没变" ⇒ 隔离 60s 并只报一次。
+#      比固定节流有针对性：正常操作零延迟，异常时自动降级而不是硬扛。
+#   ⑤ DEBUG 级记录触发通知的原文（有上限），下次复现能直接读出"是谁在触发我们"。
 my $REPUB_BUSY = 0;
 my $REPUB_LAST = 0;
-my $REPUB_MIN_INTERVAL = 5;
+my $REPUB_MIN_INTERVAL = 1;      # 同一秒内不重复扫（**不再是节流上限**）
+my $REPUB_SELF_ROUNDS = 0;       # 连续"写了行但队列没变"的轮数
+my $REPUB_SELF_MAX    = 4;       # 达到就隔离
+my $REPUB_QUARANTINE  = 0;       # 隔离截止时间（epoch）
+my $REPUB_LAST_QSIG   = '';      # 上一轮队列成员签名
+my $REPUB_DIAG        = 0;       # 通知原文诊断计数（有上限，避免刷日志）
+
+# 会**改变队列成员**的 playlist 子命令（改这些才可能需要给新行补封面）。
+# 相反，下面这些**永远不改队列内容**，收到就直接忽略：
+#   newmetadata（元数据写入的通知——自激回路里就是它这一类）
+#   newsong / open / stop / pause / sync / cant_open（播放状态）
+#   index / jump / modified / name / path / ... （纯查询或播放位置）
+my $REPUB_IGNORE = qr{^playlist\s+(?:newmetadata|newsong|open|stop|pause|sync|cant_open|index|jump|modified|name|path|artist|album|genre|duration|playlistsinfo|preview)\b};
+
+sub _repub_worthy {
+	my $req = shift;
+	return 0 unless $req && ref($req);
+	my $str = eval { $req->getRequestString } || '';
+	return 0 if $str =~ $REPUB_IGNORE;
+	return 1 if $str =~ m{^playlist\b};
+	return 0;
+}
 
 sub _repub_fire {
 	Plugins::LxMusic::ProtocolHandler->republish_known_queued();
+}
+
+# 只读诊断口（回归测试 t/republish-loop-test.pl 用它断言"指纹/隔离"状态；设置页也可显示）
+sub republish_stats {
+	my ($class) = @_;
+	return {
+		fingerprints => scalar(keys %REPUBLISHED),
+		quarantine   => $REPUB_QUARANTINE,
+		self_rounds  => $REPUB_SELF_ROUNDS,
+		busy         => $REPUB_BUSY,
+		last_qsig    => $REPUB_LAST_QSIG,
+	};
 }
 
 sub _schedule_republish {
@@ -555,13 +605,15 @@ sub _schedule_republish {
 sub republish_known_queued {
 	my ($class) = @_;
 
-	return 0 if $REPUB_BUSY;                                   # ① 防重入
+	return 0 if $REPUB_BUSY;                                   # 防重入
 	my $now = time();
-	return 0 if $now - $REPUB_LAST < $REPUB_MIN_INTERVAL;      # ② 节流
+	return 0 if $now < $REPUB_QUARANTINE;                      # 自激隔离期
+	return 0 if $now - $REPUB_LAST < $REPUB_MIN_INTERVAL;      # 同一秒不重复扫
 	$REPUB_LAST = $now;
 	$REPUB_BUSY = 1;
 
 	my ($n, $skip) = (0, 0);
+	my @qurls;
 	eval {
 		for my $client (Slim::Player::Client::clients()) {
 			my $pl = eval { Slim::Player::Playlist::playList($client) };
@@ -569,6 +621,7 @@ sub republish_known_queued {
 			for my $item (@$pl) {
 				my $u = blessed($item) ? eval { $item->url } : $item;
 				next unless $u && $u =~ m{^lxm://};
+				push @qurls, $u;
 				my $m = $METADATA{$u} or next;
 				next unless $m->{cover} || $m->{title};
 				# 指纹：内容没变 ⇒ 一个字节都不写（否则每写一次就换来一个新通知）
@@ -590,32 +643,59 @@ sub republish_known_queued {
 	$REPUB_BUSY = 0;
 	%REPUBLISHED = () if scalar(keys %REPUBLISHED) > 3000;   # 上限，防内存无界
 
+	# ④ 自激探测器：**写了行、而队列成员和上一轮完全一样** ⇒ 有东西在反复触发我们。
+	# 正常操作不可能这样：真改队列 ⇒ 队列签名必变；只有自激回路才"队列不动却一直在写"。
+	my $qsig = join("\x1e", @qurls);
+	if ($n) {
+		if ($qsig eq $REPUB_LAST_QSIG) {
+			$REPUB_SELF_ROUNDS++;
+			if ($REPUB_SELF_ROUNDS >= $REPUB_SELF_MAX) {
+				$REPUB_QUARANTINE = $now + 60;
+				$REPUB_SELF_ROUNDS = 0;
+				$log->warn("LxMusic: republish wrote $n rows while the queue did not change"
+					. " -> self-trigger suspected, republish quarantined for 60s");
+			}
+		}
+		else {
+			$REPUB_SELF_ROUNDS = 0;
+		}
+	}
+	$REPUB_LAST_QSIG = $qsig;
+
 	if ($n) {
 		# ⚠️ 用 warn 而不是 info：插件默认级别是 ERROR，info 级**根本不会写进 server.log**
 		#（0.11.29/30 我因此误判"定时器没跑"，白白多绕了两轮）
-		$log->warn("LxMusic: playlist-triggered republish: wrote $n rows, skipped $skip unchanged");
+		$log->warn("LxMusic: republish: wrote $n rows, skipped $skip unchanged");
 	}
 	else {
 		# no-op 走 debug：正常运行时不该刷屏（首轮之后每轮都是 no-op，这是**预期**）
-		$log->debug("LxMusic: playlist-triggered republish: no-op ($skip rows already current)");
+		$log->debug("LxMusic: republish: no-op (queue=" . scalar(@qurls) . " rows, $skip current)");
 	}
 	return $n;
 }
 
 # eval 包一层：万一 LMS 版本里没有 subscribe（或测试存根没实现），插件照样加载
+# 0.11.49：通知只当**兜底**（主路径是 ① 里两处确定性触发），并且：
+#   · 只认改队列成员的命令（`_repub_worthy`）——元数据/播放状态通知一律忽略；
+#   · **不再"立即补发"**（0.11.32 已实测那一次发生在 LMS 建队途中，会被随后的建队冲掉）；
+#   · 我们自己的写入换来的通知直接忽略（同步重入那一半，`$REPUB_BUSY`）。
 my $SUBSCRIBED = eval {
 	Slim::Control::Request::subscribe(sub {
-		# 0.11.48：我们自己的写入换来的通知直接忽略（同步重入那一半）
+		my $req = shift;
+
 		return if $REPUB_BUSY;
-		my $now = time();
-		# 立即补发一次（小批量/单行入队时这次就够，UI 立刻能看到封面）
-		unless ($now - $LAST_REPUB < 2) {
-			$LAST_REPUB = $now;
-			Plugins::LxMusic::ProtocolHandler->republish_known_queued();
+
+		# ⑤ 诊断：DEBUG 级记录触发通知的原文（有上限），下次复现可直接读出"谁在触发我们"
+		if ($log->is_debug && $REPUB_DIAG < 40) {
+			$REPUB_DIAG++;
+			my $str = eval { $req->getRequestString } || '?';
+			$log->debug("LxMusic: playlist notify: $str");
 		}
-		# 再排一次"尾部"补发：每来一条通知就把它往后推 3 秒 ⇒ 等通知彻底停下来（LMS 建队结束）才发。
-		# 这一步是 0.11.32 的关键：快速整榜入队时，上面那次立即补发发生在**建队途中**，会被随后的建队冲掉。
-		$LAST_REPUB = $now;
+
+		return unless _repub_worthy($req);
+
+		# 只有"改队列成员"的通知才排尾部补发：等通知停下来（LMS 建队结束）+3s 再发一次。
+		# 这一步是 0.11.32 的关键：建队途中发布会被随后的建队冲掉。
 		Plugins::LxMusic::ProtocolHandler->_schedule_republish();
 	}, [['playlist']]);
 	1;
@@ -920,8 +1000,11 @@ sub explodePlaylist {
 
 				# 0.11.29 曾在这里用 `setTimer($client, ...)` 补发；0.11.32 撤掉：
 				# 实测 **`$client` 当宿主的定时器会被 LMS 在队列变更时 kill**（同一次测量里
-				# `__PACKAGE__` 宿主的定时器照常触发，这个从不触发）⇒ 补发改由下面 playlist 通知的
-				# **尾部去抖**统一负责（宿主是我们自持的 `$REPUB_OWNER` hashref，不被 kill）。
+				# `__PACKAGE__` 宿主的定时器照常触发，这个从不触发）⇒ 补发改由**自持 `$REPUB_OWNER`**
+				# 的尾部去抖负责。
+				# 0.11.49：这里**主动排一次**（确定性触发）——整榜入队的落点就是本函数，
+				# 不再依赖"LMS 会不会为这次入队发通知"（那正是自激回路的入口）。
+				_schedule_republish();
 			},
 		);
 		return;
