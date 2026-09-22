@@ -528,10 +528,13 @@ sub request {
 	my $timeout = $args{timeout} || 20;
 	$timeout = 60 if $timeout > 60;          # lx 宿主 20s 硬超时同量级，上限 60
 
-	# 常驻 worker 路径（M0.10）：只有「订阅源取链」(musicUrl) 与「可播校验」(probe) 值得常驻——
-	# 冷启动成本（起 qjs + 解析 shim/源脚本 + 源 rconfig 握手）在设备上占了每首曲子的主要固定开销。
-	# sdk 类动作（搜索、榜单）语义不同且成本占比小，继续走 fork。
+	# 常驻 worker 路径（M0.10）：
+	#  · 「订阅源取链」(musicUrl) 与「可播校验」(probe)：固定开销最大。
+	#  · 0.11.43 起 **sdk 动作也常驻**（source=$SDK，shim 侧 argv[1] 认 sdk.bundle.js 当 worker）：
+	#    设备是 i386（Atom 级），每请求 fork+解析 700KB bundle ≈0.5s，而歌单下钻一次要问好几层。
 	# 返回 0 = worker 不可用（起不来/写失败/积压），落回下面的 fork 路径。
+	my %SDK_WORKER_ACTIONS = map { $_ => 1 }
+		qw(search boards boardlist songlist songlistdetail songlistbytag songlistsorts songlisttags);
 	if (workerEnabled()) {
 		if ($action eq 'musicUrl' && $source && $source ne $SHIM && $source ne $SDK) {
 			return if $class->_worker_submit(
@@ -550,6 +553,16 @@ sub request {
 				info    => $args{info},
 				cb      => $cb,
 				timeout => $timeout,
+			);
+		}
+		elsif ($SDK_WORKER_ACTIONS{$action} && $source eq $SDK) {
+			return if $class->_worker_submit(
+				source   => $SDK,
+				sourceId => $args{sourceId},
+				action   => $action,
+				info     => $args{info},
+				cb       => $cb,
+				timeout  => $timeout,
 			);
 		}
 	}

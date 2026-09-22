@@ -678,7 +678,12 @@ async function main(std, os) {
 	//   boardlist payload = { source, bangid|id, page? }     -> getList(bangid, page)
 	//     注：kg/tx/wy/mg 的 getList 吃 bangid；kw 榜单上游 wbd 签名已失效（搜索不受影响）
 	const SDK_ACTIONS = { search: 1, boards: 1, boardlist: 1, songlist: 1, songlistdetail: 1, songlistbytag: 1, songlistsorts: 1, songlisttags: 1 };
-	if (SDK_ACTIONS[action]) {
+	// 0.11.43：这个分支同时服务「fork 单次」与「常驻 worker」两种形态。
+	// 动机：设备是 i386（Atom 级），每个请求 fork 一个 qjs 再解析 ~700KB bundle ≈ 0.5s；
+	// 而歌单下钻一次要问好几层（平台/排序/分类/列表/曲目），这笔固定开销被放大数倍。
+	// 常驻后 bundle 只解析一次（Helper 侧用 source=$SDK 起一个 worker，argv[1] 就是它）。
+	const isSdkWorker = (action === 'serve') && /sdk\.bundle\.js$/.test(String(sourcePath || ''));
+	if (SDK_ACTIONS[action] || isSdkWorker) {
 		let payload = {};
 		try { payload = JSON.parse(infoJson || '{}') || {} } catch (e) {}
 		if (payload && payload.info && typeof payload.info === 'object') payload = payload.info;
@@ -831,7 +836,10 @@ async function main(std, os) {
 			print('RESULT ' + JSON.stringify({ ok: false, error: 'sdk bundle did not expose __LXSDK' }));
 			std.exit(1);
 		}
-		const runSdk = async () => {
+		// 0.11.43：参数化（从前闭包吃外层的 action/payload，常驻 worker 一进程要服务多个请求）
+		const runSdk = async (act, argPayload) => {
+			const action = act;
+			const payload = argPayload || {};
 			if (action === 'search') {
 				const q = String(payload.query || payload.name || '');
 				const page = Number(payload.page) || 1;
@@ -913,7 +921,36 @@ async function main(std, os) {
 			if (!bangid) throw new Error('boardlist: bangid required');
 			return await mod.getList(bangid, Number(payload.page) || 1);
 		};
-		runSdk().then(r => {
+		// ---- 常驻 worker 形态：bundle 已加载，按行协议服务（READY / RESULT <id> {json} / LOG）----
+		if (isSdkWorker) {
+			print('READY ' + JSON.stringify({ name: 'sdk', version: '' }));
+			std.out.flush();
+			for (;;) {
+				const line = std.in.getline();
+				if (line === null || line === undefined) break;      // stdin 关闭 → 退出
+				const t = String(line).trim();
+				if (!t) continue;
+				let req;
+				try { req = JSON.parse(t); }
+				catch (e) { print('RESULT 0 ' + JSON.stringify({ ok: false, error: 'bad request json' })); continue; }
+				const rid = req.id != null ? req.id : 0;
+				const t0w = Date.now();
+				try {
+					const r = await runSdk(req.action || '', req.info || {});
+					print('RESULT ' + rid + ' ' + JSON.stringify({ ok: true, data: r == null ? null : r, ms: Date.now() - t0w }));
+				}
+				catch (e) {
+					const o = JSON.parse(fmtErr(e));
+					o.ms = Date.now() - t0w;
+					print('RESULT ' + rid + ' ' + JSON.stringify(o));
+				}
+				std.out.flush();
+			}
+			print('LOG sdk worker: stdin closed, exiting');
+			std.exit(0);
+		}
+
+		runSdk(action, payload).then(r => {
 			const s = JSON.stringify({ ok: true, data: r == null ? null : r });
 			print('LOG sdk stringify len=' + s.length);
 			print('RESULT ' + s);
