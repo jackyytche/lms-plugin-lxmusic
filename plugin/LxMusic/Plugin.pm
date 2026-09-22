@@ -908,21 +908,28 @@ sub sdkPlListHandler {
 				}
 			}
 
-			my @list = @{ $res->{data}{list} };
+			my $raw  = $res->{data}{list};
+			my @list = @$raw;
 			@list = @list[ $skip .. $#list ] if $skip && @list > $skip;
 			@list = @list[ 0 .. $window - 1 ] if @list > $window;
 			my $items = _plItems($src, \@list, 60);
 
-			# ⚠️ 0.11.33：`offset` 是**必须**的。LMS 下钻第 N 项时用父层返回的
-			# items[N - offset] 取条目（Slim/Control/XMLBrowser.pm:386、Slim/Web/XMLBrowser.pm:285、
-			# 子 feed 合并处 :1530 / :1137），而本层是"开窗返回"的；从前不报 offset ⇒
-			# items[N] 直接越界 ⇒ **只有列表第 1 个歌单点得进去，其余全是空页**（用户报的 Q2）。
-			# `total` 让列表页自己长出页码条；mg 的上游 total 是哨兵值 99999（假数）⇒ 丢掉。
+			# total 让列表页长出页码条。真实值：kw 9080/1754、kg 2000、tx 11619/30758、wy 真值；
+			# mg 的上游是**硬编码哨兵 99999**（vendored mg/songList.js:210 `total: 99999`）⇒ 视为未知，
+			# 用"本页上游已满 ⇒ 至少还有一页"合成一个保守值，否则 mg 永远翻不了页（用户报的现象之一）。
 			my $total = $res->{data}{total};
-			$total = undef if !defined $total || $total !~ /^\d+$/ || $total >= 9999;
+			$total = undef if !defined $total || $total !~ /^\d+$/ || $total >= 99999;
+			if (!defined $total) {
+				my $end = ($page - 1) * $upw + scalar(@$raw);   # 本页最后一个绝对下标 + 1
+				$total = $end + (($upw && scalar(@$raw) >= $upw) ? 1 : 0);
+			}
 
 			$cb->({
 				items  => @$items ? $items : [ { name => _u('该平台没有返回歌单'), type => 'text' } ],
+				# ⚠️ 0.11.33：`offset` 是**必须**的。LMS 下钻第 N 项时用父层返回的
+				# items[N - offset] 取条目（Slim/Control/XMLBrowser.pm:386、Slim/Web/XMLBrowser.pm:285、
+				# 子 feed 合并处 :1530 / :1137），而本层是"开窗返回"的；从前不报 offset ⇒
+				# items[N] 直接越界 ⇒ **只有列表第 1 个歌单点得进去，其余全是空页**（Q2）。
 				offset => $index,
 				(defined $total ? (total => $total) : ()),
 			});
