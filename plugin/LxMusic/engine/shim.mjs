@@ -839,6 +839,77 @@ async function main(std, os) {
 			print('RESULT ' + JSON.stringify({ ok: false, error: 'sdk bundle did not expose __LXSDK' }));
 			std.exit(1);
 		}
+		// ---- kg 歌单详情「快路径」（0.11.46）----
+		// 起因：用户问"榜单加载挺快，歌单能参考它吗"。答案是能——榜单走的是一次精简 JSON
+		// （leaderboard.getList，100 首/页），而 kg 的歌单详情在 SDK 里是**两步重活**：
+		//   ① 抓 371KB 的 special/single HTML 再正则抠 JSON  ② 再打一次 574KB 的音频信息接口
+		// 设备是 i386（Atom 级）：本机 qjs 只需 ~0.27s 的解析，在设备上要 2~3s。
+		// mobilecdn 的 special/song 是同一份数据的**精简 JSON**（可 pagesize 分页，
+		// 字段足够还原 SDK 的曲目对象形状），实测 42KB/0.14s（100 首）。
+		// 任何一步失败都**回落到 SDK 原路径**，行为不变。
+		function __sizeFmt(size) {
+			if (!size) return '0 B';
+			const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+			const n = Math.floor(Math.log(size) / Math.log(1024));
+			return (size / Math.pow(1024, Math.floor(n))).toFixed(2) + ' ' + units[n];
+		}
+		function __fmtTime(secs) {
+			const m = Math.trunc(secs / 60), s2 = Math.trunc(secs % 60);
+			const p = (x) => (x < 10 ? '0' + x : String(x));
+			return (m == 0 && s2 == 0) ? '--/--' : p(m) + ':' + p(s2);
+		}
+		async function kgLeanDetail(rawId, page) {
+			const id = String(rawId).replace(/^id_/, '').replace(/.*special\/single\//, '');
+			if (!/^\d+$/.test(id)) throw new Error('lean: not a numeric special id');
+			const pagesize = 100;
+			const base = 'http://mobilecdn.kugou.com/api/v3/special';
+			const get = async (u) => {
+				const r = await globalThis.__lxBinHttp.fetch(u, { timeout: 15000 });
+				if (r.statusCode !== 200) throw new Error('lean http ' + r.statusCode);
+				// ⚠️ 必须 utf8Decode：latin1 拿字节会让中文名整片乱码（0.11.46 本地 A/B 现场）
+				return JSON.parse(utf8Decode(r.bytes));
+			};
+			const body = await get(base + '/song?specialid=' + id + '&page=' + page
+				+ '&pagesize=' + pagesize + '&version=9108');
+			if (!body || body.status !== 1 || !body.data) throw new Error('lean: bad song body');
+			const raw = body.data.info || [];
+			const list = raw.map((it) => {
+				const types = [], _types = {};
+				if (it.filesize) { const s = __sizeFmt(it.filesize); types.push({ type: '128k', size: s, hash: it.hash }); _types['128k'] = { size: s, hash: it.hash }; }
+				if (it['320filesize']) { const s = __sizeFmt(it['320filesize']); types.push({ type: '320k', size: s, hash: it['320hash'] }); _types['320k'] = { size: s, hash: it['320hash'] }; }
+				if (it['sqfilesize']) { const s = __sizeFmt(it['sqfilesize']); types.push({ type: 'flac', size: s, hash: it.sqhash }); _types.flac = { size: s, hash: it.sqhash }; }
+				const fn = String(it.filename || '');
+				const dash = fn.indexOf(' - ');
+				const singer = dash > 0 ? fn.slice(0, dash) : '';
+				const name = dash > 0 ? fn.slice(dash + 3) : fn;
+				let secs = Number(it.duration) || 0;
+				if (secs > 10000) secs = Math.round(secs / 1000);   // 兼容秒/毫秒两种口径
+				return {
+					singer, name, albumName: '',
+					// id 统一成字符串：SDK 路径给的就是字符串，订阅源里按字符串处理
+					albumId: String(it.album_id != null ? it.album_id : ''),
+					songmid: String(it.audio_id != null ? it.audio_id : ''),
+					albumAudioId: String(it.album_audio_id != null ? it.album_audio_id : ''),
+					source: 'kg', interval: __fmtTime(secs), img: null, lrc: null,
+					hash: it.hash, types, _types, typeUrl: {},
+				};
+			});
+			const total = Number(body.data.total) || list.length;
+			let meta = {};
+			try {
+				const mi = await get(base + '/info?specialid=' + id + '&version=9108');
+				meta = (mi && mi.data) || {};
+			} catch (e) { /* 封面/名字拿不到不影响曲目 */ }
+			return {
+				list, page, limit: pagesize, total, source: 'kg',
+				info: {
+					name: meta.specialname || '', author: meta.nickname || '',
+					img: meta.imgurl ? String(meta.imgurl).replace('{size}', '240') : '',
+					count: total,
+				},
+			};
+		}
+
 		// 0.11.43：参数化（从前闭包吃外层的 action/payload，常驻 worker 一进程要服务多个请求）
 		const runSdk = async (act, argPayload) => {
 			const action = act;
@@ -915,6 +986,15 @@ async function main(std, os) {
 				const id = String(payload.id != null ? payload.id : (payload.listid || ''));
 				if (!id) throw new Error('songlistdetail: id required');
 				const page = Number(payload.page) || 1;
+				// kg 快路径（0.11.46）：见 kgLeanDetail 注释；`lean:0` 可强制走 SDK 做 A/B
+				if (src === 'kg' && payload.lean !== 0 && payload.lean !== false) {
+					try {
+						return await kgLeanDetail(id, page);
+					}
+					catch (e) {
+						print('LOG kg lean failed, fallback to sdk: ' + String((e && e.message) || e));
+					}
+				}
 				return await sl.getListDetail(id, page);
 			}
 			const mod = sdk[payload.source] && sdk[payload.source].leaderboard;
