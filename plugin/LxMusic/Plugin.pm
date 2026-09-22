@@ -838,6 +838,46 @@ sub _pl_meta {
 	return $PL_META{$src};
 }
 
+# ---------- feed 结果缓存（0.11.40）----------
+# 为什么必须有：Daphile 皮肤的下钻链接**不带 session sid**（`index=7.0.1.1.0&sess=`），
+# 所以 LMS 的 feed 会话缓存从不生效 ⇒ **每次点一个歌单，LMS 都会把父层列表重新问一遍**
+# （"点歌单进曲目列表"实测 2.0~4.4s，其中约 0.9s 是父层那次重取），而我们这边每次都是
+# fork 一个 qjs + 打一次平台 API。插件侧缓存这两层就能把重复开销压掉。
+my %FEED_CACHE;
+my $FEED_CACHE_MAX  = 300;
+my $PL_LIST_TTL     = 120;   # 分类 → 歌单列表（会变，短 TTL）
+my $PL_DETAIL_TTL   = 600;   # 歌单 → 曲目页（整单内容基本不变）
+
+# ⚠️ 缓存里存的 feed 必须**拷贝后再交出去**：LMS 会往返回的 feed/item 上写 `fetched`/`items`
+# 等内部状态（Slim/Control/XMLBrowser.pm `_cliQuerySubFeed_done`、Web 版 `handleSubFeed`），
+# 直接复用同一个 hashref 会把 LMS 的内部状态带进缓存，下一次命中就"看起来已经取过了"。
+sub _feed_copy {
+	my ($f) = @_;
+	return $f unless ref $f eq 'HASH';
+	my %c = %$f;
+	if (ref $f->{items} eq 'ARRAY') {
+		$c{items} = [ map { ref $_ eq 'HASH' ? { %$_ } : $_ } @{ $f->{items} } ];
+	}
+	return \%c;
+}
+
+sub _feed_cache_get {
+	my ($k, $ttl) = @_;
+	my $e = $FEED_CACHE{$k} or return undef;
+	return undef if (time() - ($e->{at} || 0)) >= $ttl;
+	return _feed_copy($e->{feed});
+}
+
+sub _feed_cache_put {
+	my ($k, $feed) = @_;
+	if (scalar(keys %FEED_CACHE) >= $FEED_CACHE_MAX) {
+		my ($old) = sort { ($FEED_CACHE{$a}{at} || 0) <=> ($FEED_CACHE{$b}{at} || 0) } keys %FEED_CACHE;
+		delete $FEED_CACHE{$old} if defined $old;
+	}
+	$FEED_CACHE{$k} = { at => time(), feed => _feed_copy($feed) };
+	return;
+}
+
 # 平台层
 sub sdkPlPlatformsHandler {
 	my ($client, $cb, $args, $mode) = @_;
@@ -855,6 +895,7 @@ sub sdkPlPlatformsHandler {
 sub sdkPlSortsHandler {
 	my ($client, $cb, $args, $mode, $src) = @_;
 	$src ||= 'kw';
+	my $t0 = time();
 	my $c = _pl_meta($src);
 
 	my $render = sub {
@@ -864,10 +905,13 @@ sub sdkPlSortsHandler {
 			url         => \&sdkPlTagsHandler,
 			passthrough => [ 'pltag', $src, $_->{id} ],
 		} } @{ $c->{sorts} || [] };
+		$log->warn(sprintf('LxMusic pl-sorts src=%s rows=%d ms=%d', $src, scalar(@items), int((time() - $t0) * 1000)));
 		$cb->({ items => @items ? \@items : [ { name => _u('该平台没有可用的排序'), type => 'text' } ] });
 	};
 
 	if ($c->{sorts} && @{ $c->{sorts} } && (time() - ($c->{sorts_at} || 0)) < $PL_SORTS_TTL) {
+		$log->warn(sprintf('LxMusic pl-sorts src=%s CACHE-HIT age=%ds ms=%d',
+			$src, int(time() - $c->{sorts_at}), int((time() - $t0) * 1000)));
 		$render->();
 		return;
 	}
@@ -897,6 +941,7 @@ sub sdkPlTagsHandler {
 	my ($client, $cb, $args, $mode, $src, $sort) = @_;
 	$src  ||= 'kw';
 	$sort = '' unless defined $sort;
+	my $t0 = time();
 	my $c = _pl_meta($src);
 
 	my $mk = sub {
@@ -929,9 +974,13 @@ sub sdkPlTagsHandler {
 			} @{ $grp->{list} || [] };
 		}
 		$cb->({ items => \@items });
+		$log->warn(sprintf('LxMusic pl-tags src=%s sort=%s rows=%d ms=%d',
+			$src, $sort, scalar(@items), int((time() - $t0) * 1000)));
 	};
 
 	if ($c->{tags} && (time() - ($c->{tags_at} || 0)) < $PL_TAGS_TTL) {
+		$log->warn(sprintf('LxMusic pl-tags src=%s CACHE-HIT age=%ds ms=%d',
+			$src, int(time() - $c->{tags_at}), int((time() - $t0) * 1000)));
 		$render->();
 		return;
 	}
@@ -970,6 +1019,15 @@ sub sdkPlListHandler {
 	my $index  = $args->{index} || 0;
 	my $window = $args->{quantity} || 50;
 	$window = 50 if $window < 1 || $window > 300;
+
+	my $ckey = join('|', 'pl', $src, $sort, $tag, $index, $window);
+	my $t0   = time();
+	if (my $hit = _feed_cache_get($ckey, $PL_LIST_TTL)) {
+		$log->warn(sprintf('LxMusic pl-list CACHE-HIT src=%s sort=%s tag=%s idx=%d win=%d ms=%d',
+			$src, $sort, $tag, $index, $window, int((time() - $t0) * 1000)));
+		$cb->($hit);
+		return;
+	}
 
 	# 上游页宽各源不同（vendored limit_list：kw 36 / kg 20 / tx 36 / wy 30；mg 未定），
 	# 先按 30 猜，拿到首响应的 limit 再重算重取一次（同榜单 0.11.5 与歌单详情 0.11.13 的教训）。
@@ -1033,7 +1091,7 @@ sub sdkPlListHandler {
 				}
 			}
 
-			$cb->({
+			my $feed = {
 				items  => @$items ? $items : [ { name => _u('该平台没有返回歌单'), type => 'text' } ],
 				# ⚠️ 0.11.33：`offset` 是**必须**的。LMS 下钻第 N 项时用父层返回的
 				# items[N - offset] 取条目（Slim/Control/XMLBrowser.pm:386、Slim/Web/XMLBrowser.pm:285、
@@ -1041,7 +1099,12 @@ sub sdkPlListHandler {
 				# items[N] 直接越界 ⇒ **只有列表第 1 个歌单点得进去，其余全是空页**（Q2）。
 				offset => $index,
 				(defined $total ? (total => $total) : ()),
-			});
+			};
+			_feed_cache_put($ckey, $feed);
+			$log->warn(sprintf('LxMusic pl-list MISS src=%s sort=%s tag=%s idx=%d win=%d rows=%d total=%s ms=%d',
+				$src, $sort, $tag, $index, $window, scalar(@$items), (defined $total ? $total : '?'),
+				int((time() - $t0) * 1000)));
+			$cb->($feed);
 		},
 	);
 	};
@@ -1063,8 +1126,19 @@ sub sdkSonglistDetailHandler {
 	my $window = $args->{quantity} || 50;
 	$window = 50 if $window < 1 || $window > 300;
 
-	# 歌单详情的上游页宽同样不固定（kw/wy 一次给整单、mg 50、kg 100），先按 50 猜，
-	# 拿到响应的 limit 再重算重取一次（同榜单 0.11.5 的教训）
+	my $ckey = join('|', 'pd', $src, $plid, $index, $window);
+	my $t0   = time();
+	if (my $hit = _feed_cache_get($ckey, $PL_DETAIL_TTL)) {
+		$log->warn(sprintf('LxMusic pl-detail CACHE-HIT src=%s id=%s idx=%d win=%d ms=%d',
+			$src, $plid, $index, $window, int((time() - $t0) * 1000)));
+		$cb->($hit);
+		return;
+	}
+
+	# 歌单详情的上游页宽同样不固定（kw 1000 / kg 10000 / tx 100000 / wy 1000…），先按 50 猜，
+	# 拿到响应的 limit 再重算重取一次（同榜单 0.11.5 的教训）。
+	# ⚠️ 0.11.40：**重算后 page/skip 没变就别重取**——index=0（"点进歌单"的绝大多数情况）时
+	# 猜 50 与真页宽算出来的都是 page=1/skip=0，从前照样再打一次平台 API，白等一次往返。
 	my $upw   = 50;
 	my $page  = int($index / $upw) + 1;
 	my $skip  = $index % $upw;
@@ -1089,13 +1163,16 @@ sub sdkSonglistDetailHandler {
 				my $lim = $res->{data}{limit};
 				if (defined $lim && $lim > 0) {
 					$retuned = 1;
-					if ($lim != $upw) {
+					my $np = int($want / $lim) + 1;
+					my $ns = $want % $lim;
+					if ($np != $page || $ns != $skip) {
 						$upw  = $lim;
-						$page = int($want / $upw) + 1;
-						$skip = $want % $upw;
+						$page = $np;
+						$skip = $ns;
 						$fetch->();
 						return;
 					}
+					$upw = $lim;   # 窗口数学沿用真页宽（合成 total 时要用）
 				}
 			}
 
@@ -1121,7 +1198,7 @@ sub sdkSonglistDetailHandler {
 			my $total = $info->{count} || $res->{data}{total} || scalar @$all;
 			my $plname = $info->{name} || $plid;
 
-			$cb->({
+			my $feed = {
 				items  => $tracks,
 				offset => $index,
 				(total => $total),
@@ -1135,7 +1212,12 @@ sub sdkSonglistDetailHandler {
 						. _u(' · ') . int($total) . _u(' 首'),
 					  type => 'text', label => 'ARTIST' },
 				]),
-			});
+			};
+			_feed_cache_put($ckey, $feed);
+			$log->warn(sprintf('LxMusic pl-detail MISS src=%s id=%s idx=%d win=%d tracks=%d total=%d ms=%d',
+				$src, $plid, $index, $window, scalar(@$tracks), int($total),
+				int((time() - $t0) * 1000)));
+			$cb->($feed);
 		},
 	);
 	};
