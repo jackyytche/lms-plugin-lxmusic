@@ -202,6 +202,10 @@ sub probeUrl {
 				method => $d->{method},
 				magic  => $magic,
 				bytes  => $d->{bytes},
+				# 0.11.51：重定向链的**最终 URL**（无跳转时为空串）——上层用它替代原直链，
+				# 免得把一条会 302 的聚合中转链交给 LMS 的开流路径（现场会挂死，见 shim 注释）。
+				effective => ($d->{url_effective} && $d->{url_effective} ne $url)
+					? $d->{url_effective} : '',
 				error  => $ok ? undef : (($res->{error} // ($code ? "HTTP $code" : 'no response'))
 					. ($type ne '' ? " type=$type" : '')
 					. ($magic ne '' ? " magic=$magic" : '')
@@ -306,7 +310,18 @@ sub resolveTrack {
 			if ($pi->{ok}) {
 				my $secs = _secsOf($track);
 				my $kbps = ($pi->{length} && $secs) ? int($pi->{length} * 8 / 1000 / $secs) : undef;
-				return $finish->($src, $q, $url, $tm, $friendly, 1, $kbps, $pi->{magic}, $pi->{length});
+				# 0.11.51：**交付重定向链的最终 URL**（探测时已跟到底并嗅过魔数，所以校验结论对最终 URL 同样成立）。
+				# 现场判据：会 302 的聚合中转链交给 LMS 的开流路径 ⇒ LMS 挂死（30s 零日志，
+				# 看门狗判 crashed）；换成最终直链后同一实验存活。原始 URL 仍留在 tries 里备查。
+				my $deliver = $url;
+				if ($pi->{effective}) {
+					$deliver = $pi->{effective};
+					# 最终 URL 往往才是有音频后缀的那个（如 …/xxx.mp3）⇒ 顺便把 friendly 重算一遍
+					$friendly = 1 if !$friendly && $class->streamFriendly($deliver);
+					$log->warn("LxMusic resolve: following redirect -> "
+						. ($deliver =~ m{^https?://([^/]+)} ? $1 : $deliver));
+				}
+				return $finish->($src, $q, $deliver, $tm, $friendly, 1, $kbps, $pi->{magic}, $pi->{length});
 			}
 			push @tries, { source => $src->{name}, quality => $q, why => 'verify: ' . ($pi->{error} // '?'), %$tm };
 			$log->warn("LxMusic resolve: verify rejected [" . $src->{name} . "] $q: " . ($pi->{error} // '?'));
