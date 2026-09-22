@@ -733,6 +733,7 @@ async function main(std, os) {
 			return s;
 		}
 		function curlOnce(url, opts, outBin, outHdr, inBody) {
+			const t0 = Date.now();
 			const outErr = outHdr + '.err';
 			// 桥级超时钳制（单位：秒！opts.timeout 是 ms）：UI 等不了 15s 级拖尾；
 			// migu.cn 设备网络实测 ~325B/s 龟速（0.3.4 现场测量），单独 3s 快速失败
@@ -790,7 +791,9 @@ async function main(std, os) {
 				if (c > 0) headers[line.slice(0, c).trim().toLowerCase()] = line.slice(c + 1).trim();
 			}
 			const bytes = readBinFile(outBin);
-			print('LOG binHttp ' + statusCode + ' ' + bytes.length + 'B ' + String(url).slice(0, 70));
+			// 带耗时：设备是 i386，要分清"慢在上游"还是"慢在本机解析"
+			print('LOG binHttp ' + statusCode + ' ' + bytes.length + 'B ' + (Date.now() - t0) + 'ms '
+				+ String(url).slice(0, 70));
 			return { statusCode, headers, bytes };
 		}
 		function errCode(msg, code) {

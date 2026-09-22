@@ -887,6 +887,19 @@ sub _feed_cache_put {
 	return;
 }
 
+# shim 子进程的 LOG 行平时只放在 $res->{logs}（页面 logs 区可见，server.log 看不到）。
+# 排查性能时（plugin.lxmusic = INFO/DEBUG）把带耗时的 binHttp 行透到 server.log，
+# 这样"慢在上游"和"慢在本机解析"能一眼分开（shim 的 binHttp 现在带 Nms）。
+sub _log_shim_http {
+	my ($what, $res) = @_;
+	return unless $log->is_info;
+	for my $l (@{ $res->{logs} || [] }) {
+		next unless $l =~ /binHttp \d+ \d+B \d+ms/;
+		$log->warn("LxMusic $what shim " . substr($l, 0, 190));
+	}
+	return;
+}
+
 # 覆盖式命中（0.11.42）：LMS 解析父层面包屑时用的是**被点的那一行的绝对下标**
 # （`index=N, quantity=1`），而展示那一层缓存的是 `index=0, quantity=50` ⇒ 只有第 1 行能命中。
 # 这里允许"已缓存的窗口覆盖住目标下标"就切片返回：列表看过一次之后，点任意一行都不再打上游。
@@ -1206,6 +1219,7 @@ sub sdkSonglistDetailHandler {
 				$cb->({ items => [ { name => _u('歌单详情失败: ') . ($res->{error} || 'unknown'), type => 'text' } ] });
 				return;
 			}
+			_log_shim_http('pl-detail', $res);
 
 			# 首响应校正页宽（与榜单 handler 同款）
 			if (!$retuned) {
