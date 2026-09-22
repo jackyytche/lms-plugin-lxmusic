@@ -671,7 +671,7 @@ async function main(std, os) {
 	}
 
 	// ---------- SDK 模式（vendored musicSdk，无需订阅源） ----------
-	// qjs shim.mjs <sdk.bundle.js> <search|boards|boardlist|songlist|songlistdetail> <payloadJSON>
+	// qjs shim.mjs <sdk.bundle.js> <search|boards|boardlist|songlist|songlistdetail|songlistbytag|songlistsorts|songlisttags> <payloadJSON>
 	//   search    payload = { query, source?, page?, limit? }
 	//             source 缺省 = searchMusic 跨源聚合（返回按源分组的数组）
 	//   boards    payload = { source }                       -> getBoards()

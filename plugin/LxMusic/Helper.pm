@@ -514,7 +514,9 @@ sub request {
 		$source = $SHIM;
 	}
 	elsif ($action eq 'search' || $action eq 'boards' || $action eq 'boardlist'
-		|| $action eq 'songlist' || $action eq 'songlistdetail' || $action eq 'songlistbytag') {
+		|| $action eq 'songlist' || $action eq 'songlistdetail' || $action eq 'songlistbytag'
+		# 0.11.36：歌单 PC 对齐的两个新元数据动作（排序 tab / 分类标签）也走 sdk.bundle.js
+		|| $action eq 'songlistsorts' || $action eq 'songlisttags') {
 		-f $SDK or do { $cb->(_err('sdk bundle not installed (search/browse disabled)')); return };
 		$source = $SDK;
 	}
