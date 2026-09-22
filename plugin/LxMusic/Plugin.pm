@@ -1156,9 +1156,9 @@ sub sdkPlListHandler {
 				(defined $total ? (total => $total) : ()),
 			};
 			_feed_cache_put($ckey, $feed, $window);
-			$log->warn(sprintf('LxMusic pl-list MISS src=%s sort=%s tag=%s idx=%d win=%d rows=%d total=%s ms=%d',
+			$log->warn(sprintf('LxMusic pl-list MISS src=%s sort=%s tag=%s idx=%d win=%d rows=%d total=%s shim_ms=%s ms=%d',
 				$src, $sort, $tag, $index, $window, scalar(@$items), (defined $total ? $total : '?'),
-				int((time() - $t0) * 1000)));
+				(defined $res->{ms} ? $res->{ms} : '?'), int((time() - $t0) * 1000)));
 			$cb->($feed);
 		},
 	);
@@ -1277,9 +1277,9 @@ sub sdkSonglistDetailHandler {
 				]),
 			};
 			_feed_cache_put($ckey, $feed, $window);
-			$log->warn(sprintf('LxMusic pl-detail MISS src=%s id=%s idx=%d win=%d tracks=%d total=%d ms=%d',
+			$log->warn(sprintf('LxMusic pl-detail MISS src=%s id=%s idx=%d win=%d tracks=%d total=%d shim_ms=%s ms=%d',
 				$src, $plid, $index, $window, scalar(@$tracks), int($total),
-				int((time() - $t0) * 1000)));
+				(defined $res->{ms} ? $res->{ms} : '?'), int((time() - $t0) * 1000)));
 			$cb->($feed);
 		},
 	);
