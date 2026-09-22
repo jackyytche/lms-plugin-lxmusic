@@ -1,0 +1,9 @@
+# CBM 索引排除：这些不是我们的代码 / 会淹没知识图谱
+# vendored SDK（lx-music-desktop 的 JS，含 ~700KB 压缩 bundle 与 renderer 工具）
+plugin/LxMusic/engine/sdk/
+# LMS 宿主 API 的测试存根（假模块，不是产品代码）
+plugin/t/
+# 预编译的 quickjs 二进制
+plugin/LxMusic/Bin/
+# CI 回写的日志
+*.log

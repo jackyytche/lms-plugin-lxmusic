@@ -599,6 +599,15 @@ async function main(std, os) {
 		else if (bytes.length > 11 && String.fromCharCode.apply(null, bytes.slice(4, 8)) === 'ftyp') magic = 'm4a';
 		else if (bytes.length > 1 && bytes[0] === 0xff && (bytes[1] & 0xe0) === 0xe0) magic = 'mp3';
 		else if (bytes.length > 3 && bytes[0] === 0x1a && bytes[1] === 0x45 && bytes[2] === 0xdf && bytes[3] === 0xa3) magic = 'mkv';
+		// 0.11.52：FLAC 的 **位深**（STREAMINFO 里的 bits-per-sample）——用来把"档位标签"
+		// 从"请求的档位"改成"真实拿到的档位"（用户报：明明 128kbps 也显示 24bit FLAC）。
+		// 布局：'fLaC'(4) + 元数据块头(4) + STREAMINFO：min/max blocksize(4) min/max framesize(6)
+		// ⇒ 第 12/13 字节起是 20bit 采样率 + 3bit 声道 + 5bit (位深-1)。
+		let bits = 0;
+		if (magic === 'flac' && bytes.length > 21) {
+			bits = (((bytes[20] & 0x01) << 4) | ((bytes[21] & 0xf0) >> 4)) + 1;
+			if (bits < 4 || bits > 32) bits = 0;      // 不可信就丢掉
+		}
 		const head = bytes.slice(0, 32).map(c => (c >= 32 && c < 127) ? String.fromCharCode(c) : '.').join('');
 		const looksHtml = /^\s*(<!doctype|<html|<\?xml|\{|\[)/i.test(head);
 		// 总长度优先取 Content-Range 里的总量（`bytes 0-2047/34600000`）：范围响应的
@@ -606,6 +615,36 @@ async function main(std, os) {
 		const crTotal = (() => {
 			const r = (hdr('content-range') || '').match(/\/\s*(\d+)\s*$/);
 			return r ? Number(r[1]) : 0;
+		})();
+		// 0.11.51：**把重定向链跟到底，求出最终 URL**。
+		// 现场（2026-09-22 深夜，最小复现）：念心给的 `http://mcp.nianxinxz.com/share/ceshi/tx.php?…`
+		// 会 302 两次（→ https 同域 → car-lv.kuwo.cn/…）；LMS 让**我们的 handler**去开这条流时，
+		// 走到第二步就挂住、30 秒零日志被达菲看门狗判 crashed（本地库/直链/源直链直接播放都稳）。
+		// 已用对照实验判定：直链源（全豆要 wy → m801.music.126.net，无 302）不崩。
+		// 办法：探测时本来就用 `curl -L` 跟了跳，这里把 3xx 块里的 Location 依次套上去得到最终 URL，
+		// 交给上层当"直链"发布 ⇒ LMS 拿到的永远是不带跳转的地址，等价于已证安全的那条路径。
+		const eff = (() => {
+			let cur = url, changed = 0;
+			for (const b of blocks) {
+				const sm = b.match(/^HTTP\/[\d.]+\s+(\d{3})/m);
+				if (!sm) continue;
+				const code = Number(sm[1]);
+				if (code < 300 || code >= 400) continue;
+				const lm = b.match(/^location\s*:\s*(.+)$/mi);
+				if (!lm) continue;
+				const loc = lm[1].trim();
+				if (/^https?:\/\//i.test(loc)) {
+					cur = loc;
+				} else if (loc.startsWith('//')) {
+					cur = ((cur.match(/^https?:/i) || ['http:'])[0]) + loc;
+				} else {
+					const mm = cur.match(/^(https?:\/\/[^\/]+)(.*)$/i);
+					if (!mm) continue;
+					cur = mm[1] + (loc.startsWith('/') ? loc : mm[2].replace(/[^\/]*$/, '') + loc);
+				}
+				changed = 1;
+			}
+			return changed ? cur : '';
 		})();
 		const out = {
 			status, method,
@@ -615,7 +654,9 @@ async function main(std, os) {
 			acceptRanges: hdr('accept-ranges'),
 			bytes: bytes.length,
 			magic,
+			bits,
 			head: head,
+			url_effective: eff,
 		};
 		const typeAudio = /^(?:audio\/|video\/|application\/(?:octet-stream|x-|ogg|flac|mp4))/i.test(out.type || '');
 		const bad = status < 200 || status >= 300
