@@ -527,6 +527,21 @@ my $LAST_REPUB = 0;
 # 而 Helper 的 worker 计时器用自持 hashref 一直好用）。
 my $REPUB_OWNER = {};
 
+# ⚠️⚠️ 0.11.48：**断自激**（2026-09-22 晚三次崩溃的真凶）
+# 现场：日志里 `playlist-triggered republish for 300 queued rows` 每 **2~3 秒**一条、连着十几条，然后 LMS 死。
+# 机制：`publishQueueMetadata` 会 `setRemoteMetadata`（写轨道元数据）⇒ **LMS 发新的 `playlist` 通知** ⇒
+# 订阅者又排一次补发 ⇒ 又写 300 行……**3 秒去抖正好卡在循环周期上**，于是一个 300 行的队列变成
+# "每 3 秒 300 次元数据写入"，CPU 被点着（这台是 i386/无风扇小机）直到进程死。
+# 两道闸：
+#   ① `%REPUBLISHED` 内容指纹——**内容没变的行一个字都不写**（这才是真正的止血点：首轮之后全是 no-op，
+#      不再产生新通知，循环自然断掉）；
+#   ② `$REPUB_BUSY` 重入闸 + `$REPUB_LAST` 节流（最快 5s 一轮）——即使通知是同步重入或被反复触发，
+#      最坏也只是"每 5 秒扫一遍哈希"，不再有写入风暴。
+my %REPUBLISHED;
+my $REPUB_BUSY = 0;
+my $REPUB_LAST = 0;
+my $REPUB_MIN_INTERVAL = 5;
+
 sub _repub_fire {
 	Plugins::LxMusic::ProtocolHandler->republish_known_queued();
 }
@@ -540,16 +555,26 @@ sub _schedule_republish {
 sub republish_known_queued {
 	my ($class) = @_;
 
-	my $n = 0;
-	for my $client (Slim::Player::Client::clients()) {
-		my $pl = eval { Slim::Player::Playlist::playList($client) };
-		next unless $pl && ref($pl) eq 'ARRAY';
-		for my $item (@$pl) {
-			my $u = blessed($item) ? eval { $item->url } : $item;
-			next unless $u && $u =~ m{^lxm://};
-			my $m = $METADATA{$u} or next;
-			next unless $m->{cover} || $m->{title};
-			eval {
+	return 0 if $REPUB_BUSY;                                   # ① 防重入
+	my $now = time();
+	return 0 if $now - $REPUB_LAST < $REPUB_MIN_INTERVAL;      # ② 节流
+	$REPUB_LAST = $now;
+	$REPUB_BUSY = 1;
+
+	my ($n, $skip) = (0, 0);
+	eval {
+		for my $client (Slim::Player::Client::clients()) {
+			my $pl = eval { Slim::Player::Playlist::playList($client) };
+			next unless $pl && ref($pl) eq 'ARRAY';
+			for my $item (@$pl) {
+				my $u = blessed($item) ? eval { $item->url } : $item;
+				next unless $u && $u =~ m{^lxm://};
+				my $m = $METADATA{$u} or next;
+				next unless $m->{cover} || $m->{title};
+				# 指纹：内容没变 ⇒ 一个字节都不写（否则每写一次就换来一个新通知）
+				my $sig = join("\x1f", map { defined $_ ? $_ : '' }
+					@{$m}{qw(cover title secs kbps quality)});
+				if (($REPUBLISHED{$u} || '') eq $sig) { $skip++; next; }
 				$class->publishQueueMetadata($u, {
 					title   => $m->{title},
 					secs    => $m->{secs},
@@ -557,19 +582,31 @@ sub republish_known_queued {
 					cover   => $m->{cover},
 					quality => $m->{quality},
 				});
-			};
-			$n++;
+				$REPUBLISHED{$u} = $sig;
+				$n++;
+			}
 		}
+	};
+	$REPUB_BUSY = 0;
+	%REPUBLISHED = () if scalar(keys %REPUBLISHED) > 3000;   # 上限，防内存无界
+
+	if ($n) {
+		# ⚠️ 用 warn 而不是 info：插件默认级别是 ERROR，info 级**根本不会写进 server.log**
+		#（0.11.29/30 我因此误判"定时器没跑"，白白多绕了两轮）
+		$log->warn("LxMusic: playlist-triggered republish: wrote $n rows, skipped $skip unchanged");
 	}
-	# ⚠️ 用 warn 而不是 info：插件默认级别是 ERROR，info 级**根本不会写进 server.log**
-	#（0.11.29/30 我因此误判"定时器没跑"，白白多绕了两轮）
-	$log->warn("LxMusic: playlist-triggered republish for $n queued rows");
+	else {
+		# no-op 走 debug：正常运行时不该刷屏（首轮之后每轮都是 no-op，这是**预期**）
+		$log->debug("LxMusic: playlist-triggered republish: no-op ($skip rows already current)");
+	}
 	return $n;
 }
 
 # eval 包一层：万一 LMS 版本里没有 subscribe（或测试存根没实现），插件照样加载
 my $SUBSCRIBED = eval {
 	Slim::Control::Request::subscribe(sub {
+		# 0.11.48：我们自己的写入换来的通知直接忽略（同步重入那一半）
+		return if $REPUB_BUSY;
 		my $now = time();
 		# 立即补发一次（小批量/单行入队时这次就够，UI 立刻能看到封面）
 		unless ($now - $LAST_REPUB < 2) {
