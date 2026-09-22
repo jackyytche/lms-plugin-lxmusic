@@ -806,11 +806,18 @@ sub _plItems {
 		my $img = $pl->{img};
 		# 歌单封面也走插件代理（kw/kg 的图 CDN 需要 UA/Referer，设备直连不出图）
 		$img = _coverProxyUrl($img) if $img && $img =~ m{^https?://} && $prefs->get('coverProxy');
+		# 0.11.33：整单播放靠 LMS 的 **`playlist`** 属性（playall/addall/insert/remove 专用，
+		# Slim/Web/XMLBrowser.pm:336-344 → type=playlist → Slim/Formats/XML.pm:93 → 我们的 explodePlaylist）。
+		# 只给 feed 级 `play` 不行：Web 侧 `play` 只认 action=play/add/insert（:325-333），
+		# 而 action=playall 会退化成"把详情 feed 当前这一页（quantity=itemsPerPage=50）当播放列表入队"
+		# ⇒ 用户报的「歌单播放队列只有 50 首」。id 只允许 [A-Za-z0-9_-]（explodePlaylist 的 URL 正则）。
+		my $plurl = ($pl->{id} =~ /^[A-Za-z0-9_-]+$/) ? "lxm://l/$src/$pl->{id}" : undef;
 		push @items, {
 			name        => _u('🎼 ') . $name . ($meta ne '' ? "  ($meta)" : ''),
 			type        => 'link',
 			url         => \&sdkSonglistDetailHandler,
 			passthrough => [ 'songlistdetail', $src, $pl->{id} ],
+			($plurl ? (playlist => $plurl) : ()),
 			(($img && $img =~ m{^https?://}) ? (image => _u($img)) : ()),
 		};
 		last if @items >= $max;
@@ -863,9 +870,18 @@ sub sdkPlListHandler {
 	my $index  = $args->{index} || 0;
 	my $window = $args->{quantity} || 50;
 	$window = 50 if $window < 1 || $window > 300;
-	my $page   = int($index / 30) + 1;     # 上游页宽按 30 计（kw/mg 30，kg/tx 36 —— 取小更稳）
-	my $skip   = $index % 30;
 
+	# 上游页宽各源不同（vendored limit_list：kw 36 / kg 20 / tx 36 / wy 30；mg 未定），
+	# 先按 30 猜，拿到首响应的 limit 再重算重取一次（同榜单 0.11.5 与歌单详情 0.11.13 的教训）。
+	# 0.11.33 之前这里硬编码 30 ⇒ 第 2 页起窗口错位。
+	my $upw  = 30;
+	my $page = int($index / $upw) + 1;
+	my $skip = $index % $upw;
+	my $retuned = 0;
+	my $want = $index;
+
+	my $fetch;
+	$fetch = sub {
 	Plugins::LxMusic::Helper->request(
 		action  => 'songlistbytag',
 		info    => { source => $src, sortId => $sid, tagId => '', page => $page },
@@ -876,13 +892,44 @@ sub sdkPlListHandler {
 				$cb->({ items => [ { name => _u('歌单获取失败: ') . ($res->{error} || 'unknown'), type => 'text' } ] });
 				return;
 			}
+
+			# 首响应校正页宽
+			if (!$retuned) {
+				my $lim = $res->{data}{limit};
+				if (defined $lim && $lim > 0) {
+					$retuned = 1;
+					if ($lim != $upw) {
+						$upw  = $lim;
+						$page = int($want / $upw) + 1;
+						$skip = $want % $upw;
+						$fetch->();
+						return;
+					}
+				}
+			}
+
 			my @list = @{ $res->{data}{list} };
 			@list = @list[ $skip .. $#list ] if $skip && @list > $skip;
 			@list = @list[ 0 .. $window - 1 ] if @list > $window;
 			my $items = _plItems($src, \@list, 60);
-			$cb->({ items => @$items ? $items : [ { name => _u('该平台没有返回歌单'), type => 'text' } ] });
+
+			# ⚠️ 0.11.33：`offset` 是**必须**的。LMS 下钻第 N 项时用父层返回的
+			# items[N - offset] 取条目（Slim/Control/XMLBrowser.pm:386、Slim/Web/XMLBrowser.pm:285、
+			# 子 feed 合并处 :1530 / :1137），而本层是"开窗返回"的；从前不报 offset ⇒
+			# items[N] 直接越界 ⇒ **只有列表第 1 个歌单点得进去，其余全是空页**（用户报的 Q2）。
+			# `total` 让列表页自己长出页码条；mg 的上游 total 是哨兵值 99999（假数）⇒ 丢掉。
+			my $total = $res->{data}{total};
+			$total = undef if !defined $total || $total !~ /^\d+$/ || $total >= 9999;
+
+			$cb->({
+				items  => @$items ? $items : [ { name => _u('该平台没有返回歌单'), type => 'text' } ],
+				offset => $index,
+				(defined $total ? (total => $total) : ()),
+			});
 		},
 	);
+	};
+	$fetch->();
 	return;
 }
 

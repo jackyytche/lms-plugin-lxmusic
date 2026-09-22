@@ -833,7 +833,10 @@ sub explodePlaylist {
 				}
 
 				my @list = @{ $res->{data}{list} };
-				@list = @list[ 0 .. 99 ] if @list > 100;
+				# 0.11.33：整单入队上限 100 → 300（与歌单详情窗口上限一致）。
+				# 起因：歌单页头"播放"从前根本不走这里（LMS 把详情 feed 的一页 50 首当播放列表入队），
+				# 修好 `playlist` 属性后才真正落到 explodePlaylist；100 会让 >100 首的歌单仍然少一截。
+				@list = @list[ 0 .. 299 ] if @list > 300;
 				my $q = $prefs->get('quality') || '320k';
 				my @urls;
 				for my $t (@list) {
