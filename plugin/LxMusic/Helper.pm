@@ -53,6 +53,10 @@ my @WAITQ;   # 超出并发闸的请求闭包队列（FIFO）
 
 # 常驻 worker 状态（声明必须在最前：shutdown 定义在 worker 段之前，词法变量不会向后可见）
 my %WORKER;  # key => { pid, rd, wr, buf, ready, queue=>[], jobs=>{}, last, recent=>[], info, src, key }
+# 0.11.54：worker 超时过的**源路径** => 打标记时间（TTL 600s）。见 `request()` 里的说明：
+# 慢源（mg 的 3 连上游）用串行 worker 会互相拖死，标记后改走 fork（每单一进程，超时只杀自己）。
+my %WORKER_BAD;
+my $WORKER_BAD_TTL = 600;
 my $WID = 0; # worker 请求自增 id（源内唯一即可）
 my $PROBE_KEY = '__probe';   # 探测专用 worker（argv[1]='-'，shim 不加载任何订阅源）
 
@@ -554,8 +558,15 @@ sub request {
 	my %SDK_WORKER_ACTIONS = map { $_ => 1 }
 		qw(search boards boardlist songlist songlistdetail songlistbytag songlistsorts songlisttags);
 	if (workerEnabled()) {
+		# 0.11.54：**慢源改走 fork**。现场（用户报"mg 几乎没有一首有声"）：
+		#   玉宁熙的 mg 取链要串行打 3 次上游（单次响应 60~250KB），单曲 20~40s；
+		#   我们 20s 一到就 `_worker_kill`，而 kill 会把**同源其他在飞 job 一起判失败**
+		#   （日志里成片 `lx-玉宁熙-Pro@320k: worker stopped`）⇒ 该源几乎每首都失败。
+		#   worker 是**串行**的（慢候选会把后面的候选全堵住），而 fork 路径**每单一进程**、
+		#   超时只杀自己（`_poll`）⇒ 慢源走 fork 更稳。这里只给"超时过的源"打 10 分钟标记，
+		#   其他源照旧享受常驻加速，worker 的通用语义不变。
 		if ($action eq 'musicUrl' && $source && $source ne $SHIM && $source ne $SDK) {
-			return if $class->_worker_submit(
+			return if !_worker_hostile($source) && $class->_worker_submit(
 				source   => $source,
 				sourceId => $args{sourceId},
 				action   => $action,
@@ -785,8 +796,27 @@ sub _worker_send_job {
 
 sub _worker_fail_all {
 	my ($class, $w, $why) = @_;
+	# 0.11.54：`$why` 以 'retry:' 开头 ⇒ **这些 job 改走 fork 重试一次**，而不是直接判失败。
+	# 为什么需要：worker 是串行的，一个慢 job 超时会导致 `_worker_kill`，而 kill 会把**同源
+	# 正在飞的兄弟候选一起判失败**——现场就是 `lx-玉宁熙-Pro@320k: worker stopped` 雪崩
+	# （mg 一张歌单几乎全无声）。fork 路径每单一进程、超时只杀自己，正适合接手。
+	my $retry = ($why =~ s/^retry://) ? 1 : 0;
 	for my $id (keys %{ $w->{jobs} }) {
 		my $job = delete $w->{jobs}{$id};
+		if ($retry && !$job->{forked}) {
+			$job->{forked} = 1;
+			my $req = eval { $JSON->decode($job->{line}) } || {};
+			$log->warn("LxMusic worker: job $id re-dispatched via fork after worker recycle");
+			__PACKAGE__->request(
+				source   => $w->{key},
+				sourceId => $req->{source},
+				action   => $req->{action},
+				info     => $req->{info},
+				timeout  => $job->{timeout},
+				cb       => $job->{cb},
+			);
+			next;
+		}
 		$job->{cb}->({ ok => 0, data => undef, error => $why, logs => $job->{logs}, alerts => [], why => 'worker' });
 	}
 	@{ $w->{queue} } = ();
@@ -794,10 +824,10 @@ sub _worker_fail_all {
 }
 
 sub _worker_kill {
-	my ($class, $w) = @_;
+	my ($class, $w, $why) = @_;
 	return unless $w;
 	Slim::Utils::Timers::killTimers($w, \&_worker_poll);
-	$class->_worker_fail_all($w, 'worker stopped');
+	$class->_worker_fail_all($w, $why || 'worker stopped');
 	kill 'KILL', $w->{pid} if $w->{pid};
 	waitpid($w->{pid}, POSIX::WNOHANG()) if $w->{pid};
 	close $w->{rd}; close $w->{wr};
@@ -883,10 +913,14 @@ sub _worker_poll {
 		next unless $job->{sent};
 		if ($now - $job->{deadline} >= 0) {
 			$log->warn("LxMusic worker($src): job $id timed out after " . ($now - $job->{started}) . 's, recycling worker');
+			# 0.11.54：这个源已经证明"串行 worker 扛不住" ⇒ 接下来 10 分钟让它走 fork，
+			# 免得 kill 把同源其他在飞 job 一起带走（"worker stopped" 雪崩）。
+			$WORKER_BAD{ $w->{key} } = time();
 			delete $w->{jobs}{$id};
 			my $cb = $job->{cb};
 			my @logs = @{ $w->{recent} };
-			Plugins::LxMusic::Helper->_worker_kill($w);
+			$w->{dead} = 1;      # 0.11.54：先标死，重试的请求才会去起新 worker / 走 fork
+			Plugins::LxMusic::Helper->_worker_kill($w, 'retry:worker timed out');
 			$cb->({ ok => 0, data => undef, error => 'timeout: worker request exceeded ' . ($job->{timeout} || '?') . 's',
 				logs => \@logs, alerts => [], why => 'timeout' });
 			return;
@@ -948,6 +982,13 @@ sub _worker_submit {
 	}
 	$class->_worker_wake($w);
 	return 1;
+}
+
+# 0.11.54：这个源最近是否被判定"worker 不适合"（超时过）——是则改走 fork 路径
+sub _worker_hostile {
+	my $src = shift;
+	my $t = $WORKER_BAD{$src} or return 0;
+	return (time() - $t < $WORKER_BAD_TTL) ? 1 : 0;
 }
 
 # ---------- 内部 ----------

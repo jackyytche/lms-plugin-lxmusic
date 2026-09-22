@@ -866,7 +866,10 @@ sub _resolve_fresh {
 		music   => $info->{music},
 		src     => $info->{src},
 		type    => $info->{type},
-		timeout => 20,
+		# 0.11.54：20s 太紧——mg（玉宁熙）要串行打 3 次上游、实测单曲 20~40s，
+		# 一到点就判超时 ⇒ 整张歌单几乎全无声（用户报的就是这个）。给到 35s，
+		# 慢源另有 Helper 侧的"改走 fork"保护（见 Helper::request 的 %WORKER_BAD）。
+		timeout => 35,
 		cb      => sub {
 			my ($res) = @_;
 
