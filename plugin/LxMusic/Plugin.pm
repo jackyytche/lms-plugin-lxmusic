@@ -1021,7 +1021,16 @@ sub sdkPlListHandler {
 			$total = undef if !defined $total || $total !~ /^\d+$/ || $total >= 99999;
 			if (!defined $total) {
 				my $end = ($page - 1) * $upw + scalar(@$raw);   # 本页最后一个绝对下标 + 1
-				$total = $end + (($upw && scalar(@$raw) >= $upw) ? 1 : 0);
+				if ($upw && scalar(@$raw) >= $upw) {
+					# 上游本页是满的 ⇒ 后面大概率还有：合成一个**至少能长出"下一页"**的 total
+					# （0.11.39：从前只 +1，`end+1` 往往 ≤ itemsPerPage ⇒ 页码条压根不出现，
+					#  实测 tx/mg 的分类列表就卡在这一条上）
+					my $need = $index + $window + 1;
+					$total = $end > $need ? $end : $need;
+				}
+				else {
+					$total = $end;   # 上游本页没满 ⇒ 这就是最后一页
+				}
 			}
 
 			$cb->({
