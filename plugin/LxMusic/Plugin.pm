@@ -1470,7 +1470,9 @@ sub _playlistM3u {
 			my $plName = ($res->{ok} && $res->{data}{info}{name}) ? _u($res->{data}{info}{name}) : 'LX Music playlist';
 			my @lines = ('#EXTM3U', '#PLAYLIST:' . Encode::encode('UTF-8', $plName));
 			if ($res->{ok} && $res->{data} && $res->{data}{list}) {
-				my $cap = 30;   # m3u 截前 30 首：入队解析串行放行，防超长单拖爆队列
+				# 0.11.35：m3u 截断 30 → 300，与「整单入队」(explodePlaylist) 和歌单详情窗口上限对齐。
+				# 从前三个上限互不一致（30 / 100 / 300），同一个歌单走不同入口拿到的长度不一样。
+				my $cap = 300;
 				for my $t (@{ $res->{data}{list} }) {
 					last if $cap-- <= 0;
 					next unless $t && ref($t) eq 'HASH';
