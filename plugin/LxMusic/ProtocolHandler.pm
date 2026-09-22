@@ -614,6 +614,12 @@ sub _publish_cover {
 						$log->debug('LxMusic: kw cover miss');
 					}
 				},
+				# 0.11.47：SimpleAsyncHTTP->new 是 (成功回调, **错误回调**, 参数)；
+				# 从前少了中间那个 ⇒ 请求失败时在 LMS Select 循环里抛 "Not a CODE reference"
+				sub {
+					my ($http, $error) = @_;
+					$log->warn('LxMusic: kw cover(publish) error: ' . ($error || '?'));
+				},
 				{ timeout => 8 },
 			)->get($picApi);
 		};

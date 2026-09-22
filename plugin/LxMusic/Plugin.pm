@@ -1807,6 +1807,15 @@ sub _streamImage {
 			$log->warn("LxMusic: cover upstream $code ct=$ct url=" . substr($imgUrl, 0, 90));
 			return _respondCoverFail("upstream $code", $client, $params, $callback, $httpClient, $response);
 		},
+		# ⚠️ 0.11.47：SimpleAsyncHTTP->new 的签名是 (成功回调, **错误回调**, 参数)。
+		# 从前这里只传了 (回调, {timeout}) ⇒ hashref 落到 ecb 槽位：timeout 从未生效，
+		# 且**每次封面请求失败**都会在 LMS 的 Select 循环里抛 `Not a CODE reference
+		# at Slim/Networking/SimpleAsyncHTTP.pm line 96`（2026-09-22 设备 crash 前现场）。
+		sub {
+			my ($http, $error) = @_;
+			$log->warn('LxMusic: cover upstream error: ' . ($error || '?') . ' url=' . substr($imgUrl, 0, 90));
+			return _respondCoverFail('upstream error', $client, $params, $callback, $httpClient, $response);
+		},
 		{ timeout => 12 },
 	)->get($imgUrl, @hdr);
 	return;
@@ -1840,6 +1849,12 @@ sub _coverProxy {
 				}
 				$log->debug('LxMusic: kw pic.web miss for ' . $songmid);
 				return _respondCoverFail('no cover', $client, $params, $callback, $httpClient, $response);
+			},
+			# 0.11.47：补错误回调（见上面 SimpleAsyncHTTP 的签名说明）
+			sub {
+				my ($http, $error) = @_;
+				$log->warn('LxMusic: kw pic.web error: ' . ($error || '?'));
+				return _respondCoverFail('kw pic.web error', $client, $params, $callback, $httpClient, $response);
 			},
 			{ timeout => 8 },
 		)->get($api);
@@ -1888,6 +1903,12 @@ sub _coverProxy {
 				}
 				$log->debug("LxMusic: kg get_res_privilege miss for $key");
 				return _respondCoverFail('no cover', $client, $params, $callback, $httpClient, $response);
+			},
+			# 0.11.47：补错误回调（见上面 SimpleAsyncHTTP 的签名说明）
+			sub {
+				my ($http, $error) = @_;
+				$log->warn('LxMusic: kg pic error: ' . ($error || '?'));
+				return _respondCoverFail('kg pic error', $client, $params, $callback, $httpClient, $response);
 			},
 			{ timeout => 8 },
 		)->post($api,
