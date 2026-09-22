@@ -861,20 +861,29 @@ sub _feed_copy {
 	return \%c;
 }
 
+# ⚠️ **缓存键不含 window**（0.11.41）：同一次点击里，LMS 会用 `quantity=1` 把父层重新问一遍
+# （拿单个条目做面包屑解析），而展示那一次是 `quantity=50`。键里带 window 就永远错开 ⇒
+# 实测点一次歌单要多付约 1s 的重复列表请求（日志 `pl-list MISS … win=1`）。
+# 现在按"最大窗口已缓存"存，小窗口命中时就地切片。
 sub _feed_cache_get {
-	my ($k, $ttl) = @_;
+	my ($k, $ttl, $window) = @_;
 	my $e = $FEED_CACHE{$k} or return undef;
 	return undef if (time() - ($e->{at} || 0)) >= $ttl;
-	return _feed_copy($e->{feed});
+	return undef if defined $window && defined $e->{win} && $e->{win} < $window;
+	my $f = _feed_copy($e->{feed});
+	if (defined $window && ref $f->{items} eq 'ARRAY' && @{ $f->{items} } > $window) {
+		$f->{items} = [ @{ $f->{items} }[ 0 .. $window - 1 ] ];
+	}
+	return $f;
 }
 
 sub _feed_cache_put {
-	my ($k, $feed) = @_;
+	my ($k, $feed, $win) = @_;
 	if (scalar(keys %FEED_CACHE) >= $FEED_CACHE_MAX) {
 		my ($old) = sort { ($FEED_CACHE{$a}{at} || 0) <=> ($FEED_CACHE{$b}{at} || 0) } keys %FEED_CACHE;
 		delete $FEED_CACHE{$old} if defined $old;
 	}
-	$FEED_CACHE{$k} = { at => time(), feed => _feed_copy($feed) };
+	$FEED_CACHE{$k} = { at => time(), feed => _feed_copy($feed), win => $win };
 	return;
 }
 
@@ -1020,9 +1029,9 @@ sub sdkPlListHandler {
 	my $window = $args->{quantity} || 50;
 	$window = 50 if $window < 1 || $window > 300;
 
-	my $ckey = join('|', 'pl', $src, $sort, $tag, $index, $window);
+	my $ckey = join('|', 'pl', $src, $sort, $tag, $index);
 	my $t0   = time();
-	if (my $hit = _feed_cache_get($ckey, $PL_LIST_TTL)) {
+	if (my $hit = _feed_cache_get($ckey, $PL_LIST_TTL, $window)) {
 		$log->warn(sprintf('LxMusic pl-list CACHE-HIT src=%s sort=%s tag=%s idx=%d win=%d ms=%d',
 			$src, $sort, $tag, $index, $window, int((time() - $t0) * 1000)));
 		$cb->($hit);
@@ -1100,7 +1109,7 @@ sub sdkPlListHandler {
 				offset => $index,
 				(defined $total ? (total => $total) : ()),
 			};
-			_feed_cache_put($ckey, $feed);
+			_feed_cache_put($ckey, $feed, $window);
 			$log->warn(sprintf('LxMusic pl-list MISS src=%s sort=%s tag=%s idx=%d win=%d rows=%d total=%s ms=%d',
 				$src, $sort, $tag, $index, $window, scalar(@$items), (defined $total ? $total : '?'),
 				int((time() - $t0) * 1000)));
@@ -1126,9 +1135,9 @@ sub sdkSonglistDetailHandler {
 	my $window = $args->{quantity} || 50;
 	$window = 50 if $window < 1 || $window > 300;
 
-	my $ckey = join('|', 'pd', $src, $plid, $index, $window);
+	my $ckey = join('|', 'pd', $src, $plid, $index);
 	my $t0   = time();
-	if (my $hit = _feed_cache_get($ckey, $PL_DETAIL_TTL)) {
+	if (my $hit = _feed_cache_get($ckey, $PL_DETAIL_TTL, $window)) {
 		$log->warn(sprintf('LxMusic pl-detail CACHE-HIT src=%s id=%s idx=%d win=%d ms=%d',
 			$src, $plid, $index, $window, int((time() - $t0) * 1000)));
 		$cb->($hit);
@@ -1213,7 +1222,7 @@ sub sdkSonglistDetailHandler {
 					  type => 'text', label => 'ARTIST' },
 				]),
 			};
-			_feed_cache_put($ckey, $feed);
+			_feed_cache_put($ckey, $feed, $window);
 			$log->warn(sprintf('LxMusic pl-detail MISS src=%s id=%s idx=%d win=%d tracks=%d total=%d ms=%d',
 				$src, $plid, $index, $window, scalar(@$tracks), int($total),
 				int((time() - $t0) * 1000)));
