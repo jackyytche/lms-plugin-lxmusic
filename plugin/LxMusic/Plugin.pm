@@ -909,15 +909,23 @@ sub sdkPlTagsHandler {
 		};
 	};
 
+	# ⚠️ 行名一律用 `_u()` 逐段拼（§5.3.19）：本文件里的中文**字面量是未打旗标的 UTF-8 字节**，
+	# 一旦和 JSON 解出来的旗标串（分组名/标签名，都是字符串）直接 join，字面量会被按 latin-1
+	# 解释 ⇒ 设备上渲染成 `[ç«é¨]`（0.11.37 现场，仅 `热门` 这一处中招，因为其它前缀恰好是 ASCII）。
+	my $mkname = sub {
+		my ($prefix, $name) = @_;
+		return _u('[') . _u($prefix) . _u('] ') . _u($name);
+	};
+
 	my $render = sub {
 		my @items = ($mk->('全部（不分分类）', ''));
 		push @items, map {
-			$mk->(join('', '[', '热门', '] ', ($_->{name} || '')), $_->{id})
+			$mk->($mkname->('热门', $_->{name}), $_->{id})
 		} @{ $c->{tags}{hotTag} || [] };
 		for my $grp (@{ $c->{tags}{tags} || [] }) {
 			my $gname = defined $grp->{name} ? $grp->{name} : '';
 			push @items, map {
-				$mk->(join('', '[', $gname, '] ', ($_->{name} || '')), $_->{id})
+				$mk->($mkname->($gname, $_->{name}), $_->{id})
 			} @{ $grp->{list} || [] };
 		}
 		$cb->({ items => \@items });
