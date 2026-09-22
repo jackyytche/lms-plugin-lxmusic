@@ -259,9 +259,12 @@ sub getSeekData {
 
 # 解析收尾（快慢路径共用）：元数据 + 客户端刷新信号 + 流地址替换
 sub _finish_resolve {
-	my ($class, $song, $url, $info, $direct, $args, $cb, $fmt, $kbps, $secs) = @_;
+	my ($class, $song, $url, $info, $direct, $args, $cb, $fmt, $kbps, $secs, $tier) = @_;
 
-	my $qLabel = $class->qualityLabel($info->{type});
+	# 0.11.52：档位标签一律用**真实拿到的**（$tier 由 _actualTier 从 fmt/码率/位深推出来），
+	# 拿不到才退回"请求的档位"。用户报的问题：pref 选 flac24bit 时，**连 128kbps 的 MP3
+	# 也标成 "FLAC 24bit"**——因为旧代码直接拿 `$info->{type}`（请求值）当标签。
+	my $qLabel = $class->qualityLabel(defined $tier && length $tier ? $tier : $info->{type});
 
 	# ⚠️ ct 必须用"我们嗅到的真实格式"来定，不能用档位标签猜：QQ/网易 CDN 的 .flac
 	# 直链会声明 Content-Type: audio/x-ogg，LMS 扫描时把这个错误类型写进轨道缓存，
@@ -302,7 +305,10 @@ sub _finish_resolve {
 
 		return \%m;
 	};
+	$log->debug('LxMusic: bc/finish-1 metadata');
 	$publish->();
+
+	$log->debug('LxMusic: bc/finish-2 cache');
 
 	$class->cache_metadata($url, { title => $info->{name}, quality => $qLabel, format => $fmt });
 
@@ -313,18 +319,28 @@ sub _finish_resolve {
 	}
 
 	# 封面：队列/正在播放也要有图（tx/wy/mg 直取，kg 推导，kw 异步 getPic）
+	$log->debug('LxMusic: bc/finish-3 contentType done, cover next');
 	eval { $class->_publish_cover($url, $info->{src}, $info->{music}) };
+	$log->debug('LxMusic: bc/finish-4 cover done');
 
 	# 晚到元数据：轮询客户端靠 playlist_timestamp 变化才会重取富 status（喜马拉雅 0.1.48/49 实证）
-	if (blessed($song) && $song->can('master')) {
-		if (my $pc = $song->master()) {
-			$pc->currentPlaylistUpdateTime(time())
-				if blessed($pc) && $pc->can('currentPlaylistUpdateTime');
-			Slim::Control::Request::notifyFromArray($pc, [ 'playlist', 'newmetadata' ]);
+	# ⚠️⚠️ 0.11.50 排查开关：2026-09-22 夜把 LMS 搞崩的最小复现是"1 行 lxm:// 队列 + 播放"
+	#   （本地库单曲播放稳、源直链直接入队播放也稳 ⇒ 凶手在我们的 lxm:// 播放链路里）。
+	#   这一行是本插件在播放路径上**唯一主动发通知**的地方 ⇒ 单独做成开关做 A/B：
+	#   `pref_notifyNewmetadata = 0` 关掉它。默认 1（保持 0.11.x 行为）。
+	if (!defined $prefs->get('notifyNewmetadata') || $prefs->get('notifyNewmetadata')) {
+		if (blessed($song) && $song->can('master')) {
+			if (my $pc = $song->master()) {
+				$pc->currentPlaylistUpdateTime(time())
+					if blessed($pc) && $pc->can('currentPlaylistUpdateTime');
+				$log->debug('LxMusic: bc/finish-5 notify newmetadata');
+				Slim::Control::Request::notifyFromArray($pc, [ 'playlist', 'newmetadata' ]);
+			}
 		}
 	}
-
+	$log->debug('LxMusic: bc/finish-5b streamUrl');
 	$song->streamUrl($direct) if blessed($song) && $song->can('streamUrl');
+	$log->debug('LxMusic: bc/finish-6 done');
 	if ($log->is_info) {
 		$log->info('LxMusic: resolved ' . substr($url, 0, 40) . ' -> ' . substr($direct, 0, 80));
 	}
@@ -864,24 +880,31 @@ sub _resolve_fresh {
 			}
 
 			my $direct = $res->{url};
-			$log->info(sprintf('LxMusic: resolved via [%s] type=%s verified=%s%s fmt=%s',
-				$res->{source} // '?', $res->{quality} // '?', $res->{verified} ? 1 : 0,
+			# 0.11.52：**真实档位**（不是请求的档位）——由格式/码率/位深反推，进 %METADATA 的
+			# `quality`，于是 getMetadataFor / 补发 / 正在播放 全都显示真实值。
+			my $tier = $class->_actualTier($res->{format}, $res->{actualKbps}, $res->{bits});
+			$log->info(sprintf('LxMusic: resolved via [%s] type=%s%s verified=%s%s fmt=%s%s',
+				$res->{source} // '?', $tier // $res->{quality} // '?',
+				(defined $tier && defined $res->{quality} && $tier ne $res->{quality}
+					? "(requested $res->{quality})" : ''),
+				$res->{verified} ? 1 : 0,
 				(defined $res->{actualKbps} ? " ~$res->{actualKbps}kbps" : ''),
-				$res->{format} // '<undef>'));
+				$res->{format} // '<undef>',
+				(($res->{bits} || 0) ? " bits=$res->{bits}" : '')));
 			_cache_put($url, $direct, $res->{format}, $res->{actualKbps}, $res->{secs}, $res->{length});
 
 			# 实际档位/码率如实进队列元数据（PC 端拿不到这个信息，我们靠 HEAD 反推）
 			$class->cache_metadata($url, {
 				title     => $info->{name},
 				source    => $res->{source},
-				quality   => $res->{quality},
+				quality   => $tier // $res->{quality},
 				kbps      => $res->{actualKbps},
 				format    => $res->{format},
 			});
 
 			# 直链是实际流地址；playlist 里保持稳定的 lxm:// URL
 			$class->_finish_resolve($song, $url, $info, $direct, $args, $cb,
-				$res->{format}, $res->{actualKbps}, $res->{secs});
+				$res->{format}, $res->{actualKbps}, $res->{secs}, $tier);
 			return;
 		},
 	);
@@ -908,6 +931,7 @@ sub new {
 	}
 
 	my $self = eval { $class->SUPER::new($args) };
+	$log->debug('LxMusic: bc/new-super ' . ($self ? 'ok' : 'FAILED'));
 	if (!$self) {
 		# 0.11.26：**开流失败就踢掉解析缓存**。现场（0.11.25 验收）：
 		#   Can't open socket to [m704.music.126.net:80]: 110: Connection timed out → stream failed to open
@@ -1112,6 +1136,29 @@ sub qualityLabel {
 	return 'FLAC 24bit'   if ($type || '') eq 'flac24bit';
 	return 'Hi-Res'       if ($type || '') eq 'hires';
 	return uc($type // '');
+}
+
+# 0.11.52：**从真实交付物反推档位**（而不是拿请求值当结果）。
+#   · flc + 位深>16 → flac24bit；位深<=16 或未知 → flac
+#   · mp3 → 按实测码率分 320k / 128k（>=300 记 320k，其余记 128k）
+#   · m4a/aac → 'aac'（qualityLabel 会渲染成 AAC）
+#   · 其它格式原样大写交给 qualityLabel
+# 为什么值得做：pref 选 flac24bit 时，源只能给 128kbps MP3 的情况很常见（音质降级链），
+# 旧代码会把标签写成 "FLAC 24bit"，用户看到的就是"档位与码率自相矛盾"。
+sub _actualTier {
+	my ($class, $fmt, $kbps, $bits) = @_;
+	my $f = lc($fmt // '');
+	return undef unless length $f;
+
+	# flc：位深读到了就信它；**读不到**（探测没取到实体）时用码率兜底——
+	# 16bit/44.1k FLAC ≈ 900~1100kbps（mg 实测 934），24bit 通常 ≥1400kbps（念心 tx 实测 1709）。
+	return (($bits || 0) > 16 ? 'flac24bit'
+		: (($bits || 0) ? 'flac' : (($kbps && $kbps >= 1400) ? 'flac24bit' : 'flac'))) if $f eq 'flc';
+	if ($f eq 'mp3') {
+		return ($kbps && $kbps >= 300) ? '320k' : '128k';
+	}
+	return 'aac' if $f eq 'm4a' || $f eq 'aac' || $f eq 'mp4';
+	return $f eq 'ogg' ? 'OGG' : uc($f);
 }
 
 1;

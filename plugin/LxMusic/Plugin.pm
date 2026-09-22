@@ -710,11 +710,21 @@ sub _coverOf {
 		my $direct = 'https://imge.kugou.com/stdmusic/240/' . $t->{albumId} . '.jpg';
 		return $proxy ? _coverProxyUrl($direct) : $direct;
 	}
-	if ($src eq 'mg' && ($t->{img} || '') =~ m{^https?://}) {
-		# mg 直连本来就可用（用户实测：走代理前有图）——保持直取，不中转
-		my $img = $t->{img};
-		$img =~ s/\.webp$/.jpg/i;
-		return _u($img);
+	if ($src eq 'mg') {
+		# mg 直连本来就可用（用户实测：走代理前有图）——保持直取，不中转。
+		# ⚠️ 0.11.52：mg 的 `img` **两种形态都有**，必须都认：
+		#   · 榜单/搜索（musicSearch.js 已归一）→ `https://d.musicapp.migu.cn/…`
+		#   · **歌单详情**（songlistdetail）→ **相对路径** `/data/oss/resource/…webp`
+		#     （本地实测 mg 歌单 id=233274165 的 50 首全是相对路径）
+		# 旧代码只认 `^https?://` ⇒ **mg 歌单的曲目全部无封面**（用户报的第 2 个问题）。
+		# 相对路径补上 mg 官方图片域即可；`.webp`→`.jpg` 的改写保平安（实测同一路径
+		# .webp=104KB image/webp、.jpg=214KB image/jpeg，两者都 200，LMS 图片代理更爱 jpeg）。
+		my $img = $t->{img} || '';
+		$img = 'https://d.musicapp.migu.cn' . $img if $img =~ m{^/};
+		if ($img =~ m{^https?://}) {
+			$img =~ s/\.webp$/.jpg/i;
+			return _u($img);
+		}
 	}
 	if ($src eq 'kw' && ($t->{songmid} || '') =~ /^\d+$/) {
 		# 代理内解析 pic.web 再取图；关掉代理则无图可给（pic.web 返回的是文本 URL）

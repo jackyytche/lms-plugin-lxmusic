@@ -599,6 +599,15 @@ async function main(std, os) {
 		else if (bytes.length > 11 && String.fromCharCode.apply(null, bytes.slice(4, 8)) === 'ftyp') magic = 'm4a';
 		else if (bytes.length > 1 && bytes[0] === 0xff && (bytes[1] & 0xe0) === 0xe0) magic = 'mp3';
 		else if (bytes.length > 3 && bytes[0] === 0x1a && bytes[1] === 0x45 && bytes[2] === 0xdf && bytes[3] === 0xa3) magic = 'mkv';
+		// 0.11.52：FLAC 的 **位深**（STREAMINFO 里的 bits-per-sample）——用来把"档位标签"
+		// 从"请求的档位"改成"真实拿到的档位"（用户报：明明 128kbps 也显示 24bit FLAC）。
+		// 布局：'fLaC'(4) + 元数据块头(4) + STREAMINFO：min/max blocksize(4) min/max framesize(6)
+		// ⇒ 第 12/13 字节起是 20bit 采样率 + 3bit 声道 + 5bit (位深-1)。
+		let bits = 0;
+		if (magic === 'flac' && bytes.length > 21) {
+			bits = (((bytes[20] & 0x01) << 4) | ((bytes[21] & 0xf0) >> 4)) + 1;
+			if (bits < 4 || bits > 32) bits = 0;      // 不可信就丢掉
+		}
 		const head = bytes.slice(0, 32).map(c => (c >= 32 && c < 127) ? String.fromCharCode(c) : '.').join('');
 		const looksHtml = /^\s*(<!doctype|<html|<\?xml|\{|\[)/i.test(head);
 		// 总长度优先取 Content-Range 里的总量（`bytes 0-2047/34600000`）：范围响应的
@@ -645,6 +654,7 @@ async function main(std, os) {
 			acceptRanges: hdr('accept-ranges'),
 			bytes: bytes.length,
 			magic,
+			bits,
 			head: head,
 			url_effective: eff,
 		};

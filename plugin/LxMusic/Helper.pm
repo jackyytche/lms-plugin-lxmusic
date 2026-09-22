@@ -202,6 +202,8 @@ sub probeUrl {
 				method => $d->{method},
 				magic  => $magic,
 				bytes  => $d->{bytes},
+				# 0.11.52：FLAC 位深（探测时从 STREAMINFO 读出来的）——用于"真实档位"标签
+				bits   => ($d->{bits} || 0),
 				# 0.11.51：重定向链的**最终 URL**（无跳转时为空串）——上层用它替代原直链，
 				# 免得把一条会 302 的聚合中转链交给 LMS 的开流路径（现场会挂死，见 shim 注释）。
 				effective => ($d->{url_effective} && $d->{url_effective} ne $url)
@@ -258,7 +260,7 @@ sub resolveTrack {
 
 	# 交付一个候选（写 tries + 回调）；$friendly 标记是否播放器友好
 	my $finish = sub {
-		my ($src, $q, $url, $tm, $friendly, $verified, $kbps, $magic, $len) = @_;
+		my ($src, $q, $url, $tm, $friendly, $verified, $kbps, $magic, $len, $bits) = @_;
 		return if $done;                 # 并行窗口下只交付一次
 		$done = 1;
 		my $suspect = ($kbps && $kbps < 64) ? 1 : 0;
@@ -291,6 +293,7 @@ sub resolveTrack {
 			length     => $len,          # 探测到的文件总字节数（拖动算偏移用）
 			suspect    => $suspect,
 			magic      => $magic,
+			bits       => $bits,          # 0.11.52：FLAC 位深（真实档位标签用）
 			format     => $fmt,
 			friendly   => $friendly,
 			tries      => \@tries,
@@ -321,7 +324,7 @@ sub resolveTrack {
 					$log->warn("LxMusic resolve: following redirect -> "
 						. ($deliver =~ m{^https?://([^/]+)} ? $1 : $deliver));
 				}
-				return $finish->($src, $q, $deliver, $tm, $friendly, 1, $kbps, $pi->{magic}, $pi->{length});
+				return $finish->($src, $q, $deliver, $tm, $friendly, 1, $kbps, $pi->{magic}, $pi->{length}, $pi->{bits});
 			}
 			push @tries, { source => $src->{name}, quality => $q, why => 'verify: ' . ($pi->{error} // '?'), %$tm };
 			$log->warn("LxMusic resolve: verify rejected [" . $src->{name} . "] $q: " . ($pi->{error} // '?'));
