@@ -677,7 +677,7 @@ async function main(std, os) {
 	//   boards    payload = { source }                       -> getBoards()
 	//   boardlist payload = { source, bangid|id, page? }     -> getList(bangid, page)
 	//     注：kg/tx/wy/mg 的 getList 吃 bangid；kw 榜单上游 wbd 签名已失效（搜索不受影响）
-	const SDK_ACTIONS = { search: 1, boards: 1, boardlist: 1, songlist: 1, songlistdetail: 1, songlistbytag: 1 };
+	const SDK_ACTIONS = { search: 1, boards: 1, boardlist: 1, songlist: 1, songlistdetail: 1, songlistbytag: 1, songlistsorts: 1, songlisttags: 1 };
 	if (SDK_ACTIONS[action]) {
 		let payload = {};
 		try { payload = JSON.parse(infoJson || '{}') || {} } catch (e) {}
@@ -863,15 +863,36 @@ async function main(std, os) {
 				const groups = (await Promise.all(tasks)).filter(g => g);
 				return groups;
 			}
+			if (action === 'songlistsorts') {
+				// 该平台的排序 tab（PC 端 SortTab 的数据源）：songList.sortList 是客户端硬编码的静态数组
+				const src = payload.source || payload.src;
+				const sl = sdk[src] && sdk[src].songList;
+				if (!sl) throw new Error('songlistsorts: no songList for source ' + src);
+				const sorts = (sl.sortList || []).map(s => ({ id: String(s.id), name: String(s.name || s.id) }));
+				return { source: src, sorts };
+			}
+			if (action === 'songlisttags') {
+				// 该平台的分类标签（PC 端 TagList 的数据源）：getTags() 运行时打平台 API
+				// 返回形状各平台一致：{ tags: [{name, list:[{id,name}]}], hotTag: [{id,name}] }
+				// ⚠️ id 形状不同源不同（kw "<id>-<digest>" / kg,tx,mg 数字 / **wy 是中文分类名**），原样透传
+				const src = payload.source || payload.src;
+				const sl = sdk[src] && sdk[src].songList;
+				if (!sl || !sl.getTags) throw new Error('songlisttags: no getTags for source ' + src);
+				const t = (await sl.getTags()) || {};
+				const normGroup = g => ({
+					name: String((g && g.name) || ''),
+					list: (((g && g.list) || []).map(i => ({ id: String(i.id), name: String(i.name || '') }))),
+				});
+				const hot = (((t.hotTag) || []).map(i => ({ id: String(i.id), name: String(i.name || '') })));
+				return { source: src, tags: ((t.tags) || []).map(normGroup), hotTag: hot };
+			}
 			if (action === 'songlistbytag') {
-				// 歌单分类列表（推荐/最热/最新）：sortId 用各平台自己 sortList 的 id
-				//   kw: ''=推荐 / hot / new      kg: '5'=推荐 / '6'=最热 / '7'=最新
-				//   tx: 5=最热 / 2=最新          wy: hot        mg: '15127315'=推荐
-				// （wy/mg 上游把"最新"注释掉了，所以只有 kw/kg/tx 提供最新）
+				// 某平台某排序某分类的歌单列表：sortId 取自该平台 sortList，tagId 取自 getTags()
+				// （''=全部）。0.11.36 起 sortId/tagId 都由调用方显式给，不再有插件自造的档位映射。
 				const src = payload.source || payload.src;
 				const sl = sdk[src] && sdk[src].songList;
 				if (!sl || !sl.getList) throw new Error('songlistbytag: no songList for source ' + src);
-				const sortId = payload.sortId != null ? payload.sortId : 'hot';
+				const sortId = payload.sortId != null ? payload.sortId : '';
 				const tagId = payload.tagId != null ? payload.tagId : '';
 				return await sl.getList(sortId, tagId, Number(payload.page) || 1);
 			}

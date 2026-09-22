@@ -154,24 +154,15 @@ sub handleFeed {
 				passthrough => [ 'boards', $_ ],
 			} } grep { _boardEnabled($_) } qw(kw kg tx wy mg)
 		),
-		# 歌单发现（M0.8）：推荐 / 最热 / 最新 —— 档位内再按平台下钻，最后进歌单详情
+		# 歌单（0.11.36 起与 PC 端分类对齐）：平台 → 排序 tab（各平台自己的 sortList）→
+		# 分类标签（getTags 动态）→ 歌单列表 → 曲目。
+		# ⚠️ 旧的「推荐/最热/最新歌单」三个入口已由这条取代（它们是插件自己发明的档位，
+		# 而 PC 端根本没有这三个顶层项；三个档位对应的 sortId 现在都在各平台的排序 tab 里）。
 		{
-			name        => _u('推荐歌单'),
+			name        => _u('歌单'),
 			type        => 'link',
-			url         => \&sdkPlSortHandler,
-			passthrough => [ 'plsort', 'rec' ],
-		},
-		{
-			name        => _u('最热歌单'),
-			type        => 'link',
-			url         => \&sdkPlSortHandler,
-			passthrough => [ 'plsort', 'hot' ],
-		},
-		{
-			name        => _u('最新歌单'),
-			type        => 'link',
-			url         => \&sdkPlSortHandler,
-			passthrough => [ 'plsort', 'new' ],
+			url         => \&sdkPlPlatformsHandler,
+			passthrough => ['plplat'],
 		},
 		{
 			name        => 'Play test (enter song id)',
@@ -825,47 +816,148 @@ sub _plItems {
 	return \@items;
 }
 
-# 歌单档位 -> 支持的平台（id 取自各平台 vendored songList.sortList：
-#   kw ''/hot/new、kg '5'/'6'/'7'、tx 5/2、wy hot、mg '15127315'；wy/mg 的"最新"上游已注释掉）
-my %PL_SORTS = (
-	rec => { label => '推荐歌单', srcs => [ [ 'kw', '' ], [ 'kg', '5' ], [ 'mg', '15127315' ] ] },
-	hot => { label => '最热歌单', srcs => [ [ 'kw', 'hot' ], [ 'kg', '6' ], [ 'tx', 5 ], [ 'wy', 'hot' ] ] },
-	new => { label => '最新歌单', srcs => [ [ 'kw', 'new' ], [ 'kg', '7' ], [ 'tx', 2 ] ] },
-);
+# ---------- 歌单：平台 → 排序 tab → 分类标签 → 列表（0.11.36，与 PC 端对齐） ----------
+#
+# PC 落雪的歌单页 = 「平台选择器 × 排序 tab × 分类标签下拉」三个并列控件：
+#   · **排序 tab**  = 各平台内置 SDK 的 `songList.sortList`（客户端硬编码，
+#                     `refs/lx-music-desktop/src/renderer/utils/musicSdk/<平台>/songList.js`）
+#   · **分类标签**  = `songList.getTags()` 运行时从平台 API 拉（热门标签 + 分组标签：语种/风格/场景…）
+#   · **请求**      = `getList(sortId, tagId, page)`
+# tagId 的形状各平台不同（shim 里原样透传，别做归一化）：
+#   kw = `"<id>-<digest>"`（sdk 内部 `split('-')`）、kg/tx/mg = 数字串、**wy = 中文分类名本身**。
+# 我们的菜单没有"选择器"，只能把这三个维度摊成三层下钻（PC 的 tab 文案/顺序取自 sortList 原文）。
+my @PL_PLATFORMS = qw(kw kg tx wy mg);
 
-# 档位入口（推荐/最热/最新）→ 选平台
-sub sdkPlSortHandler {
-	my ($client, $cb, $args, $mode, $sort) = @_;
-	$sort ||= 'hot';
-	my $def = $PL_SORTS{$sort} or do {
-		$cb->({ items => [ { name => _u('未知歌单档位'), type => 'text' } ] });
-		return;
-	};
-	my @items = map {
-		my ($src, $sid) = @$_;
-		{
-			name        => _u($def->{label}) . _u(' · ') . _u($src),
-			type        => 'link',
-			url         => \&sdkPlListHandler,
-			passthrough => [ 'pllist', $src, $sort ],
-		}
-	} @{ $def->{srcs} };
+my %PL_META;                # src => { sorts_at, sorts => [...], tags_at, tags => {tags,hotTag} }
+my $PL_SORTS_TTL = 86400;   # sortList 是静态数组（客户端硬编码），缓存一天足够
+my $PL_TAGS_TTL  = 21600;   # 分类标签来自平台 API（会变、且慢），缓存 6 小时
+
+sub _pl_meta {
+	my ($src) = @_;
+	$PL_META{$src} ||= {};
+	return $PL_META{$src};
+}
+
+# 平台层
+sub sdkPlPlatformsHandler {
+	my ($client, $cb, $args, $mode) = @_;
+	my @items = map { {
+		name        => _u('歌单 · ') . _u($_),
+		type        => 'link',
+		url         => \&sdkPlSortsHandler,
+		passthrough => [ 'plsort', $_ ],
+	} } @PL_PLATFORMS;
 	$cb->({ items => \@items });
 	return;
 }
 
-# 某平台某档位的歌单列表（支持 XMLBrowser 的 index/quantity 分页）
-sub sdkPlListHandler {
+# 排序 tab 层：条目完全来自该平台 sortList（不再有插件自造的"推荐/最热/最新"档位映射）
+sub sdkPlSortsHandler {
+	my ($client, $cb, $args, $mode, $src) = @_;
+	$src ||= 'kw';
+	my $c = _pl_meta($src);
+
+	my $render = sub {
+		my @items = map { {
+			name        => _u($_->{name}),
+			type        => 'link',
+			url         => \&sdkPlTagsHandler,
+			passthrough => [ 'pltag', $src, $_->{id} ],
+		} } @{ $c->{sorts} || [] };
+		$cb->({ items => @items ? \@items : [ { name => _u('该平台没有可用的排序'), type => 'text' } ] });
+	};
+
+	if ($c->{sorts} && @{ $c->{sorts} } && (time() - ($c->{sorts_at} || 0)) < $PL_SORTS_TTL) {
+		$render->();
+		return;
+	}
+
+	Plugins::LxMusic::Helper->request(
+		action  => 'songlistsorts',
+		info    => { source => $src },
+		timeout => 30,
+		cb      => sub {
+			my ($res) = @_;
+			if ($res->{ok} && $res->{data} && ref $res->{data}{sorts} eq 'ARRAY' && @{ $res->{data}{sorts} }) {
+				$c->{sorts}    = $res->{data}{sorts};
+				$c->{sorts_at} = time();
+				$render->();
+			}
+			else {
+				$cb->({ items => [ { name => _u('排序获取失败: ') . _u($res->{error} || 'unknown'), type => 'text' } ] });
+			}
+		},
+	);
+	return;
+}
+
+# 分类标签层：第一行「全部（不分分类）」，其后是热门标签 + 各分组（行名带 `[分组]` 前缀，
+# 摊平一层——菜单没法像 PC 那样在同一个下拉里画分组标题）。
+sub sdkPlTagsHandler {
 	my ($client, $cb, $args, $mode, $src, $sort) = @_;
 	$src  ||= 'kw';
-	$sort ||= 'hot';
+	$sort = '' unless defined $sort;
+	my $c = _pl_meta($src);
 
-	my $def = $PL_SORTS{$sort} or do {
-		$cb->({ items => [ { name => _u('未知歌单档位'), type => 'text' } ] });
-		return;
+	my $mk = sub {
+		my ($label, $tag) = @_;
+		return {
+			name        => _u($label),
+			type        => 'link',
+			url         => \&sdkPlListHandler,
+			passthrough => [ 'pllist', $src, $sort, $tag ],
+		};
 	};
-	my ($sid) = map { $_->[1] } grep { $_->[0] eq $src } @{ $def->{srcs} };
-	$sid = '' unless defined $sid;
+
+	my $render = sub {
+		my @items = ($mk->('全部（不分分类）', ''));
+		push @items, map {
+			$mk->(join('', '[', '热门', '] ', ($_->{name} || '')), $_->{id})
+		} @{ $c->{tags}{hotTag} || [] };
+		for my $grp (@{ $c->{tags}{tags} || [] }) {
+			my $gname = defined $grp->{name} ? $grp->{name} : '';
+			push @items, map {
+				$mk->(join('', '[', $gname, '] ', ($_->{name} || '')), $_->{id})
+			} @{ $grp->{list} || [] };
+		}
+		$cb->({ items => \@items });
+	};
+
+	if ($c->{tags} && (time() - ($c->{tags_at} || 0)) < $PL_TAGS_TTL) {
+		$render->();
+		return;
+	}
+
+	Plugins::LxMusic::Helper->request(
+		action  => 'songlisttags',
+		info    => { source => $src },
+		timeout => 30,
+		cb      => sub {
+			my ($res) = @_;
+			if ($res->{ok} && $res->{data} && ref $res->{data}{tags} eq 'ARRAY') {
+				$c->{tags}    = { tags => $res->{data}{tags}, hotTag => ($res->{data}{hotTag} || []) };
+				$c->{tags_at} = time();
+				$render->();
+			}
+			else {
+				# 标签拿不到也不能把这条路堵死：至少给一行"全部"
+				$c->{tags} = { tags => [], hotTag => [] };
+				$render->();
+			}
+		},
+	);
+	return;
+}
+
+# 某平台 + 某排序 + 某分类下的歌单列表（支持 XMLBrowser 的 index/quantity 分页）
+# 0.11.36：sortId 来自该平台自己的 sortList，tagId 来自 getTags()（''=全部），不再查 %PL_SORTS
+sub sdkPlListHandler {
+	my ($client, $cb, $args, $mode, $src, $sort, $tag) = @_;
+	$src  ||= 'kw';
+	$src  = 'kw' unless grep { $_ eq $src } @PL_PLATFORMS;
+	$sort = '' unless defined $sort;
+	$tag  = '' unless defined $tag;
+	$tag  = '' if ref $tag;   # 防御：passthrough 被 LMS 解析成数组时（同 0.7.38 的坑）
 
 	my $index  = $args->{index} || 0;
 	my $window = $args->{quantity} || 50;
@@ -884,7 +976,7 @@ sub sdkPlListHandler {
 	$fetch = sub {
 	Plugins::LxMusic::Helper->request(
 		action  => 'songlistbytag',
-		info    => { source => $src, sortId => $sid, tagId => '', page => $page },
+		info    => { source => $src, sortId => $sort, tagId => $tag, page => $page },
 		timeout => 30,
 		cb      => sub {
 			my ($res) = @_;
