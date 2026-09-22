@@ -887,6 +887,33 @@ sub _feed_cache_put {
 	return;
 }
 
+# 覆盖式命中（0.11.42）：LMS 解析父层面包屑时用的是**被点的那一行的绝对下标**
+# （`index=N, quantity=1`），而展示那一层缓存的是 `index=0, quantity=50` ⇒ 只有第 1 行能命中。
+# 这里允许"已缓存的窗口覆盖住目标下标"就切片返回：列表看过一次之后，点任意一行都不再打上游。
+sub _feed_cache_cover {
+	my ($kind, $a, $b, $index, $window, $ttl) = @_;
+	my $prefix = join('|', $kind, $a, $b, '');
+	for my $k (keys %FEED_CACHE) {
+		next unless index($k, $prefix) == 0;
+		my ($start) = $k =~ m{\|(\d+)$};
+		next unless defined $start;
+		my $e = $FEED_CACHE{$k} or next;
+		next if (time() - ($e->{at} || 0)) >= $ttl;
+		my $win = $e->{win} || 0;
+		next unless $start <= $index && ($index + $window) <= ($start + $win);
+		next unless ref $e->{feed}{items} eq 'ARRAY';
+		my $off   = $index - $start;
+		my $avail = scalar(@{ $e->{feed}{items} }) - $off;
+		next if $avail <= 0;
+		my $take = $window < $avail ? $window : $avail;
+		my $f = _feed_copy($e->{feed});
+		$f->{items}  = [ @{ $f->{items} }[ $off .. $off + $take - 1 ] ];
+		$f->{offset} = $index;
+		return $f;
+	}
+	return undef;
+}
+
 # 平台层
 sub sdkPlPlatformsHandler {
 	my ($client, $cb, $args, $mode) = @_;
@@ -1037,6 +1064,12 @@ sub sdkPlListHandler {
 		$cb->($hit);
 		return;
 	}
+	if (my $hit = _feed_cache_cover('pl', $src, join('|', $sort, $tag), $index, $window, $PL_LIST_TTL)) {
+		$log->warn(sprintf('LxMusic pl-list CACHE-COVER src=%s sort=%s tag=%s idx=%d win=%d ms=%d',
+			$src, $sort, $tag, $index, $window, int((time() - $t0) * 1000)));
+		$cb->($hit);
+		return;
+	}
 
 	# 上游页宽各源不同（vendored limit_list：kw 36 / kg 20 / tx 36 / wy 30；mg 未定），
 	# 先按 30 猜，拿到首响应的 limit 再重算重取一次（同榜单 0.11.5 与歌单详情 0.11.13 的教训）。
@@ -1139,6 +1172,13 @@ sub sdkSonglistDetailHandler {
 	my $t0   = time();
 	if (my $hit = _feed_cache_get($ckey, $PL_DETAIL_TTL, $window)) {
 		$log->warn(sprintf('LxMusic pl-detail CACHE-HIT src=%s id=%s idx=%d win=%d ms=%d',
+			$src, $plid, $index, $window, int((time() - $t0) * 1000)));
+		$cb->($hit);
+		return;
+	}
+	# 覆盖式命中：看过一次整页后，**点这一页里的任意一首**（LMS 用 index=N, quantity=1 再取一次）不再打上游
+	if (my $hit = _feed_cache_cover('pd', $src, $plid, $index, $window, $PL_DETAIL_TTL)) {
+		$log->warn(sprintf('LxMusic pl-detail CACHE-COVER src=%s id=%s idx=%d win=%d ms=%d',
 			$src, $plid, $index, $window, int((time() - $t0) * 1000)));
 		$cb->($hit);
 		return;
