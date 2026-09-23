@@ -176,6 +176,8 @@ my %RESOLVE_CACHE;      # url => { direct => 'http...', fmt => 'mp3'|'flc'|..., 
 # 0.11.31：`%METADATA` 的声明上移到文件顶部（`republish_known_queued` 在 528 行就要用它，
 # 词法变量必须先声明；原来它声明在 882 行的「元数据」段里，导致编译期报 "requires explicit package name"）
 my %METADATA;
+# 0.11.58：渲染期预热的在飞计数（全局只允许 1 个，见 `warmTracks` 的说明）
+my $WARM_INFLIGHT = 0;
 # 0.11.49：`%REPUBLISHED`（补发的**内容指纹**）也上移到顶部——`republish_queued_rows`（483 行）
 # 与 `republish_known_queued`（585 行）都要用它。指纹语义：url => 上次真的写进 LMS 的内容签名；
 # 签名相同 ⇒ 一个字节都不写（写就会换来一条新的 playlist 通知，那是自激回路的原料）。
@@ -421,11 +423,19 @@ sub _finish_resolve {
 # 现在"下一首"的准备完全交给 LMS lookahead；我们只保留**渲染期预热**（`warmTracks`）。
 
 # 渲染期预热（0.5.2）：列表渲染完就后台解析前 N 首，用户点哪首都是缓存命中（秒开）。
-# 受 Helper 并发闸（max 2）保护，不会打满设备；已在缓存里的跳过。
+# ⚠️ 0.11.58：**预热被严格限流**。现场实测（0.11.57，纯浏览 15 页 soak，一次都没点播）：
+#   设置页诊断恒温显示「可播校验 在跑 22 个请求 / 全豆要 在跑 22 个请求」——因为每渲染一页
+#   歌单/榜单就预热 3 首，而每首又按「档位 × 全部已启用源」派候选（含 verify 探测）。
+#   这些 job 全排进**串行** worker，用户真正点歌时排在它们后面 ⇒ "解析慢、越用越卡"。
+#   现在：① 全局同一时刻只允许 1 个预热在飞；② 预热请求标记为 bg，设备一忙就被 Helper
+#   直接丢弃（不排队）；③ 默认只预热 1 首（`warmMax` 可调，`warmEnable=0` 彻底关）。
 sub warmTracks {
 	my ($class, $urls, $max) = @_;
-	$max ||= 3;
+	return 0 if defined $prefs->get('warmEnable') && !$prefs->get('warmEnable');
+	$max = $prefs->get('warmMax') if !$max && defined $prefs->get('warmMax');
+	$max ||= 1;
 	return 0 unless $urls && ref($urls) eq 'ARRAY';
+	return 0 if $WARM_INFLIGHT;         # ① 全局只允许 1 个预热在飞
 
 	my $n = 0;
 	for my $u (@$urls) {
@@ -438,20 +448,23 @@ sub warmTracks {
 		my $info = eval { $class->parseUrl($u) } or next;
 
 		$n++;
+		$WARM_INFLIGHT++;
 		$log->info('LxMusic: warm ' . $n . ' (' . ($info->{name} || '') . ')');
 		Plugins::LxMusic::Helper->resolveTrack(
-			music   => $info->{music},
-			src     => $info->{src},
-			type    => $info->{type},
-			timeout => 20,
+			music    => $info->{music},
+			src      => $info->{src},
+			type     => $info->{type},
+			timeout  => 20,
+			priority => 'bg',           # ② 设备忙 ⇒ Helper 直接丢弃，不排队
 			# 0.11.25：预热同样带校验（见 _prefetch_next 的注释）——预热本来就是后台行为，
 			# 校验失败的候选由阶梯跳过，落进缓存的就是"探针验过"的链。
 			verify  => 1,
 			cb      => sub {
 				my ($res) = @_;
+				$WARM_INFLIGHT-- if $WARM_INFLIGHT > 0;
 				if ($res->{ok} && $res->{url}) {
 					_cache_put($u, $res->{url}, $res->{format}, $res->{actualKbps},
-						$res->{secs}, $res->{length});
+						$res->{secs}, $res->{length}, $res->{bits});
 					$log->info('LxMusic: warm ok (' . ($info->{name} || '') . ') via ['
 						. ($res->{source} // '?') . '] verified');
 				}
@@ -882,7 +895,13 @@ sub _resolve_fresh {
 		# 0.11.54：20s 太紧——mg（玉宁熙）要串行打 3 次上游、实测单曲 20~40s，
 		# 一到点就判超时 ⇒ 整张歌单几乎全无声（用户报的就是这个）。给到 35s，
 		# 慢源另有 Helper 侧的"改走 fork"保护（见 Helper::request 的 %WORKER_BAD）。
-		timeout => 35,
+		# ⚠️ 0.11.58：**播放路径不能死等 35s**。LMS 自己约 4~8s 就放弃这次取链，用户看到的是
+		# "点了半天没声"，而设备还在空转（这是"解析慢"的体感来源）。改为
+		#   ① 单候选超时 14s（够快源 + 一次中转链跟跳）；
+		#   ② 整体预算 `resolveBudget`（默认 10s）：到点就明确失败并放人，候选转后台跑完缓存。
+		timeout  => 14,
+		budget   => (defined $prefs->get('resolveBudget') ? $prefs->get('resolveBudget') : 10),
+		priority => 'user',
 		cb      => sub {
 			my ($res) = @_;
 
@@ -907,7 +926,7 @@ sub _resolve_fresh {
 				(defined $res->{actualKbps} ? " ~$res->{actualKbps}kbps" : ''),
 				$res->{format} // '<undef>',
 				(($res->{bits} || 0) ? " bits=$res->{bits}" : '')));
-			_cache_put($url, $direct, $res->{format}, $res->{actualKbps}, $res->{secs}, $res->{length});
+			_cache_put($url, $direct, $res->{format}, $res->{actualKbps}, $res->{secs}, $res->{length}, $res->{bits});
 
 			# 实际档位/码率如实进队列元数据（PC 端拿不到这个信息，我们靠 HEAD 反推）
 			$class->cache_metadata($url, {
@@ -1152,6 +1171,8 @@ sub qualityLabel {
 	# "FLAC 24BIT" 那种大写乱码。
 	return $type if $type =~ /\s/;
 	return 'MP3 128kbps'  if $type eq '128k';
+	return 'MP3 192kbps'  if $type eq '192k';
+	return 'MP3 256kbps'  if $type eq '256k';
 	return 'MP3 320kbps'  if $type eq '320k';
 	return 'FLAC'         if $type eq 'flac';
 	return 'FLAC 24bit'   if $type eq 'flac24bit';
@@ -1177,7 +1198,12 @@ sub _actualTier {
 	return (($bits || 0) > 16 ? 'flac24bit'
 		: (($bits || 0) ? 'flac' : (($kbps && $kbps >= 1400) ? 'flac24bit' : 'flac'))) if $f eq 'flc';
 	if ($f eq 'mp3') {
-		return ($kbps && $kbps >= 300) ? '320k' : '128k';
+		# 0.11.58：**按实测码率就近取标**，不再把 192/256kbps 压成"128k"（用户报的 A0 类错法之一：
+		# 设备日志里出现过 ~192kbps 却显示 "MP3 128kbps"，与 LMS 自己读到的码率自相矛盾）。
+		return '320k' if $kbps && $kbps >= 300;
+		return '256k' if $kbps && $kbps >= 224;
+		return '192k' if $kbps && $kbps >= 160;
+		return '128k';
 	}
 	return 'aac' if $f eq 'm4a' || $f eq 'aac' || $f eq 'mp4';
 	return $f eq 'ogg' ? 'OGG' : uc($f);

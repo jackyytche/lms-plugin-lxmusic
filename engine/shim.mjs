@@ -130,6 +130,20 @@ async function main(std, os) {
 		}
 		if (name === EVENT_NAMES.inited) {
 			__inited = true;
+			// 0.11.58：**把源的能力表带出去**（PC 端 `preload.js:146-167` 正是用它生成 userApi.apis /
+			// qualityList 并做请求裁剪）。从前只置 __inited=true、data 直接丢弃 ⇒ 宿主只能按
+			// 「所有已启用源 × 所有档位」盲打：慢源上每次取链都白跑好几轮，还会把上游错误
+			// 放大成超时/熔断（用户报的"解析慢"、worker 雪崩的结构性原因）。
+			try {
+				const d = (data && typeof data === 'object') ? data : {};
+				__caps = {
+					status: String(d.status || 'success'),
+					sources: (d.sources && typeof d.sources === 'object') ? d.sources : {},
+				};
+				print('CAPS ' + JSON.stringify(__caps));
+			} catch (e) {
+				print('LOG caps capture failed: ' + String((e && e.message) || e));
+			}
 			return Promise.resolve();
 		}
 		return Promise.reject(new Error('The event is not supported: ' + name));
@@ -346,6 +360,9 @@ async function main(std, os) {
 	const __timers = [];
 	let __timerSeq = 1;
 	let __inited = false;
+	// 0.11.58：源在 `lx.send('inited', {sources:{…}})` 里声明的能力表（平台 → 可用档位）。
+	// `send()` 里采集、以一行 `CAPS {json}` 打给宿主；serve 模式的 READY 行也带上它。
+	let __caps = null;
 	globalThis.setTimeout = function (fn, ms) {
 		const args = Array.prototype.slice.call(arguments, 2);
 		__timers.push({ fn, args });
@@ -1216,7 +1233,8 @@ async function main(std, os) {
 	// stdout 一行 = READY {...} | RESULT <id> {json} | LOG ...
 	if (action === 'serve') {
 		const info0 = globalThis.lx.currentScriptInfo || {};
-		print('READY ' + JSON.stringify({ name: info0.name || '', version: info0.version || '' }));
+		// 0.11.58：READY 带上源声明的能力表（此时 `drainUntilInited()` 已跑完 ⇒ __caps 就绪）
+		print('READY ' + JSON.stringify({ name: info0.name || '', version: info0.version || '', caps: __caps }));
 		std.out.flush();
 		for (;;) {
 			const line = std.in.getline();

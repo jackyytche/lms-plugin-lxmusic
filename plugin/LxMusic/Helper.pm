@@ -68,6 +68,15 @@ my %SRC_FAIL;      # key => 连续失败次数
 my %SRC_BAD;       # key => 熔断时间
 my $SRC_BAD_N   = 2;
 my $SRC_BAD_TTL = 600;
+
+# 0.11.58：**源能力表**（源文件路径 => { 平台 => { name, qualitys=>{...}, actions=>{...} } }）。
+# 权威来源：源自己在 `lx.send('inited', {sources:{kw:{qualitys:[...]}}})` 里声明（PC 端
+# `preload.js:146-167` 就靠它生成 userApi.apis/qualityList 并裁剪请求）。我们从前把它丢掉
+# ⇒ 只能"所有源 × 所有档位"盲打：慢源上每次取链白跑若干轮，还把上游错误放大成超时/熔断。
+# 采集口：shim 的 `CAPS {json}` 行（fork 与 worker 两条路径都打）与 worker 的 `READY {...caps}`。
+my %CAPS;          # path => { plat => { name => '', qualitys => { q => 1 }, actions => { a => 1 } } }
+my %CAPS_AT;       # path => 采集时间
+
 my $WID = 0; # worker 请求自增 id（源内唯一即可）
 my $PROBE_KEY = '__probe';   # 探测专用 worker（argv[1]='-'，shim 不加载任何订阅源）
 
@@ -194,11 +203,12 @@ sub lmsFormat {
 
 # 直链可播性探测（走 shim 的 probe：curl -I，不允许 HEAD 时退 Range 0-0）
 sub probeUrl {
-	my ($class, $url, $cb) = @_;
+	my ($class, $url, $cb, $prio) = @_;
 	$class->request(
-		action  => 'probe',
-		info    => { url => $url, timeout => 8 },
-		timeout => 15,
+		action   => 'probe',
+		info     => { url => $url, timeout => 8 },
+		timeout  => 15,
+		priority => $prio,
 		cb      => sub {
 			my ($res) = @_;
 			my $d    = (ref($res->{data}) eq 'HASH') ? $res->{data} : {};
@@ -272,6 +282,51 @@ sub _breaker_state {
 	return +{ fail => { %SRC_FAIL }, bad => { %SRC_BAD }, n => $SRC_BAD_N, ttl => $SRC_BAD_TTL };
 }
 
+# ---------- 0.11.58：源能力表 ----------
+# 记下某个源文件声明的能力（同一路径重复声明则覆盖：源热更新后能力表跟着更新）
+sub _caps_note {
+	my ($class, $path, $caps) = @_;
+	return 0 unless $path && ref($caps) eq 'HASH';
+	my $src = $caps->{sources};
+	return 0 unless ref($src) eq 'HASH' && %$src;
+	my %m;
+	for my $plat (keys %$src) {
+		my $d = $src->{$plat};
+		next unless ref($d) eq 'HASH';
+		my %q = map { ($_ => 1) } grep { defined && length } @{
+			(ref($d->{qualitys}) eq 'ARRAY') ? $d->{qualitys} : [] };
+		my %ac = map { ($_ => 1) } grep { defined && length } @{
+			(ref($d->{actions}) eq 'ARRAY') ? $d->{actions} : [] };
+		$m{lc $plat} = { name => ($d->{name} // ''), qualitys => \%q, actions => \%ac };
+	}
+	return 0 unless %m;
+	$CAPS{$path}    = \%m;
+	$CAPS_AT{$path} = time();
+	$log->warn('LxMusic caps: [' . ($path =~ m{([^/]+)$} ? $1 : $path) . '] declares '
+		. join(', ', map { $_ . '(' . join('/', sort keys %{ $m{$_}{qualitys} }) . ')' } sort keys %m));
+	return 1;
+}
+
+# 该源**是否声明支持**某平台：1=支持 / 0=不支持 / undef=未知（未知按老行为放行，绝不误杀）
+sub _caps_platform {
+	my ($class, $path, $plat) = @_;
+	my $c = $CAPS{$path} or return undef;
+	$plat = lc($plat // '');
+	return $c->{$plat} ? 1 : 0;
+}
+
+# 该源在该平台声明的档位集合（undef = 未知）
+sub _caps_qualitys {
+	my ($class, $path, $plat) = @_;
+	my $c = $CAPS{$path} or return undef;
+	my $d = $c->{lc($plat // '')} or return undef;
+	my $q = $d->{qualitys} or return undef;
+	return %$q ? $q : undef;
+}
+
+sub caps_state { return { map { $_ => [ sort keys %{ $CAPS{$_} } ] } keys %CAPS } }
+sub _caps_reset { %CAPS = (); %CAPS_AT = (); return 1 }
+
 # 多源解析：resolveTrack(music=>{}, src=>'kw', type=>'320k', cb=>sub{...})
 # cb 收到 { ok, url, source, quality, verified, actualKbps, tries=>[{source,quality,why|ok}] }
 sub resolveTrack {
@@ -293,15 +348,51 @@ sub resolveTrack {
 	my @ladder = $class->qualityLadder($a{type}, $track, $a{declaredQualitys});
 	# 外层音质、内层源：优先保音质，同档位再依次换源（PC 只换源不降档，我们两者都做）
 	my $plat = $a{src} || ($track->{source}) || '';
+	my $prio = (defined $a{priority} && $a{priority} eq 'bg') ? 'bg' : 'user';
 	my @cand;
 	my @tripped;
-	for my $q (@ladder) {
-		for my $s (@$sources) {
-			my $k = _src_key($s, $plat, $q);
-			if (_src_tripped($k)) { push @tripped, ($s->{name} // '?') . "\@$q"; next; }
-			push @cand, [ $q, $s ];
+	my @nocap;      # 被能力表裁掉的源（只报一次，便于现场判断"是源不支持这个平台"）
+	my @noqual;     # 被能力表裁掉的 (源, 档位)
+	my $build = sub {
+		my ($useCaps) = @_;
+		my (@c, @t);
+		for my $q (@ladder) {
+			for my $s (@$sources) {
+				my $k = _src_key($s, $plat, $q);
+				if (_src_tripped($k)) { push @t, ($s->{name} // '?') . "\@$q"; next; }
+				if ($useCaps) {
+					my $path = Plugins::LxMusic::Sources->pathFor($s->{id});
+					if (defined $path) {
+						my $sup = $class->_caps_platform($path, $plat);
+						if (defined $sup && !$sup) { push @nocap, ($s->{name} // '?'); next; }
+						my $qs = $class->_caps_qualitys($path, $plat);
+						if ($qs && !$qs->{$q}) { push @noqual, ($s->{name} // '?') . "\@$q"; next; }
+					}
+				}
+				push @c, [ $q, $s ];
+			}
 		}
+		return (\@c, \@t);
+	};
+	# 0.11.58：**先按源声明的能力表裁剪**（PC 端 preload 的做法）。若裁剪后一个候选都不剩
+	# （源没声明该平台 / 声明与实际不符 / 完全没有能力表），退回不做能力裁剪的旧行为——
+	# 「宁可慢，也不能因为一张表点了没声」。
+	my ($c1, $t1) = $build->(1);
+	if (@$c1 || !(@nocap || @noqual)) {
+		@cand = @$c1; @tripped = @$t1;
 	}
+	else {
+		my ($c2, $t2) = $build->(0);
+		@cand = @$c2; @tripped = @$t2;
+		$log->warn('LxMusic resolve: capability table would leave no candidate for '
+			. ($plat || '?') . ' -> ignoring it (nocap=' . join(',', @nocap)
+			. ' noqual=' . join(',', @noqual) . ')');
+	}
+	$log->info('LxMusic resolve: candidates=' . scalar(@cand) . ' (ladder=' . join('/', @ladder)
+		. ' platform=' . ($plat || '?') . ')'
+		. (@nocap ? ' caps-pruned-platform=' . join(',', @nocap) : '')
+		. (@noqual ? ' caps-pruned-tier=' . join(',', @noqual) : ''));
+
 	# 0.11.57：**全被熔断时不许静音**——清掉这个平台的所有熔断（宁可慢，也不能"点了没声"）
 	if (!@cand && @tripped) {
 		for my $q (@ladder) {
@@ -407,9 +498,25 @@ sub resolveTrack {
 			$log->warn("LxMusic resolve: verify rejected [" . $src->{name} . "] $q: " . ($pi->{error} // '?'));
 			_src_failed(_src_key($src, $plat, $q), ($src->{name} // '?') . "\@$q");   # 0.11.57 熔断计数
 			$settle->();
-		});
+		}, $prio);
 		return;
 	};
+
+	# 0.11.58：**整体预算**（秒，0 = 不限）。LMS 的播放路径等不了——它大约 4~8s 就放弃这次取链，
+	# 而 0.11.54 把 worker 超时放大到 35s ⇒ 用户看到"点了半天没声"，设备却还在为一次注定失败的
+	# 取链空转（这正是"解析慢 + 越用越卡"的体感来源）。超预算就**明确失败**并把结论交给调用方，
+	# 在飞的候选留给后台跑完（下次点同一首就是缓存命中）。
+	my $budget = $a{budget} || 0;
+	if ($budget > 0) {
+		my $owner = {};
+		Slim::Utils::Timers::setTimer($owner, time() + $budget, sub {
+			return if $done;
+			$done = 1;
+			my $why = "resolve budget ${budget}s exceeded";
+			$log->warn("LxMusic resolve: $why (queued=" . scalar(@cand) . " inflight=$inflight)");
+			eval { $cb->({ ok => 0, timeout => 1, error => $why, tries => \@tries }); };
+		});
+	}
 
 	# 派发器：窗口未满就继续启动候选；某个候选结算（成功/失败/挂起/校验被拒）时补位。
 	# 候选耗尽且没有"在飞"的之后，才走"兜底中转链 → 全失败"的收尾。
@@ -446,6 +553,7 @@ sub resolveTrack {
 				sourceId => ($a{src} // ''),
 				info     => { musicInfo => $track, type => $q },
 				timeout  => ($a{timeout} || 20),
+				priority => $prio,
 				cb       => sub {
 					my ($res) = @_;
 					my $el = Time::HiRes::time() - $t0;
@@ -625,6 +733,17 @@ sub request {
 	my $timeout = $args{timeout} || 20;
 	$timeout = 60 if $timeout > 60;          # lx 宿主 20s 硬超时同量级，上限 60
 
+	# 0.11.58：**请求分级**。'user' = 用户动作（点播/取链/校验，必须做完）；'bg' = 后台行为
+	# （渲染期预热等）。bg 在"设备已经忙"时**直接丢弃**而不排队：
+	# 现场实测（0.11.57，纯浏览 15 页 soak）恒温在 diagno 里看到"可播校验 在跑 22 个请求 /
+	# 全豆要 在跑 22 个请求"——浏览一页就预热 3 首 × 多源 × 全档位，全排进串行 worker，
+	# 用户真正点歌时排在这些无用功后面 ⇒ 越用越卡、最后像"插件失去响应"。
+	my $prio = defined $args{priority} && $args{priority} eq 'bg' ? 'bg' : 'user';
+	if ($prio eq 'bg' && $class->_load_busy) {
+		$log->info('LxMusic Helper: background request dropped (device busy): ' . ($action // '?'));
+		return $cb->(_err('background request skipped: device busy'));
+	}
+
 	# 常驻 worker 路径（M0.10）：
 	#  · 「订阅源取链」(musicUrl) 与「可播校验」(probe)：固定开销最大。
 	#  · 0.11.43 起 **sdk 动作也常驻**（source=$SDK，shim 侧 argv[1] 认 sdk.bundle.js 当 worker）：
@@ -648,15 +767,17 @@ sub request {
 				info     => $args{info},
 				cb       => $cb,
 				timeout  => $timeout,
+				priority => $prio,
 			);
 		}
 		elsif ($action eq 'probe') {
 			return if $class->_worker_submit(
-				probe   => 1,
-				action  => $action,
-				info    => $args{info},
-				cb      => $cb,
-				timeout => $timeout,
+				probe    => 1,
+				action   => $action,
+				info     => $args{info},
+				cb       => $cb,
+				timeout  => $timeout,
+				priority => $prio,
 			);
 		}
 		elsif ($SDK_WORKER_ACTIONS{$action} && $source eq $SDK) {
@@ -667,13 +788,19 @@ sub request {
 				info     => $args{info},
 				cb       => $cb,
 				timeout  => $timeout,
+				priority => $prio,
 			);
 		}
 	}
 
 	# 并发闸（M0.3）：整单 m3u 入队时 LMS 会并发解析几十个 lxm://，全 fork 会打满设备 CPU
 	# 并拖垮上游（0.4.0 现场：全部 'timeout: no RESULT line'）。排队串行放行，max 2 并发。
+	# 0.11.58：后台请求**不排队**（排队 = 用户点歌时前面还压着一串预热）——直接丢弃。
 	if (scalar(keys %JOBS) >= _maxChildren()) {
+		if ($prio eq 'bg') {
+			$log->info('LxMusic Helper: background request dropped at the gate: ' . ($action // '?'));
+			return $cb->(_err('background request skipped: gate full'));
+		}
 		push @WAITQ, sub { __PACKAGE__->request(%args) };
 		$log->debug('LxMusic Helper: request queued (' . scalar(@WAITQ) . ' waiting)');
 		return;
@@ -719,6 +846,7 @@ sub request {
 		started => time(),
 		timeout => $timeout,
 		done    => 0,
+		src     => $source,     # 0.11.58：CAPS 行要按"哪个源"归档
 	};
 	$JOBS{$pid} = $job;
 
@@ -876,6 +1004,9 @@ sub _worker_fail_all {
 	# 正在飞的兄弟候选一起判失败**——现场就是 `lx-玉宁熙-Pro@320k: worker stopped` 雪崩
 	# （mg 一张歌单几乎全无声）。fork 路径每单一进程、超时只杀自己，正适合接手。
 	my $retry = ($why =~ s/^retry://) ? 1 : 0;
+	# 0.11.58：要重试就先标死——否则同步重入 `request()` 时会**复用这个正在死的 worker**
+	# （`_worker_submit` 判的是 `!$w->{dead} && kill(0,pid)`），新 job 又被塞进一个即将被 kill 的进程。
+	$w->{dead} = 1 if $retry;
 	for my $id (keys %{ $w->{jobs} }) {
 		my $job = delete $w->{jobs}{$id};
 		if ($retry && !$job->{forked}) {
@@ -892,7 +1023,8 @@ sub _worker_fail_all {
 			);
 			next;
 		}
-		$job->{cb}->({ ok => 0, data => undef, error => $why, logs => $job->{logs}, alerts => [], why => 'worker' });
+		# 0.11.58：回调包 eval（同 `_worker_poll` 的理由：回调抛异常会打断调用链/状态收尾）
+		eval { $job->{cb}->({ ok => 0, data => undef, error => $why, logs => $job->{logs}, alerts => [], why => 'worker' }); };
 	}
 	@{ $w->{queue} } = ();
 	return;
@@ -905,8 +1037,15 @@ sub _worker_kill {
 	$class->_worker_fail_all($w, $why || 'worker stopped');
 	kill 'KILL', $w->{pid} if $w->{pid};
 	waitpid($w->{pid}, POSIX::WNOHANG()) if $w->{pid};
-	close $w->{rd}; close $w->{wr};
-	delete $WORKER{ $w->{key} };
+	close $w->{rd} if $w->{rd};
+	close $w->{wr} if $w->{wr};
+	# ⚠️ 0.11.58：**只删自己那一格**。`_worker_fail_all` 的 retry 分支会**同步重入 `request()`**，
+	# 而旧 worker 此刻还没标死（非超时路径）⇒ 那里可能已经 spawn 出一个**新** worker 放进
+	# `$WORKER{同一个 key}`。旧代码无条件 `delete $WORKER{$w->{key}}` 会把**新 worker 的登记**删掉：
+	# 新进程成了孤儿（不在 %WORKER 里 ⇒ 诊断看不到、`_worker_submit` 下次又 spawn 一个），
+	# 同一个源上叠出两个 qjs + 两套管道，越用越多。
+	delete $WORKER{ $w->{key} } if $WORKER{ $w->{key} } == $w;
+	$w->{dead} = 1;
 	return;
 }
 
@@ -941,10 +1080,20 @@ sub _worker_poll {
 			$w->{ready} = 1;
 			$w->{info} = $1;
 			$log->warn("LxMusic worker($src): READY $1 (warm)");
+			# 0.11.58：READY 里带源声明的能力表 ⇒ 立即可用（无需再等一次 CAPS 行）
+			my $info = eval { $JSON->decode($1) };
+			Plugins::LxMusic::Helper->_caps_note($w->{key}, $info->{caps})
+				if ref($info) eq 'HASH' && $info->{caps};
 			while (defined(my $qid = shift @{ $w->{queue} })) {
 				my $qjob = $w->{jobs}{$qid} or next;
 				last unless Plugins::LxMusic::Helper->_worker_send_job($w, $qjob);
 			}
+			next;
+		}
+		# 0.11.58：源在 inited 时声明的能力表（fork 与 worker 两条路径都会打这一行）
+		if ($line =~ /^CAPS (.*)$/s) {
+			my $c = eval { $JSON->decode($1) };
+			Plugins::LxMusic::Helper->_caps_note($w->{key}, $c) if ref($c) eq 'HASH';
 			next;
 		}
 		if ($line =~ /^RESULT (\d+) (.*)$/s) {
@@ -964,11 +1113,16 @@ sub _worker_poll {
 			else { $err = 'bad worker RESULT json' }
 			$log->warn(sprintf('LxMusic worker(%s): job %s done ok=%d%s', $src, $id, $ok ? 1 : 0,
 				(defined $dec->{ms} ? " ms=$dec->{ms}" : '')));
-			$job->{cb}->({
+			# ⚠️ 0.11.58：**回调必须包 eval**。LMS 的 `Slim::Utils::Timers` 在
+			# `eval { $subptr->(...) }` 里调用我们（Timers.pm:266），异常会被它吞掉——
+			# 而我们的重排定时器在本函数**末尾**：回调一抛异常，这个 worker 就再也不会被
+			# poll（进程活着、jobs 挂着、回调永不来）= "插件失去响应但 LMS 正常"。
+			eval { $job->{cb}->({
 				ok => $ok ? 1 : 0, data => $data, error => $err,
 				logs => [ @{ $w->{recent} }, @{ $job->{logs} || [] } ], alerts => [], why => 'worker',
 				ms => $dec->{ms},
-			});
+			}); };
+			$log->warn("LxMusic worker($src): job $id callback threw: $@") if $@;
 			next;
 		}
 		if ($line =~ /^LOG (.*)$/s) {
@@ -996,8 +1150,8 @@ sub _worker_poll {
 			my @logs = @{ $w->{recent} };
 			$w->{dead} = 1;      # 0.11.54：先标死，重试的请求才会去起新 worker / 走 fork
 			Plugins::LxMusic::Helper->_worker_kill($w, 'retry:worker timed out');
-			$cb->({ ok => 0, data => undef, error => 'timeout: worker request exceeded ' . ($job->{timeout} || '?') . 's',
-				logs => \@logs, alerts => [], why => 'timeout' });
+			eval { $cb->({ ok => 0, data => undef, error => 'timeout: worker request exceeded ' . ($job->{timeout} || '?') . 's',
+				logs => \@logs, alerts => [], why => 'timeout' }); };
 			return;
 		}
 	}
@@ -1020,6 +1174,17 @@ sub _worker_poll {
 	return;
 }
 
+# 0.11.58：设备是否已经"忙"（后台请求据此自我放弃，而不是排到用户前面）
+sub _load_busy {
+	my ($class) = @_;
+	return 1 if scalar(keys %JOBS) >= _maxChildren();
+	for my $k (keys %WORKER) {
+		my $w = $WORKER{$k} or next;
+		return 1 if $w->{jobs} && scalar(keys %{ $w->{jobs} }) >= 4;
+	}
+	return 0;
+}
+
 # 把一个请求交给常驻 worker；返回 1 = 已接管，0 = 调用方应退回 fork 路径
 sub _worker_submit {
 	my ($class, %a) = @_;
@@ -1028,6 +1193,15 @@ sub _worker_submit {
 	my $w = $WORKER{$key};
 	$w = $class->_worker_spawn($key, $arg1) unless $w && !$w->{dead} && kill(0, $w->{pid});
 	return 0 unless $w;
+
+	# 0.11.58：**后台（预热）请求绝不跟用户抢同一个串行 worker**——worker 里已经有活就直接放弃。
+	# 这一条是"点歌慢/越用越卡"的关键闸门：从前浏览一页就塞进 3~9 个预热取链+校验 job，
+	# 用户真正点歌时它们全排在前面（现场 diag 恒温 "在跑 22 个请求"）。
+	if ((($a{priority} // 'user') eq 'bg') && $w->{jobs} && scalar(keys %{ $w->{jobs} }) >= 1) {
+		$log->info('LxMusic worker: background job dropped (worker busy)');
+		$a{cb}->(_err('background request skipped: worker busy'));
+		return 1;   # 已接管（错误已回复），不要退回 fork
+	}
 
 	# 背压：worker 是串行的，堆积过多就让调用方退回 fork 路径（那边有并发闸）
 	return 0 if scalar(keys %{ $w->{jobs} }) >= 24;
@@ -1082,6 +1256,12 @@ sub _finish {
 	}
 	unlink($job->{out});
 
+	# 0.11.58：fork 路径也要归档源能力表（shim 在 inited 时会打一行 `CAPS {json}`）
+	if ($job->{src} && $buf =~ /^CAPS (.*)$/m) {
+		my $c = eval { $JSON->decode($1) };
+		__PACKAGE__->_caps_note($job->{src}, $c) if ref($c) eq 'HASH';
+	}
+
 	# 注意：_parse 是类方法（单测以 Helper->_parse 调用）——这里必须同样以类方法
 	# 调用；裸 _parse($buf) 会让 $class 吃掉 $buf、$text=undef，RESULT 永远解析失败。
 	my ($ok, $data, $err, $logs, $alerts) = __PACKAGE__->_parse($buf);
@@ -1107,14 +1287,17 @@ sub _finish {
 			push @$logs, '(empty - child produced no output at all)';
 		}
 	}
-	$job->{cb}->({
+	# 0.11.58：回调包 eval，且**无论回调是否抛异常都要放行并发闸**——否则 `@WAITQ` 里排队的
+	# 请求会永远等不到放行（表现为"整插件不再响应新请求"）。
+	eval { $job->{cb}->({
 		ok     => $ok ? 1 : 0,
 		data   => $data,
 		error  => $err,
 		logs   => $logs,
 		alerts => $alerts,
 		why    => $why,
-	});
+	}); };
+	$log->warn("LxMusic Helper: job $job->{pid} callback threw: $@") if $@;
 
 	# 并发闸放行：m3u 整单入队会瞬间排起几十个解析，串行小并发保护设备 CPU 与上游
 	while (@WAITQ && scalar(keys %JOBS) < _maxChildren()) {

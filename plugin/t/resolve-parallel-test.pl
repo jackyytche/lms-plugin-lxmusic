@@ -54,7 +54,8 @@ my %cb;
 	*Plugins::LxMusic::Helper::request = sub {
 		my ($class, %a) = @_;
 		my ($id) = grep { $path{$_} eq $a{source} } keys %path;
-		push @launched, { id => $id, path => $a{source}, info => $a{info} };
+		push @launched, { id => $id, path => $a{source}, info => $a{info},
+			priority => $a{priority}, budget => $a{budget} };
 		$cb{$id} = $a{cb};
 		return 1;
 	};
@@ -77,9 +78,25 @@ sub new_run {
 	# 0.11.57：每个场景先清"死源熔断"，否则前两个场景的失败会把某些
 	# (源×平台×档位) 三元组闸掉，后面的场景根本不会再派候选（这正是熔断的设计行为）。
 	Plugins::LxMusic::Helper::_breaker_reset();
+	Slim::Utils::Timers::resetForTest();
 	my @got;
 	Plugins::LxMusic::Helper->resolveTrack(
 		music => $track, src => 'wy', type => 'flac',
+		cb    => sub { push @got, $_[0] },
+	);
+	return \@got;
+}
+
+# 0.11.58：带整体预算的场景（定时器桩需要 fireDue 才会触发）
+sub new_run_budget {
+	my ($secs) = @_;
+	@launched = ();
+	%cb = ();
+	Plugins::LxMusic::Helper::_breaker_reset();
+	Slim::Utils::Timers::resetForTest();
+	my @got;
+	Plugins::LxMusic::Helper->resolveTrack(
+		music => $track, src => 'wy', type => 'flac', budget => $secs,
 		cb    => sub { push @got, $_[0] },
 	);
 	return \@got;
@@ -124,6 +141,72 @@ sub new_run {
 	check('deferred: 两个候选都先被标记为暂缓', @def == 2, 'deferred_tries=' . scalar(@def));
 	check('deferred: 交付的是中转链（兜底路径）',
 		@$got && $got->[0]{ok} && $got->[0]{url} =~ m{relay\.example});
+}
+
+# ---------- 4. 能力表裁剪（0.11.58）：源声明不支持该平台 ⇒ 完全不为它生成候选 ----------
+{
+	# B 源只声明支持 kw；本场景请求平台 wy ⇒ 只有 A 源该被派出
+	Plugins::LxMusic::Helper::_caps_reset();
+	Plugins::LxMusic::Helper->_caps_note($path{B},
+		{ status => 'success', sources => { kw => { name => 'kw', qualitys => ['128k', '320k'] } } });
+	my $got = new_run();
+	check('caps: 未声明该平台的源不再生成候选（只派 A）',
+		@launched == 1 && $launched[0]{id} eq 'A', 'launched=' . join(',', map { $_->{id} } @launched));
+	$cb{A}->({ ok => 0, error => 'x', why => 'worker' });
+	check('caps: 失败路径仍然只回调一次', @$got == 1);
+
+	# 声明支持的平台照旧派发
+	Plugins::LxMusic::Helper::_caps_reset();
+	Plugins::LxMusic::Helper->_caps_note($path{B},
+		{ status => 'success', sources => { wy => { name => 'wy', qualitys => ['flac'] } } });
+	my $got2 = new_run();
+	check('caps: 声明支持的平台照旧参与', scalar(@launched) == 2,
+		'launched=' . scalar(@launched));
+
+	# 档位裁剪：B 在 wy 上只声明 128k/320k，而请求 flac ⇒ B 不出现在 flac 档
+	Plugins::LxMusic::Helper::_caps_reset();
+	Plugins::LxMusic::Helper->_caps_note($path{B},
+		{ status => 'success', sources => { wy => { name => 'wy', qualitys => ['128k', '320k'] } } });
+	my $got3 = new_run();
+	my @src_of_launch = map { $_->{id} } @launched;
+	check('caps: 档位不支持时该源被裁掉', !grep { $_ eq 'B' } @src_of_launch,
+		'launched=' . join(',', @src_of_launch));
+
+	Plugins::LxMusic::Helper::_caps_reset();
+}
+
+# ---------- 5. 整体预算（0.11.58）：超预算必须明确失败，不再让调用方无限等 ----------
+{
+	my $got = new_run_budget(1);     # 1 秒预算，且两个候选都不回调
+	check('budget: 预算内没有候选返回 ⇒ 尚未回调', @$got == 0);
+	sleep 2;
+	Slim::Utils::Timers::fireDue();
+	check('budget: 超预算只回调一次', @$got == 1);
+	check('budget: 回调标了 timeout 且 ok=0', @$got && !$got->[0]{ok} && $got->[0]{timeout});
+	check('budget: 错误信息说明是预算超时', @$got && $got->[0]{error} =~ /budget/,
+		@$got ? $got->[0]{error} : '');
+}
+
+# ---------- 6. 请求分级（0.11.58）：后台（预热）优先级要一路传到候选请求上 ----------
+{
+	@launched = ();
+	%cb = ();
+	Plugins::LxMusic::Helper::_breaker_reset();
+	my @got;
+	Plugins::LxMusic::Helper->resolveTrack(
+		music => $track, src => 'wy', type => 'flac', priority => 'bg',
+		cb    => sub { push @got, $_[0] },
+	);
+	my @prios = map { $_->{priority} } @launched;
+	# ⚠️ grep 是列表操作符，会把它后面的一切都吃掉（包括 detail 参数）——所以先算进变量
+	my $all_bg = @prios ? (grep { ($_ // '') ne 'bg' } @prios) == 0 : 0;
+	check('bg: 预热的 bg 优先级传到了候选请求', @prios == 2 && $all_bg,
+		'prios=' . join(',', map { $_ // 'undef' } @prios));
+	check('bg: 设备空闲时 _load_busy 为假（不会误丢后台请求）',
+		!Plugins::LxMusic::Helper::_load_busy());
+	$cb{A}->({ ok => 0, error => 'x', why => 'worker' });
+	$cb{B}->({ ok => 0, error => 'y', why => 'worker' });
+	check('bg: 照常收尾（只回调一次）', @got == 1);
 }
 
 print $failed ? "\n$failed FAILED\n" : "\nALL PASS\n";

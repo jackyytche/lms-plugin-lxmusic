@@ -686,8 +686,9 @@ sub _trackItems {
 		});
 	}
 
-	# 渲染期预热前几首（点哪首都是缓存命中）——异步，不阻塞页面
-	Plugins::LxMusic::ProtocolHandler->warmTracks([ map { $_->{url} } @items ], 3) if @items;
+	# 渲染期预热**只热 1 首**（0.11.58）：预热是后台行为，Helper 侧标 bg、设备一忙就丢弃。
+	# 从前热 3 首 × 多源 × 全档位，纯浏览就能把串行 worker 堆到 22 个在跑请求（实测）。
+	Plugins::LxMusic::ProtocolHandler->warmTracks([ map { $_->{url} } @items ], 1) if @items;
 	return \@items;
 }
 
