@@ -268,6 +268,15 @@ sub new_run_budget {
 	check('thumb: kg 没有尺寸变体 -> 原样', $H->coverThumb($kg, 300) eq $kg, $H->coverThumb($kg, 300));
 	check('thumb: mg 没有尺寸变体 -> 原样', $H->coverThumb($mg, 300) eq $mg, $H->coverThumb($mg, 300));
 	check('thumb: size=0 关闭改写 -> 原样', $H->coverThumb($wy, 0) eq $wy, $H->coverThumb($wy, 0));
+	# 0.11.62：大图档（队列/正在播放）用 500，且与列表档互不影响
+	check('thumb(big): 显式 500 -> param=500y500',
+		$H->coverThumb($wy, 500) eq $wy . '?param=500y500', $H->coverThumb($wy, 500));
+	check('thumb(big): kind=big 走 coverThumbBig（默认 500）',
+		$H->coverThumb($wy, undef, 'big') eq $wy . '?param=500y500',
+		$H->coverThumb($wy, undef, 'big'));
+	check('thumb: 列表档仍是 300（未被大图档带偏）',
+		$H->coverThumb($tx, undef) eq 'https://y.gtimg.cn/music/photo_new/T002R300x300M000002iWKlh2DcjFL.jpg',
+		$H->coverThumb($tx, undef));
 	check('thumb: 未知域 -> 原样',
 		$H->coverThumb('https://example.com/a.jpg', 300) eq 'https://example.com/a.jpg');
 }

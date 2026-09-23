@@ -492,14 +492,16 @@ sub _coverFromMusic {
 		if (defined $v && $v ne '' && $v =~ m{^https?://}) {
 			$v =~ s/\.webp$/.jpg/i;   # mg 的 webp 换成同路径 .jpg（实测 200/159KB jpeg）
 			# 0.11.61：队列行/正在播放也走缩略（wy 原图 4.81MB/张，50 行就是 240MB）
-			return Plugins::LxMusic::Helper->coverThumb($v);
+			# 0.11.62：这里用**大图档**（`coverThumbBig`，默认 500）——"正在播放"面板会请求
+			# 300~500px，用 300 的源会发虚；wy 的 500 档实测 621KB，仍比原图小 7.7 倍。
+			return Plugins::LxMusic::Helper->coverThumb($v, undef, 'big');
 		}
 	}
 	if (($src || '') eq 'kg' && ($m->{albumId} || '') =~ /^\d+$/) {
 		return 'https://imge.kugou.com/stdmusic/240/' . $m->{albumId} . '.jpg';
 	}
 	if (($src || '') eq 'tx' && ($m->{albumMid} || '') =~ /^[A-Za-z0-9]+$/) {
-		my $s = Plugins::LxMusic::Helper->coverThumbSize() || 500;
+		my $s = Plugins::LxMusic::Helper->coverThumbSize(undef, 'big') || 500;
 		return 'https://y.gtimg.cn/music/photo_new/T002R' . $s . 'x' . $s
 			. 'M000' . $m->{albumMid} . '.jpg';
 	}

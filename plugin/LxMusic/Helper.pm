@@ -214,17 +214,21 @@ sub lmsFormat {
 #   · kg `imge.kugou.com/stdmusic/{120,150,240,500}/<id>.jpg` 四个尺寸**同一份字节**
 #   · mg 加 `?size=/?w=/?param=/?width=` 全部 403，路径段变体 404
 sub coverThumbSize {
-	my ($size) = @_;
-	my $v = defined $size ? $size : $prefs->get('coverThumb');
-	$v = 300 unless defined $v;
+	my ($size, $kind) = @_;
+	# 0.11.62：**分级尺寸**。列表行只要 54~150px，而"正在播放"面板会请求 300~500px；
+	# 用 300 的源去撑 500 的框会发虚（用户会立刻看出来），所以队列/正在播放用
+	# `coverThumbBig`（默认 500，仍比 wy 的 4.8MB 原图小 7.7 倍）。
+	my $pref = ($kind && $kind eq 'big') ? 'coverThumbBig' : 'coverThumb';
+	my $v = defined $size ? $size : $prefs->get($pref);
+	$v = ($pref eq 'coverThumbBig') ? 500 : 300 unless defined $v;
 	return 0 if !$v || $v < 0;
 	return 500 if $v > 500;
 	return int($v);
 }
 
 sub coverThumb {
-	my ($class, $url, $size) = @_;
-	$size = coverThumbSize($size);
+	my ($class, $url, $size, $kind) = @_;
+	$size = coverThumbSize($size, $kind);
 	return $url unless defined $url && length $url;
 	return $url unless $size;
 

@@ -87,6 +87,8 @@ sub initPlugin {
 		# 实测：wy 原图 4.81MB/张、kw 108KB、tx 55KB，而达菲每一行都要经 LMS 图像代理取一次
 		# ⇒ 一页 50 行就是几百 MB 代理流量。这里把列表/队列封面统一降到缩略尺寸（0 = 用原图）。
 		coverThumb     => 300,
+		# 0.11.62：大图档（队列行/正在播放面板会请求 300~500px，用 300 会发虚）
+		coverThumbBig  => 500,
 	});
 
 	unless (Plugins::LxMusic::Helper->init) {
