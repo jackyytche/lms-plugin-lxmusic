@@ -865,7 +865,9 @@ sub scanUrl {
 	if ($cached && $age < _fresh_window()) {
 		$log->info('LxMusic: resolve cache HIT (' . ($info->{name} || '') . ") age=${age}s — fresh, using it");
 		# 0.11.56：命中也要算**真实档位**（此前不传 ⇒ 退回请求档位，于是永远显示 FLAC 24bit）
-		my $ctier = $class->_actualTier($cached->{fmt}, $cached->{kbps}, $cached->{bits});
+		# 0.11.60：连"上游声明的档位"一起传（`$info->{music}{types}`），与播放路径同一套推导
+		my $ctier = $class->_actualTier($cached->{fmt}, $cached->{kbps}, $cached->{bits},
+			(ref($info->{music}{types}) eq 'ARRAY' ? $info->{music}{types} : undef));
 		$class->_finish_resolve($song, $url, $info, $cached->{direct}, $args, $cb,
 			$cached->{fmt}, $cached->{kbps}, $cached->{secs}, $ctier);
 		return;
@@ -915,9 +917,9 @@ sub _resolve_fresh {
 			}
 
 			my $direct = $res->{url};
-			# 0.11.52：**真实档位**（不是请求的档位）——由格式/码率/位深反推，进 %METADATA 的
-			# `quality`，于是 getMetadataFor / 补发 / 正在播放 全都显示真实值。
-			my $tier = $class->_actualTier($res->{format}, $res->{actualKbps}, $res->{bits});
+			# 0.11.60：**真实档位**统一由这里算（fmt/码率/位深 + 上游 types[] 封顶），
+			# 工具页与元数据都取这个值 ⇒ 同一曲目在任何位置显示一致（A0）
+			my $tier = $class->_actualTier($res->{format}, $res->{actualKbps}, $res->{bits}, $res->{declared});
 			$log->info(sprintf('LxMusic: resolved via [%s] type=%s%s verified=%s%s fmt=%s%s',
 				$res->{source} // '?', $tier // $res->{quality} // '?',
 				(defined $tier && defined $res->{quality} && $tier ne $res->{quality}
@@ -1183,30 +1185,68 @@ sub qualityLabel {
 
 # 0.11.52：**从真实交付物反推档位**（而不是拿请求值当结果）。
 #   · flc + 位深>16 → flac24bit；位深<=16 或未知 → flac
-#   · mp3 → 按实测码率分 320k / 128k（>=300 记 320k，其余记 128k）
+#   · mp3 → 按实测码率分 320k / 256k / 192k / 128k
 #   · m4a/aac → 'aac'（qualityLabel 会渲染成 AAC）
 #   · 其它格式原样大写交给 qualityLabel
-# 为什么值得做：pref 选 flac24bit 时，源只能给 128kbps MP3 的情况很常见（音质降级链），
-# 旧代码会把标签写成 "FLAC 24bit"，用户看到的就是"档位与码率自相矛盾"。
+# 0.11.60：**再按"上游声明的档位"封顶**（`$declared`，来自该曲的 `types[]`）。
+#   现场（A0 实测）：kw《晴天》上游只声明 `128k/320k/flac`，但交付流实测 1647kbps，
+#   于是"码率≥1400 ⇒ 24bit"的启发式把它标成 **FLAC 24bit** —— 比上游声明的还高，用户看到
+#   的就是"标签与来源自相矛盾"。规则：在"≤ 推出来的档位"的上游声明里取最高的那个。
+my @TIER_ORDER = qw(128k 192k 256k 320k flac flac24bit hires);
+my %TIER_RANK;
+{ my $i = 0; $TIER_RANK{ $TIER_ORDER[$i] } = ++$i for 0 .. $#TIER_ORDER }
+
 sub _actualTier {
-	my ($class, $fmt, $kbps, $bits) = @_;
+	my ($class, $fmt, $kbps, $bits, $declared) = @_;
 	my $f = lc($fmt // '');
 	return undef unless length $f;
 
-	# flc：位深读到了就信它；**读不到**（探测没取到实体）时用码率兜底——
-	# 16bit/44.1k FLAC ≈ 900~1100kbps（mg 实测 934），24bit 通常 ≥1400kbps（念心 tx 实测 1709）。
-	return (($bits || 0) > 16 ? 'flac24bit'
-		: (($bits || 0) ? 'flac' : (($kbps && $kbps >= 1400) ? 'flac24bit' : 'flac'))) if $f eq 'flc';
-	if ($f eq 'mp3') {
-		# 0.11.58：**按实测码率就近取标**，不再把 192/256kbps 压成"128k"（用户报的 A0 类错法之一：
-		# 设备日志里出现过 ~192kbps 却显示 "MP3 128kbps"，与 LMS 自己读到的码率自相矛盾）。
-		return '320k' if $kbps && $kbps >= 300;
-		return '256k' if $kbps && $kbps >= 224;
-		return '192k' if $kbps && $kbps >= 160;
-		return '128k';
+	# ⚠️ 0.11.60 踩坑：**不要写 `my $tier = EXPR if COND;`** —— 条件为假时那个 `my` 的初始化
+	# 根本不执行，而词法变量是复用的 pad 槽，会**残留上一次调用的值** ⇒ 后面的 `!defined $tier`
+	# 判空全部失效（实测：mp3 256/192/96、m4a、ape 全部返回上一次的 '320k'）。
+	# 一律先无条件初始化，再用 if/elsif 赋值。
+	my $tier;
+	if ($f eq 'flc') {
+		# 位深读到了就信它；**读不到**（探测没取到实体）时用码率兜底——
+		# 16bit/44.1k FLAC ≈ 900~1100kbps（mg 实测 934），24bit 通常 ≥1400kbps（念心 tx 实测 1709）。
+		$tier = ($bits || 0) > 16 ? 'flac24bit'
+			: (($bits || 0) ? 'flac' : (($kbps && $kbps >= 1400) ? 'flac24bit' : 'flac'));
 	}
-	return 'aac' if $f eq 'm4a' || $f eq 'aac' || $f eq 'mp4';
-	return $f eq 'ogg' ? 'OGG' : uc($f);
+	elsif ($f eq 'mp3') {
+		# 0.11.58：按实测码率就近取标（192/256kbps 不再被压成"128k"，也不再一律写 320k）
+		$tier = '320k' if $kbps && $kbps >= 300;
+		$tier = '256k' if !defined $tier && $kbps && $kbps >= 224;
+		$tier = '192k' if !defined $tier && $kbps && $kbps >= 160;
+		$tier = '128k' if !defined $tier;
+	}
+	elsif ($f eq 'm4a' || $f eq 'aac' || $f eq 'mp4') {
+		$tier = 'aac';
+	}
+	elsif ($f eq 'ogg') {
+		$tier = 'OGG';
+	}
+	else {
+		$tier = uc($f);
+	}
+
+	# 上游声明封顶：只在"声明的档位集合非空"且"我们推的档位不在声明里"时降级。
+	if ($tier && $declared && ref($declared) eq 'ARRAY' && @$declared) {
+		my %has = map { (ref($_) eq 'HASH' ? ($_->{type} // '') : $_) => 1 } @$declared;
+		delete $has{''};
+		if (%has && !$has{$tier}) {
+			my $myrank = $TIER_RANK{$tier} || 99;
+			my ($best, $bestrank) = (undef, -1);
+			for my $d (keys %has) {
+				my $r = $TIER_RANK{$d} or next;
+				($best, $bestrank) = ($d, $r) if $r <= $myrank && $r > $bestrank;
+			}
+			if (defined $best) {
+				$log->info("LxMusic: tier $tier capped to $best by the upstream types[] declaration");
+				$tier = $best;
+			}
+		}
+	}
+	return $tier;
 }
 
 1;

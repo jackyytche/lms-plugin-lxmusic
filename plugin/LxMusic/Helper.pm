@@ -462,6 +462,9 @@ sub resolveTrack {
 			suspect    => $suspect,
 			magic      => $magic,
 			bits       => $bits,          # 0.11.52：FLAC 位深（真实档位标签用）
+			# 0.11.60：把"该曲上游声明的档位"也交出去 ⇒ 上层算**同一个**真实档位
+			# （否则工具页/元数据/日志各算各的，又会出现"同一曲目显示不一致"，A0）
+			declared   => (ref($track->{types}) eq 'ARRAY' ? $track->{types} : undef),
 			format     => $fmt,
 			friendly   => $friendly,
 			tries      => \@tries,

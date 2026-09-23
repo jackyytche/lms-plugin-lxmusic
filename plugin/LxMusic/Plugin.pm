@@ -1990,7 +1990,9 @@ sub _webPreview {
 		music    => $track,
 		src      => $src,
 		type     => ($prefs->get('quality') || '320k'),
-		timeout  => 20,
+		# 0.11.60：工具页也给整体预算（页面能等，但别无限等——mg 那条实测 19.6s 才失败）
+		timeout  => 14,
+		budget   => 20,
 		cb       => sub {
 			my ($res) = @_;
 			my $elapsed = sprintf('%.2f', time() - $started);
@@ -2008,7 +2010,15 @@ sub _webPreview {
 			my $html;
 			if ($res->{ok} && $res->{url}) {
 				my $u = encode_entities($res->{url});
-				my $via = encode_entities(sprintf('[%s] %s%s', $res->{source} // '?', $res->{quality} // '?',
+				# 0.11.60（A0）：显示**真实档位**（交付物反推 + 上游 types[] 封顶），请求档位不同则括注。
+				# 现场：wy 行请求 flac、实际交付 ~128kbps 的流，旧代码在这行写 "[全豆要] flac ~128kbps"
+				# —— 同一行里"flac"和"128kbps"自相矛盾，用户看到的正是这种。
+				my $realTier = Plugins::LxMusic::ProtocolHandler->_actualTier(
+					$res->{format}, $res->{actualKbps}, $res->{bits}, $res->{declared});
+				my $shown = $realTier || $res->{quality} || '?';
+				my $req = (defined $realTier && defined $res->{quality} && $realTier ne $res->{quality})
+					? " (requested $res->{quality})" : '';
+				my $via = encode_entities(sprintf('[%s] %s%s%s', $res->{source} // '?', $shown, $req,
 					(defined $res->{actualKbps} ? " ~$res->{actualKbps}kbps" : '')
 					. ($res->{verified} ? ' verified' : '')
 					. ($res->{suspect} ? ' ⚠ 码率异常低，疑似试听片段' : '')));

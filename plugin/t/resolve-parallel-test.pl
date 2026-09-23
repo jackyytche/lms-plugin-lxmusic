@@ -21,16 +21,21 @@ BEGIN {
 	unshift @INC, sub {
 		my ($self, $file) = @_;
 		return unless $file =~ m{^Plugins/LxMusic/([^/]+\.pm)$};
-		for my $dir ($build, File::Spec->catdir($root, 'LxMusic')) {
-			my $p = File::Spec->catfile($dir, $1);
-			next unless -f $p;
-			open my $fh, '<', $p or next;
-			return $fh;
-		}
-		return;
+		# ⚠️ 2026-09-23：t_build 里可能有**过期副本**（本地/CI 早期构建留下的），
+		# 无条件优先它会让我们在"测旧代码"（实测踩到：ProtocolHandler 加载到 09-19 的版本，
+		# 新方法怎么都不存在）。⇒ 两个候选都在时**取 mtime 更新的那个**。
+		my @cand = grep { -f $_ } map { File::Spec->catfile($_, $1) }
+			($build, File::Spec->catdir($root, 'LxMusic'));
+		return unless @cand;
+		my ($newest) = sort { (stat($b))[9] <=> (stat($a))[9] } @cand;
+		open my $fh, '<', $newest or return;
+		return $fh;
 	};
 	my $helper = File::Spec->catfile($FindBin::Bin, '..', 'LxMusic', 'Helper.pm');
 	require $helper;
+	# 0.11.60：告诉 require 这个包已经加载（否则 ProtocolHandler 的 `use Plugins::LxMusic::Helper`
+	# 会经钩子**再加载一遍**同名包 ⇒ "Subroutine _src_failed redefined" 噪音）
+	$INC{'Plugins/LxMusic/Helper.pm'} = $helper;
 }
 
 my $failed = 0;
@@ -207,6 +212,37 @@ sub new_run_budget {
 	$cb{A}->({ ok => 0, error => 'x', why => 'worker' });
 	$cb{B}->({ ok => 0, error => 'y', why => 'worker' });
 	check('bg: 照常收尾（只回调一次）', @got == 1);
+}
+
+# ---------- 7. 真实档位推导（0.11.60，A0）：位深/码率/上游声明 → 一个标签 ----------
+{
+	require Plugins::LxMusic::ProtocolHandler;
+	my $PH = 'Plugins::LxMusic::ProtocolHandler';
+	my @decl_flac   = ({ type => '128k' }, { type => '320k' }, { type => 'flac' });
+	my @decl_24     = ({ type => 'flac' }, { type => 'flac24bit' });
+
+	check('tier: flac 且位深 24 -> flac24bit', $PH->_actualTier('flc', 1700, 24) eq 'flac24bit');
+	check('tier: flac 且位深 16 -> flac', $PH->_actualTier('flc', 1000, 16) eq 'flac');
+	check('tier: flac 无位深 + 1647kbps + 上游只声明 flac -> flac（不再吹成 24bit）',
+		$PH->_actualTier('flc', 1647, 0, \@decl_flac) eq 'flac');
+	check('tier: flac 无位深 + 1709kbps + 上游含 flac24bit -> flac24bit',
+		$PH->_actualTier('flc', 1709, 0, \@decl_24) eq 'flac24bit');
+	check('tier: mp3 320kbps -> 320k', $PH->_actualTier('mp3', 320, 0) eq '320k',
+		'got=' . ($PH->_actualTier('mp3', 320, 0) // 'undef'));
+	check('tier: mp3 256kbps -> 256k', $PH->_actualTier('mp3', 256, 0) eq '256k',
+		'got=' . ($PH->_actualTier('mp3', 256, 0) // 'undef'));
+	check('tier: mp3 192kbps -> 192k', $PH->_actualTier('mp3', 192, 0) eq '192k',
+		'got=' . ($PH->_actualTier('mp3', 192, 0) // 'undef'));
+	check('tier: mp3 96kbps -> 128k', $PH->_actualTier('mp3', 96, 0) eq '128k',
+		'got=' . ($PH->_actualTier('mp3', 96, 0) // 'undef'));
+	check('tier: m4a -> aac', $PH->_actualTier('mp4', 200, 0) eq 'aac',
+		'got=' . ($PH->_actualTier('mp4', 200, 0) // 'undef'));
+	check('tier: 未知格式原样大写', $PH->_actualTier('ape', 900, 0) eq 'APE',
+		'got=' . ($PH->_actualTier('ape', 900, 0) // 'undef'));
+	check('label: 192k -> MP3 192kbps', $PH->qualityLabel('192k') eq 'MP3 192kbps');
+	check('label: 256k -> MP3 256kbps', $PH->qualityLabel('256k') eq 'MP3 256kbps');
+	check('label: 已是人读标签则幂等（不再被 uc 成 FLAC 24BIT）',
+		$PH->qualityLabel('FLAC 24bit') eq 'FLAC 24bit');
 }
 
 print $failed ? "\n$failed FAILED\n" : "\nALL PASS\n";

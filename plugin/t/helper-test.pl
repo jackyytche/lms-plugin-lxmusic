@@ -22,16 +22,20 @@ BEGIN {
 	unshift @INC, sub {
 		my ($self, $file) = @_;
 		return unless $file =~ m{^Plugins/LxMusic/([^/]+\.pm)$};
-		for my $dir ($build, File::Spec->catdir($root, 'LxMusic')) {
-			my $p = File::Spec->catfile($dir, $1);
-			next unless -f $p;
-			open my $fh, '<', $p or next;
-			return $fh;
-		}
-		return;
+		# ⚠️ 2026-09-23：t_build 里可能有**过期副本**（早期构建留下的），无条件优先它会让我们
+		# 在"测旧代码"（实测踩到：ProtocolHandler 加载到 09-19 的版本，新方法怎么都不存在）。
+		# ⇒ 两个候选都在时**取 mtime 更新的那个**（zip 平铺场景下 t_build 是唯一的，照旧可用）。
+		my @cand = grep { -f $_ } map { File::Spec->catfile($_, $1) }
+			($build, File::Spec->catdir($root, 'LxMusic'));
+		return unless @cand;
+		my ($newest) = sort { (stat($b))[9] <=> (stat($a))[9] } @cand;
+		open my $fh, '<', $newest or return;
+		return $fh;
 	};
 	my $helper = File::Spec->catfile($FindBin::Bin, '..', 'LxMusic', 'Helper.pm');
 	require $helper;
+	# 0.11.60：标记已加载，避免经钩子重复加载同名包（redefined 噪音）
+	$INC{'Plugins/LxMusic/Helper.pm'} = $helper;
 	Plugins::LxMusic::Helper->import if Plugins::LxMusic::Helper->can('import');
 }
 
