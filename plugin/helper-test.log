@@ -1,6 +1,6 @@
-Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 1042.
+Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 1053.
 	(Maybe you meant system() when you said exec()?)
-Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 1142.
+Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 1153.
 	(Maybe you meant system() when you said exec()?)
 ok - parse ok=1
 ok - parse data url
@@ -19,9 +19,9 @@ ok - installSource wrote the file
 ok - installSource rejects junk
 
 ALL PASS
-Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 1042.
+Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 1053.
 	(Maybe you meant system() when you said exec()?)
-Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 1142.
+Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 1153.
 	(Maybe you meant system() when you said exec()?)
 LOG-WARN: LxMusic resolve: try [srcA] type=flac
 LOG-WARN: LxMusic resolve: try [srcB] type=flac
@@ -49,7 +49,6 @@ LOG-WARN: LxMusic resolve: resolve budget 1s exceeded (queued=0 inflight=2)
 LOG-WARN: LxMusic resolve: try [srcA] type=flac
 LOG-WARN: LxMusic resolve: try [srcB] type=flac
 LOG-WARN: LxMusic resolve FAILED after 2 tries: srcA@flac: x; srcB@flac: y
-Use of uninitialized value $TIER_ORDER[7] in hash element at /loader/0x563771ab3e30/Plugins/LxMusic/ProtocolHandler.pm line 1236.
 LOG-WARN: LxMusic resolve: try [srcA] type=flac
 LOG-WARN: LxMusic resolve: try [srcB] type=flac
 LOG-WARN: LxMusic resolve: try [srcB] type=flac
@@ -57,10 +56,10 @@ LOG-WARN: LxMusic resolve: try [srcA] type=flac
 LOG-WARN: LxMusic resolve: try [srcA] type=flac
 LOG-WARN: LxMusic resolve: try [srcB] type=flac
 LOG-WARN: LxMusic caps: [A.js] declares kw(128k/flac), wy(flac)
-LOG-WARN: LxMusic state: loaded 1 caps, 2 scored pairs from /tmp/mgvfksRtHC/state.json
+LOG-WARN: LxMusic state: loaded 1 caps, 2 scored pairs from /tmp/cKs_HJLtFe/state.json
 LOG-WARN: LxMusic resolve: try [srcB] type=flac
 LOG-WARN: LxMusic resolve: try [srcA] type=flac
-LOG-WARN: LxMusic state: /tmp/mgvfksRtHC/state.json 解析失败，忽略（'"' expected, at character offset 2 (before "this is not json") at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 452.
+LOG-WARN: LxMusic state: /tmp/cKs_HJLtFe/state.json 解析失败，忽略（'"' expected, at character offset 2 (before "this is not json") at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 463.
 ）
 ok - window: 未回调前已启动 2 个候选
 ok - window: 两个候选来自不同源
@@ -121,11 +120,10 @@ ok - state: 恢复的分数真的影响派发顺序（B 先）
 ok - state: 坏文件只告警不抛异常
 
 ALL PASS
-Statement unlikely to be reached at t_build/Plugins/LxMusic/Helper.pm line 1042.
+Statement unlikely to be reached at t_build/Plugins/LxMusic/Helper.pm line 1053.
 	(Maybe you meant system() when you said exec()?)
-Statement unlikely to be reached at t_build/Plugins/LxMusic/Helper.pm line 1142.
+Statement unlikely to be reached at t_build/Plugins/LxMusic/Helper.pm line 1153.
 	(Maybe you meant system() when you said exec()?)
-Use of uninitialized value $TIER_ORDER[7] in hash element at /loader/0x5566f44b5d70/Plugins/LxMusic/ProtocolHandler.pm line 1236.
 ok - A1 首轮写满 300 行
 ok - A2 之后 4 轮"通知风暴"零写入（指纹止血）
 ok - B0 订阅者已注册
