@@ -217,6 +217,51 @@ sub handler {
 		$params->{lxWorkers} = _ent('已关闭（每请求现起 qjs 进程）');
 	}
 
+	# 0.11.65：把**学到的（源×平台）成绩**显示出来——用户能直接看到"哪个源在我这儿最靠谱"，
+	# 排障时也不用去猜为什么点歌走的是某个源。数据来自 0.11.63 的 %SRC_SCORE（0.11.64 起持久化）。
+	{
+		my $sc = Plugins::LxMusic::Helper->score_state;
+		my %name;
+		for my $rec (@{ Plugins::LxMusic::Sources->list }) {
+			$name{ $rec->{id} } = $rec->{name} if $rec->{id};
+		}
+		my @lines;
+		for my $plat (qw(kw kg tx wy mg)) {
+			my @best;
+			for my $k (keys %$sc) {
+				my ($sid, $p) = split(/\|/, $k, 2);
+				next unless defined $p && $p eq $plat;
+				my $e = $sc->{$k};
+				my $n = ($e->{ok} || 0) + ($e->{fail} || 0) or next;
+				my $rate = int(100 * ($e->{ok} || 0) / $n + 0.5);
+				my $avg = $e->{ms_n} ? int($e->{ms_sum} / $e->{ms_n}) : undef;
+				push @best, { nm => ($name{$sid} // $sid), rate => $rate, avg => $avg, n => $n };
+			}
+			next unless @best;
+			@best = sort { $b->{rate} <=> $a->{rate} || ($a->{avg} // 9e9) <=> ($b->{avg} // 9e9) } @best;
+			push @lines, _m($plat, ': ', join(' > ', map {
+				$_->{nm} . ' ' . $_->{rate} . '%' . (defined $_->{avg} ? '/' . $_->{avg} . 'ms' : '')
+			} @best[0 .. ($#best > 2 ? 2 : $#best)]));
+		}
+		$params->{lxScores} = @lines ? _ent(join(_chars('；'), @lines))
+			: _ent('（还没有取链成绩：播过一次歌就会开始记录）');
+
+		# 能力表：源声明了哪些平台/档位（用于确认"裁剪"到底认没认出来）
+		# 键是**源文件路径**，显示时换成源名（拿不到就退回 `<id>.js`）
+		my $caps = Plugins::LxMusic::Helper->caps_state;
+		my %byPath2;
+		for my $rec (@{ Plugins::LxMusic::Sources->list }) {
+			my $p = Plugins::LxMusic::Sources->pathFor($rec->{id});
+			$byPath2{$p} = $rec->{name} if $p;
+		}
+		my @cap_line;
+		for my $p (sort keys %$caps) {
+			my $short = $byPath2{$p} // ($p =~ m{([^/]+)$})[0] // $p;
+			push @cap_line, _m($short, '=', join('/', @{ $caps->{$p} }));
+		}
+		$params->{lxCaps} = _ent(@cap_line ? join(_chars('；'), @cap_line) : '（还没有源能力表）');
+	}
+
 	return $class->SUPER::handler($client, $params, $callback, $httpClient, $response);
 }
 
