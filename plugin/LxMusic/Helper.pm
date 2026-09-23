@@ -351,6 +351,7 @@ sub _caps_note {
 	$CAPS_AT{$path} = time();
 	$log->warn('LxMusic caps: [' . ($path =~ m{([^/]+)$} ? $1 : $path) . '] declares '
 		. join(', ', map { $_ . '(' . join('/', sort keys %{ $m{$_}{qualitys} }) . ')' } sort keys %m));
+	$class->state_save;      # 0.11.64：能力表落盘（节流），重启后第一首就能用上裁剪
 	return 1;
 }
 
@@ -374,6 +375,11 @@ sub _caps_qualitys {
 sub caps_state { return { map { $_ => [ sort keys %{ $CAPS{$_} } ] } keys %CAPS } }
 sub _caps_reset { %CAPS = (); %CAPS_AT = (); return 1 }
 
+# ⚠️ 注意：**状态持久化的实现放在下面 `%SRC_SCORE` 声明之后**——Perl 的词法变量必须先声明后使用，
+# 而 state_load/save 两个函数都要引用 `%SRC_SCORE`（0.11.64 第一版就踩了这个：编译期
+# "Global symbol %SRC_SCORE requires explicit package name"）。
+
+
 # ---------- 0.11.63：每（源 × 平台）**自适应排序** ----------
 # 起因（0.11.62 轮实测，`docs/source-eval-independent-note.md`）：候选从前只按**注册表顺序**派发，
 # 而熔断 `%SRC_BAD` 只记"失败"、不记"谁快/谁稳"。于是多挂一个源就可能把点歌从 0.96s 拖到 8.35s、
@@ -390,6 +396,8 @@ sub _score_note {
 	my $e = $SRC_SCORE{$k} ||= { ok => 0, fail => 0, ms_sum => 0, ms_n => 0 };
 	$e->{ $ok ? 'ok' : 'fail' }++;
 	if (defined $ms && $ms > 0) { $e->{ms_sum} += $ms; $e->{ms_n}++ }
+	# 0.11.64：分数落盘（节流 60s）——重启后"谁快谁稳"不用重新学
+	Plugins::LxMusic::Helper->state_save;
 	return;
 }
 
@@ -415,6 +423,89 @@ sub _score_sort {
 
 sub score_state { return { map { $_ => { %{ $SRC_SCORE{$_} } } } keys %SRC_SCORE } }
 sub _score_reset { %SRC_SCORE = (); return 1 }
+
+# ---------- 0.11.64：能力表 +（源×平台）分数**持久化** ----------
+# 为什么必须持久：两者原本都是内存态 ⇒ LMS 一重启，"能力表裁剪"和"学到的派发顺序"全丢，
+# 每个（源 × 平台）的**第一首**又要按冷顺序走一遍（0.11.63 实测那一次 mg 要 13.04s）。
+# 存放位置：prefs 目录（`Slim::Utils::Prefs::dir()`，跨重启可写），**不要用 /tmp**（tmpfs 会被清）。
+# 环境变量 `LX_STATE_FILE` 可覆盖（单测/排查用）。
+my $STATE_LAST = 0;         # 上次落盘时间（节流用）
+
+sub state_file {
+	my ($class) = @_;
+	return $ENV{LX_STATE_FILE} if defined $ENV{LX_STATE_FILE} && length $ENV{LX_STATE_FILE};
+	my $base = eval { Slim::Utils::Prefs::dir() } || File::Spec->tmpdir();
+	my $d = File::Spec->catdir($base, 'lxmusic');
+	mkpath($d) unless -d $d;
+	return File::Spec->catfile($d, 'state.json');
+}
+
+sub state_load {
+	my ($class) = @_;
+	my $f = $class->state_file or return 0;
+	return 0 unless -f $f;
+	# ⚠️ 不能用 `do { local $/; open(my $fh, ...) ? <$fh> : undef }`：`my $fh` 的作用域只在那条
+	# 表达式里，`<$fh>` 在 `?` 之后就出界了（编译期 "Global symbol $fh requires explicit package name"）。
+	my $raw = '';
+	if (open(my $fh, '<', $f)) { local $/; $raw = <$fh> // ''; close $fh }
+	return 0 unless length $raw;
+	my $d = eval { JSON::XS->new->utf8->decode($raw) };
+	unless (ref($d) eq 'HASH') {
+		$log->warn("LxMusic state: $f 解析失败，忽略（$@）");
+		return 0;
+	}
+	# 能力表：只补空槽（运行期学到的新能力优先，不覆盖）
+	my $cap = $d->{caps};
+	if (ref($cap) eq 'HASH') {
+		for my $p (keys %$cap) {
+			next if $CAPS{$p};
+			next unless ref($cap->{$p}) eq 'HASH' && %{ $cap->{$p} };
+			$CAPS{$p} = $cap->{$p};
+		}
+	}
+	my $sc = $d->{score};
+	if (ref($sc) eq 'HASH') {
+		for my $k (keys %$sc) {
+			my $e = $sc->{$k};
+			next unless ref($e) eq 'HASH';
+			$SRC_SCORE{$k} = {
+				ok => int($e->{ok} || 0), fail => int($e->{fail} || 0),
+				ms_sum => 0 + ($e->{ms_sum} || 0), ms_n => int($e->{ms_n} || 0),
+			};
+		}
+	}
+	$log->warn('LxMusic state: loaded ' . scalar(keys %CAPS) . ' caps, '
+		. scalar(keys %SRC_SCORE) . " scored pairs from $f");
+	return 1;
+}
+
+# 落盘（节流：默认 60s 最多一次；shutdown 会强制一次）
+sub state_save {
+	my ($class, $force) = @_;
+	return 0 unless $force || time() - $STATE_LAST >= 60;
+	$STATE_LAST = time();
+	my $f = $class->state_file or return 0;
+	my $json = eval {
+		JSON::XS->new->utf8->canonical->encode({ caps => \%CAPS, score => \%SRC_SCORE });
+	} or do { $log->warn("LxMusic state: 序列化失败: $@"); return 0 };
+	# 先写临时文件再 rename：避免断电/被杀时留下半个文件
+	my $tmp = "$f.tmp";
+	my $ok = eval {
+		open(my $fh, '>', $tmp) or die "$tmp: $!";
+		print $fh $json;
+		close $fh or die "close: $!";
+		rename($tmp, $f) or die "rename: $!";
+		1;
+	};
+	unless ($ok) {
+		$log->warn("LxMusic state: 写入失败 $f: $@");
+		return 0;
+	}
+	return 1;
+}
+
+sub state_reset { %CAPS = (); %CAPS_AT = (); %SRC_SCORE = (); $STATE_LAST = 0; return 1 }
+
 
 # 多源解析：resolveTrack(music=>{}, src=>'kw', type=>'320k', cb=>sub{...})
 # cb 收到 { ok, url, source, quality, verified, actualKbps, tries=>[{source,quality,why|ok}] }
@@ -730,6 +821,9 @@ sub init {
 	mkpath($TMPDIR) or do { $log->error("LxMusic Helper: mkpath $TMPDIR: $!"); return 0 };
 	mkpath($SOURCES);
 
+	# 0.11.64：恢复"能力表 +（源×平台）分数"⇒ 重启后第一个请求就能裁剪候选、按学到的顺序派发
+	$class->state_load;
+
 	# shim/sdk 先拷（纯文本不会被 EBUSY 卡住）；qjs 最后、失败仅降级保留旧二进制，
 	# 绝不因 qjs 占用而 return 0 —— 那会让 shim 停在旧版（0.3.6 现场）
 	copy($shimSrc, $SHIM) or do { $log->error("LxMusic Helper: copy shim: $!"); return 0 };
@@ -993,6 +1087,7 @@ sub shutdown {
 		_finish($job, 'shutdown');
 	}
 	rmtree($TMPDIR);
+	$class->state_save(1);      # 0.11.64：停机前强制落盘（节流绕过）
 	return 1;
 }
 

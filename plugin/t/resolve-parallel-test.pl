@@ -323,5 +323,57 @@ sub new_run_budget {
 	$H->_score_reset();
 }
 
+# ---------- 10. 状态持久化（0.11.64）：能力表 +（源×平台）分数要能跨重启恢复 ----------
+{
+	my $H = 'Plugins::LxMusic::Helper';
+	my $sf = File::Spec->catfile($tmp, 'state.json');
+	local $ENV{LX_STATE_FILE} = $sf;      # 指到临时文件，绝不碰真机上的 state.json
+	unlink $sf;
+
+	$H->state_reset();
+	# 注意：能力表里必须**同时**给 A 声明 wy，否则恢复能力表后 A 会在 wy 上被裁掉，
+	# 也就测不到"分数决定顺序"（第一版就踩了：order=B 只有一个候选）
+	$H->_caps_note($path{A}, { status => 'success',
+		sources => { kw => { name => 'kw', qualitys => ['128k', 'flac'] },
+		             wy => { name => 'wy', qualitys => ['flac'] } } });
+	Plugins::LxMusic::Helper::_score_note(Plugins::LxMusic::Helper::_score_key({ id => 'B', name => 'srcB' }, 'wy'), 1, 150);
+	Plugins::LxMusic::Helper::_score_note(Plugins::LxMusic::Helper::_score_key({ id => 'A', name => 'srcA' }, 'wy'), 0, 2000);
+
+	check('state: state_save 写出文件', $H->state_save(1) && -f $sf, $sf);
+	my $bytes = -s $sf;
+
+	# 模拟重启：清空内存再 load
+	$H->state_reset();
+	check('state: reset 后能力表为空', !%{ $H->caps_state });
+	check('state: state_load 成功', $H->state_load);
+	my $caps = $H->caps_state;
+	check('state: 能力表恢复', ref($caps) eq 'HASH' && exists $caps->{ $path{A} },
+		join(',', sort keys %{ $caps || {} }));
+	my $st = $H->score_state;
+	check('state: 分数恢复（B|wy ok=1 / A|wy fail=1）',
+		($st->{'B|wy'}{ok} // 0) == 1 && ($st->{'A|wy'}{fail} // 0) == 1,
+		join(',', map { "$_=" . ($st->{$_}{ok} // 0) . "/" . ($st->{$_}{fail} // 0) } sort keys %$st));
+
+	# 恢复后的顺序：B 应该排在 A 前面
+	@launched = ();
+	%cb = ();
+	$H->_breaker_reset();
+	Plugins::LxMusic::Helper->resolveTrack(music => $track, src => 'wy', type => 'flac', cb => sub { });
+	check('state: 恢复的分数真的影响派发顺序（B 先）',
+		@launched == 2 && $launched[0]{id} eq 'B', 'order=' . join(',', map { $_->{id} } @launched));
+
+	# 文件坏掉不能把插件带崩
+	open(my $fh, '>', $sf) or die $!;
+	print $fh "{ this is not json";
+	close $fh;
+	$H->state_reset();
+	my $ok = eval { $H->state_load };
+	check('state: 坏文件只告警不抛异常', defined $ok, $@ || 'undef');
+
+	unlink $sf;
+	$H->state_reset();
+	delete $ENV{LX_STATE_FILE};
+}
+
 print $failed ? "\n$failed FAILED\n" : "\nALL PASS\n";
 exit($failed ? 1 : 0);
