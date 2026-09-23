@@ -491,14 +491,17 @@ sub _coverFromMusic {
 		my $v = $m->{$k};
 		if (defined $v && $v ne '' && $v =~ m{^https?://}) {
 			$v =~ s/\.webp$/.jpg/i;   # mg 的 webp 换成同路径 .jpg（实测 200/159KB jpeg）
-			return $v;
+			# 0.11.61：队列行/正在播放也走缩略（wy 原图 4.81MB/张，50 行就是 240MB）
+			return Plugins::LxMusic::Helper->coverThumb($v);
 		}
 	}
 	if (($src || '') eq 'kg' && ($m->{albumId} || '') =~ /^\d+$/) {
 		return 'https://imge.kugou.com/stdmusic/240/' . $m->{albumId} . '.jpg';
 	}
 	if (($src || '') eq 'tx' && ($m->{albumMid} || '') =~ /^[A-Za-z0-9]+$/) {
-		return 'https://y.gtimg.cn/music/photo_new/T002R300x300M000' . $m->{albumMid} . '.jpg';
+		my $s = Plugins::LxMusic::Helper->coverThumbSize() || 500;
+		return 'https://y.gtimg.cn/music/photo_new/T002R' . $s . 'x' . $s
+			. 'M000' . $m->{albumMid} . '.jpg';
 	}
 	return '';
 }

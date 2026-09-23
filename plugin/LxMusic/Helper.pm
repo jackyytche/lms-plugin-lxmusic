@@ -201,6 +201,49 @@ sub lmsFormat {
 	return undef;
 }
 
+# ---------- 0.11.61 封面提速：缩略尺寸改写（放在 Helper，Plugin 与 ProtocolHandler 共用） ----------
+# 现场（2026-09-23 实测，`tmp/cover_size_probe.py` + `tmp/cover_variant_deep.py`）：
+# 达菲皮肤每行封面都要经 LMS 图像代理取一次图，而**上游给多大就拉多大**：
+#   · wy  `p2.music.126.net/…/109951168163397768.jpg` 原图 **4.81 MB**（!!）
+#         `?param=300y300` = 240 KB（20×）、`200y200` = 112 KB（43×）、`130y130` = 51 KB
+#   · kw  `img1.kwcdn.kuwo.cn/star/albumcover/500/…` = 108 KB；pic.web 的 pictype/size
+#         降到 300 ⇒ 44.6 KB（2.4×）、150 ⇒ 14.4 KB
+#   · tx  `y.gtimg.cn/…/T002R500x500…` = 55 KB → `T002R300x300…` = 25 KB（2.2×）
+# 一页 50 行 ⇒ wy 原图就是 240 MB 的代理流量。pref `coverThumb`（0 = 原图，默认 300）。
+# ⚠️ 实测**没有**尺寸变体的源一律原样返回，绝不自造 URL：
+#   · kg `imge.kugou.com/stdmusic/{120,150,240,500}/<id>.jpg` 四个尺寸**同一份字节**
+#   · mg 加 `?size=/?w=/?param=/?width=` 全部 403，路径段变体 404
+sub coverThumbSize {
+	my ($size) = @_;
+	my $v = defined $size ? $size : $prefs->get('coverThumb');
+	$v = 300 unless defined $v;
+	return 0 if !$v || $v < 0;
+	return 500 if $v > 500;
+	return int($v);
+}
+
+sub coverThumb {
+	my ($class, $url, $size) = @_;
+	$size = coverThumbSize($size);
+	return $url unless defined $url && length $url;
+	return $url unless $size;
+
+	if ($url =~ m{^https?://[^/]*music\.126\.net/}i) {           # wy
+		return $url if $url =~ /[?&]param=\d+y\d+/i;
+		return $url . ($url =~ /\?/ ? '&' : '?') . "param=${size}y${size}";
+	}
+	if ($url =~ m{^https?://[^/]*(?:gtimg\.cn|y\.qq\.com)/}i && $url =~ /R\d+x\d+/) {   # tx
+		my $u = $url;
+		$u =~ s/R\d+x\d+/R${size}x${size}/;
+		return $u;
+	}
+	if ($url =~ m{^https?://[^/]*kwcdn\.kuwo\.cn/star/albumcover/(\d+)/}i) {            # kw
+		my $u = $url;
+		$u =~ s{(/star/albumcover/)\d+/}{$1${size}/};
+		return $u;
+	}
+	return $url;
+}
 # 直链可播性探测（走 shim 的 probe：curl -I，不允许 HEAD 时退 Range 0-0）
 sub probeUrl {
 	my ($class, $url, $cb, $prio) = @_;

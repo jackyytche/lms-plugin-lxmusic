@@ -83,6 +83,10 @@ sub initPlugin {
 		warmMax        => 1,     # 每页预热几首（0-5）；预热请求是 bg 优先级，设备忙时会被直接丢弃
 		resolveBudget  => 10,    # 播放路径整体预算（秒，0=不限）：超预算明确失败并放人（LMS 约 4~8s 就放弃）
 		sdkWorkers     => 2,     # 浏览（SDK）常驻进程池大小（1-4）：>1 时"列表/详情"下钻不再互相排队
+		# ---- 0.11.61 封面提速 ----
+		# 实测：wy 原图 4.81MB/张、kw 108KB、tx 55KB，而达菲每一行都要经 LMS 图像代理取一次
+		# ⇒ 一页 50 行就是几百 MB 代理流量。这里把列表/队列封面统一降到缩略尺寸（0 = 用原图）。
+		coverThumb     => 300,
 	});
 
 	unless (Plugins::LxMusic::Helper->init) {
@@ -755,23 +759,27 @@ sub _coverOf {
 		$img = 'https://d.musicapp.migu.cn' . $img if $img =~ m{^/};
 		if ($img =~ m{^https?://}) {
 			$img =~ s/\.webp$/.jpg/i;
-			return _u($img);
+			return _u(_coverThumb($img));
 		}
 	}
 	if ($src eq 'kw' && ($t->{songmid} || '') =~ /^\d+$/) {
 		# 代理内解析 pic.web 再取图；关掉代理则无图可给（pic.web 返回的是文本 URL）
-		return $proxy ? _coverProxyUrl('kw:' . $t->{songmid}) : '';
+		# 0.11.61：把缩略尺寸一起交给代理（`pictype/size` 决定 kwcdn 路径里的尺寸段）
+		my $s = _coverThumbSize();
+		return $proxy ? _coverProxyUrl('kw:' . $t->{songmid} . ($s ? ":$s" : '')) : '';
 	}
 
 	for my $k (qw(img pic albumPic picUrl cover)) {
 		my $v = $t->{$k};
 		if (defined $v && $v ne '' && $v =~ m{^https?://}) {
 			$v =~ s/\.webp$/.jpg/i;
-			return _u($v);
+			return _u(_coverThumb($v));
 		}
 	}
 	if ($src eq 'tx' && ($t->{albumMid} || '') =~ /^[A-Za-z0-9]+$/) {
-		return 'https://y.gtimg.cn/music/photo_new/T002R300x300M000' . $t->{albumMid} . '.jpg';
+		my $s = _coverThumbSize() || 500;
+		return 'https://y.gtimg.cn/music/photo_new/T002R' . $s . 'x' . $s
+			. 'M000' . $t->{albumMid} . '.jpg';
 	}
 	return '';
 }
@@ -783,6 +791,10 @@ sub _coverProxyUrl {
 	my $port = $prefs->get('httpPort') || 9000;
 	return "http://$srv:$port/plugins/LxMusic/cover?u=" . encode_base64url($target);
 }
+
+# ---------- 0.11.61 封面提速：缩略尺寸（实现搬到了 Helper，Plugin/ProtocolHandler 共用） ----------
+sub _coverThumbSize { return Plugins::LxMusic::Helper->coverThumbSize(@_) }
+sub _coverThumb     { return Plugins::LxMusic::Helper->coverThumb(@_) }
 
 # ---------- M0.3 歌单：搜索 -> 详情 -> 播放/整单 ----------
 
@@ -838,6 +850,8 @@ sub _plItems {
 		));
 		my $img = $pl->{img};
 		# 歌单封面也走插件代理（kw/kg 的图 CDN 需要 UA/Referer，设备直连不出图）
+		# 0.11.61：同样降到缩略尺寸（一页 30 个歌单 × 上游原图是另一处大流量）
+		$img = _coverThumb($img) if $img;
 		$img = _coverProxyUrl($img) if $img && $img =~ m{^https?://} && $prefs->get('coverProxy');
 		# 0.11.33：整单播放靠 LMS 的 **`playlist`** 属性（playall/addall/insert/remove 专用，
 		# Slim/Web/XMLBrowser.pm:336-344 → type=playlist → Slim/Formats/XML.pm:93 → 我们的 explodePlaylist）。
@@ -1872,12 +1886,17 @@ sub _coverProxy {
 	}
 
 	# kw：先解析 pic.web（响应体是图片 URL 纯文本，落雪 PC 端 getPic 同款），再取图
-	if ($target =~ /^kw:(\d+)$/) {
-		my $songmid = $1;
-		if (my $cached = $COVER_CACHE{"kw:$songmid"}) {
+	# 0.11.61：目标可带缩略尺寸 `kw:<songmid>:<size>`（pictype/size 决定 kwcdn 路径里的尺寸段；
+	# 实测 500→108KB / 300→44.6KB / 240→30KB / 150→14.4KB）
+	if ($target =~ /^kw:(\d+)(?::(\d+))?$/) {
+		my ($songmid, $size) = ($1, $2);
+		$size = _coverThumbSize($size);
+		my $ckey = "kw:$songmid" . ($size ? ":$size" : '');
+		if (my $cached = $COVER_CACHE{$ckey}) {
 			return _streamImage($cached, $client, $params, $callback, $httpClient, $response);
 		}
-		my $api = 'http://artistpicserver.kuwo.cn/pic.web?corp=kuwo&type=rid_pic&pictype=500&size=500&rid=' . $songmid;
+		my $api = 'http://artistpicserver.kuwo.cn/pic.web?corp=kuwo&type=rid_pic&pictype='
+			. ($size || 500) . '&size=' . ($size || 500) . '&rid=' . $songmid;
 		Slim::Networking::SimpleAsyncHTTP->new(
 			sub {
 				my $res = shift;
@@ -1886,8 +1905,9 @@ sub _coverProxy {
 				$img =~ s/^\s+|\s+$//g;
 				if ($img =~ m{^https?://\S+$}) {
 					%COVER_CACHE = () if keys %COVER_CACHE > 300;
-					$COVER_CACHE{"kw:$songmid"} = $img;
-					return _streamImage($img, $client, $params, $callback, $httpClient, $response);
+					# pic.web 偶尔忽略 pictype，返回的仍是 500 尺寸 ⇒ 再改写一次兜底
+					$COVER_CACHE{$ckey} = _coverThumb($img);
+					return _streamImage($COVER_CACHE{$ckey}, $client, $params, $callback, $httpClient, $response);
 				}
 				$log->debug('LxMusic: kw pic.web miss for ' . $songmid);
 				return _respondCoverFail('no cover', $client, $params, $callback, $httpClient, $response);

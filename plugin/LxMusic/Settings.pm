@@ -74,7 +74,7 @@ sub prefs {
 		quality bridgeTimeout helperConcurrency resolveTtl coverProxy
 		boardsKw boardsKg boardsTx boardsWy boardsMg qualityFallback verifyUrl autoSkipOnError
 		workerEnable workerIdle preferStreamable
-		warmEnable warmMax resolveBudget sdkWorkers
+		warmEnable warmMax resolveBudget sdkWorkers coverThumb
 	));
 }
 

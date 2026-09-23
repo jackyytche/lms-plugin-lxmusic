@@ -245,5 +245,32 @@ sub new_run_budget {
 		$PH->qualityLabel('FLAC 24bit') eq 'FLAC 24bit');
 }
 
+# ---------- 8. 封面缩略改写（0.11.61）：只动实测有尺寸变体的源，其余原样 ----------
+{
+	my $H = 'Plugins::LxMusic::Helper';
+	my $wy = 'https://p2.music.126.net/l0vGEnowGfj6DgFSGojyfQ==/109951168163397768.jpg';
+	my $tx = 'https://y.gtimg.cn/music/photo_new/T002R500x500M000002iWKlh2DcjFL.jpg';
+	my $kw = 'http://img1.kwcdn.kuwo.cn/star/albumcover/500/s3s94/93/211513640.jpg';
+	my $kg = 'https://imge.kugou.com/stdmusic/240/966846.jpg';
+	my $mg = 'https://d.musicapp.migu.cn/data/oss/resource/00/42/rf/abc.jpg';
+
+	check('thumb: wy 追加 param=300y300', $H->coverThumb($wy, 300) eq $wy . '?param=300y300',
+		$H->coverThumb($wy, 300));
+	check('thumb: wy 已有 param 不重复追加',
+		$H->coverThumb($wy . '?param=130y130', 300) eq $wy . '?param=130y130',
+		$H->coverThumb($wy . '?param=130y130', 300));
+	check('thumb: tx R500x500 -> R300x300',
+		$H->coverThumb($tx, 300) eq 'https://y.gtimg.cn/music/photo_new/T002R300x300M000002iWKlh2DcjFL.jpg',
+		$H->coverThumb($tx, 300));
+	check('thumb: kw albumcover/500 -> /300/',
+		$H->coverThumb($kw, 300) eq 'http://img1.kwcdn.kuwo.cn/star/albumcover/300/s3s94/93/211513640.jpg',
+		$H->coverThumb($kw, 300));
+	check('thumb: kg 没有尺寸变体 -> 原样', $H->coverThumb($kg, 300) eq $kg, $H->coverThumb($kg, 300));
+	check('thumb: mg 没有尺寸变体 -> 原样', $H->coverThumb($mg, 300) eq $mg, $H->coverThumb($mg, 300));
+	check('thumb: size=0 关闭改写 -> 原样', $H->coverThumb($wy, 0) eq $wy, $H->coverThumb($wy, 0));
+	check('thumb: 未知域 -> 原样',
+		$H->coverThumb('https://example.com/a.jpg', 300) eq 'https://example.com/a.jpg');
+}
+
 print $failed ? "\n$failed FAILED\n" : "\nALL PASS\n";
 exit($failed ? 1 : 0);
