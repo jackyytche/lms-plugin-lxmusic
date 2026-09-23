@@ -1007,72 +1007,106 @@ sub explodePlaylist {
 	elsif ($url =~ m{^lxm://l/([a-z]+)/([A-Za-z0-9_-]+)$}) { ($kind, $src, $id) = ('songlist', $1, $2) }
 
 	if ($kind) {
-		Plugins::LxMusic::Helper->request(
-			action  => ($kind eq 'board' ? 'boardlist' : 'songlistdetail'),
-			info    => ($kind eq 'board'
-				? { source => $src, bangid => $id, page => 1 }
-				: { source => $src, id     => $id, page => 1 }),
-			timeout => 45,
-			cb      => sub {
-				my ($res) = @_;
-				unless ($res->{ok} && $res->{data} && $res->{data}{list} && @{ $res->{data}{list} }) {
-					$log->error("LxMusic: $kind explode failed: " . ($res->{error} || 'empty list'));
-					$cb->([]);
-					return;
-				}
-
-				my @list = @{ $res->{data}{list} };
-				# 0.11.33：整单入队上限 100 → 300（与歌单详情窗口上限一致）。
-				# 起因：歌单页头"播放"从前根本不走这里（LMS 把详情 feed 的一页 50 首当播放列表入队），
-				# 修好 `playlist` 属性后才真正落到 explodePlaylist；100 会让 >100 首的歌单仍然少一截。
-				@list = @list[ 0 .. 299 ] if @list > 300;
-				my $q = $prefs->get('quality') || '320k';
-				my @urls;
-				for my $t (@list) {
-					next unless $t && ref($t) eq 'HASH';
-					my $name = ($t->{singer} ? $t->{singer} . ' - ' : '') . ($t->{name} || '?');
-					my $u = $class->buildUrl(
-						music => $t,
-						src   => ($t->{source} || $src),
-						type  => $q,
-						name  => $name,
-					);
-					next unless $u;
-					# 入队前发布队列元数据（歌名/时长/封面/码率估算）——队列行渲染靠它，零额外 API
-					$class->_publish_cover($u, ($t->{source} || $src), $t);
-					my $secs = _secs_of_interval($t->{interval});
-					my $est;
-					if ($secs && ref($t->{types}) eq 'ARRAY') {
-						my $biggest;
-						for my $ty (@{ $t->{types} }) {
-							next unless ref $ty eq 'HASH';
-							my $b = eval { Plugins::LxMusic::Plugin::_bytesOf($ty->{size}) };
-							next unless $b;
-							$biggest = $b if !defined $biggest || $b > $biggest;
-						}
-						$est = int($biggest * 8 / 1000 / $secs) if $biggest;
+		# 0.11.67：**整榜要取满**。现场（实测）：`playlist add lxm://b/kw/kw__93` 只进 100 行，
+		# 而 kw 的榜单是"一页 100、total 300、翻页有效"（`tmp/board_paging_probe.py` 实测：
+		# page1/2/3 首行各不相同）⇒ 从前只取第一页，整榜被截成 1/3。
+		# tx 则相反：上游 total=100、翻 3 页都是同一批 ⇒ 分页循环自然停在 1 页，不会多打请求。
+		# 上限沿用既有的 300（与歌单详情窗口/m3u 一致），最多 4 页，且**页失败即用已有的收尾**。
+		my $CAP = 300;
+		my $MAXPAGE = 4;
+		my (@list, $page, $seen, $done);
+		my $finished = 0;      # ⚠️ 不能用 `$done->{ran}`：$done 是 CODE ref，当 hashref 用会直接抛
+		                       # "Not a HASH reference"（0.11.67 第一版现场：整榜入队 0 行、静默失败）
+		$page = 1;
+		my $fetch;                      # 递归闭包：一页一页取，够了/取不动就收尾
+		$fetch = sub {
+			Plugins::LxMusic::Helper->request(
+				action  => ($kind eq 'board' ? 'boardlist' : 'songlistdetail'),
+				info    => ($kind eq 'board'
+					? { source => $src, bangid => $id, page => $page }
+					: { source => $src, id     => $id, page => $page }),
+				timeout => 45,
+				cb      => sub {
+					my ($res) = @_;
+					my $got = ($res->{ok} && $res->{data} && ref($res->{data}{list}) eq 'ARRAY')
+						? $res->{data}{list} : undef;
+					if (!$got || !@$got) {
+						# 第一页就空 ⇒ 真失败；后续页空 ⇒ 正常收尾
+						$log->error("LxMusic: $kind explode failed (page $page): "
+							. ($res->{error} || 'empty list')) unless @list;
+						return $done->();
 					}
-					$class->publishQueueMetadata($u, {
-						title   => $name,
-						secs    => $secs,
-						kbps    => $est,
-						quality => $q,
-					});
-					# 0.11.32：这里不再自己攒 @repub 快照——封面/歌名已进 %METADATA，
-					# 由 playlist 通知的**尾部去抖**统一在"建队结束后"按队列实际内容补发。
-					push @urls, $u;
-				}
-				$cb->(\@urls);
+					# 跨页去重（kw 这类源翻页边界可能重叠）
+					my $added = 0;
+					for my $t (@$got) {
+						next unless ref($t) eq 'HASH';
+						my $key = $t->{songmid} // $t->{hash} // $t->{id} // $t->{name};
+						next if !defined $key || $seen->{$key}++;
+						push @list, $t;
+						$added++;
+					}
+					my $total = $res->{data}{total} // 0;
+					my $full  = (@list >= $CAP) || ($total && @list >= $total) || $added == 0;
+					if ($full || $page >= $MAXPAGE) {
+						$log->warn("LxMusic: $kind explode src=$src id=$id pages=$page rows="
+							. scalar(@list) . " total=$total");
+						return $done->();
+					}
+					$page++;
+					$log->info("LxMusic: $kind explode src=$src id=$id page $page (have "
+						. scalar(@list) . "/$total)");
+					$fetch->();
+				},
+			);
+		};
+		$done = sub {
+			return if $finished;
+			$finished = 1;
+			my @out = @list > $CAP ? @list[ 0 .. $CAP - 1 ] : @list;
+			if (!@out) { return $cb->([]) }
 
-				# 0.11.29 曾在这里用 `setTimer($client, ...)` 补发；0.11.32 撤掉：
-				# 实测 **`$client` 当宿主的定时器会被 LMS 在队列变更时 kill**（同一次测量里
-				# `__PACKAGE__` 宿主的定时器照常触发，这个从不触发）⇒ 补发改由**自持 `$REPUB_OWNER`**
-				# 的尾部去抖负责。
-				# 0.11.49：这里**主动排一次**（确定性触发）——整榜入队的落点就是本函数，
-				# 不再依赖"LMS 会不会为这次入队发通知"（那正是自激回路的入口）。
-				_schedule_republish();
-			},
-		);
+			my $q = $prefs->get('quality') || '320k';
+			my @urls;
+			for my $t (@out) {
+				my $name = ($t->{singer} ? $t->{singer} . ' - ' : '') . ($t->{name} || '?');
+				my $u = $class->buildUrl(
+					music => $t,
+					src   => ($t->{source} || $src),
+					type  => $q,
+					name  => $name,
+				);
+				next unless $u;
+				# 入队前发布队列元数据（歌名/时长/封面/码率估算）——队列行渲染靠它，零额外 API
+				$class->_publish_cover($u, ($t->{source} || $src), $t);
+				my $secs = _secs_of_interval($t->{interval});
+				my $est;
+				if ($secs && ref($t->{types}) eq 'ARRAY') {
+					my $biggest;
+					for my $ty (@{ $t->{types} }) {
+						next unless ref $ty eq 'HASH';
+						my $b = eval { Plugins::LxMusic::Plugin::_bytesOf($ty->{size}) };
+						next unless $b;
+						$biggest = $b if !defined $biggest || $b > $biggest;
+					}
+					$est = int($biggest * 8 / 1000 / $secs) if $biggest;
+				}
+				$class->publishQueueMetadata($u, {
+					title   => $name,
+					secs    => $secs,
+					kbps    => $est,
+					quality => $q,
+				});
+				push @urls, $u;
+			}
+			$log->warn("LxMusic: $kind explode handing " . scalar(@urls)
+				. ' urls to LMS (from ' . scalar(@out) . ' rows)');
+			$cb->(\@urls);
+
+			# 0.11.49：这里**主动排一次**（确定性触发）——整榜入队的落点就是本函数，
+			# 不再依赖"LMS 会不会为这次入队发通知"（那正是自激回路的入口）。
+			_schedule_republish();
+		};
+		$fetch->();
 		return;
 	}
 
