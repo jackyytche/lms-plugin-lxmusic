@@ -83,6 +83,7 @@ sub new_run {
 	# 0.11.57：每个场景先清"死源熔断"，否则前两个场景的失败会把某些
 	# (源×平台×档位) 三元组闸掉，后面的场景根本不会再派候选（这正是熔断的设计行为）。
 	Plugins::LxMusic::Helper::_breaker_reset();
+	Plugins::LxMusic::Helper::_score_reset();      # 0.11.63：分数也要隔离，否则场景之间互相影响派发顺序
 	Slim::Utils::Timers::resetForTest();
 	my @got;
 	Plugins::LxMusic::Helper->resolveTrack(
@@ -279,6 +280,47 @@ sub new_run_budget {
 		$H->coverThumb($tx, undef));
 	check('thumb: 未知域 -> 原样',
 		$H->coverThumb('https://example.com/a.jpg', 300) eq 'https://example.com/a.jpg');
+}
+
+# ---------- 9. 每（源 × 平台）自适应排序（0.11.63） ----------
+{
+	my $H = 'Plugins::LxMusic::Helper';
+
+	# 9a) 没有任何数据 ⇒ 保持注册表顺序（稳定排序，绝不因为"没见过"就乱排）
+	@launched = ();
+	%cb = ();
+	$H->_breaker_reset();
+	$H->_score_reset();
+	Plugins::LxMusic::Helper->resolveTrack(music => $track, src => 'wy', type => 'flac', cb => sub { });
+	check('score: 无数据时保持注册表顺序（A 先）',
+		@launched == 2 && $launched[0]{id} eq 'A', 'order=' . join(',', map { $_->{id} } @launched));
+
+	# 9b) A 在 wy 上失败过、B 在 wy 上又快又成功 ⇒ B 必须排到前面
+	Plugins::LxMusic::Helper::_score_note(Plugins::LxMusic::Helper::_score_key({ id => 'A', name => 'srcA' }, 'wy'), 0, 3000);
+	Plugins::LxMusic::Helper::_score_note(Plugins::LxMusic::Helper::_score_key({ id => 'B', name => 'srcB' }, 'wy'), 1, 200);
+	@launched = ();
+	%cb = ();
+	$H->_breaker_reset();
+	Plugins::LxMusic::Helper->resolveTrack(music => $track, src => 'wy', type => 'flac', cb => sub { });
+	check('score: 按（源×平台）分数重排（B 先）',
+		@launched == 2 && $launched[0]{id} eq 'B', 'order=' . join(',', map { $_->{id} } @launched));
+
+	# 9c) 分数是**分平台**的：B 在 kw 上的成功不能影响 wy 的顺序
+	$H->_score_reset();
+	Plugins::LxMusic::Helper::_score_note(Plugins::LxMusic::Helper::_score_key({ id => 'B', name => 'srcB' }, 'kw'), 1, 100);
+	@launched = ();
+	%cb = ();
+	$H->_breaker_reset();
+	Plugins::LxMusic::Helper->resolveTrack(music => $track, src => 'wy', type => 'flac', cb => sub { });
+	check('score: 分平台隔离（kw 的数据不影响 wy 顺序）',
+		@launched == 2 && $launched[0]{id} eq 'A', 'order=' . join(',', map { $_->{id} } @launched));
+
+	# 9d) 分数表是只读诊断口（设置页/日志可用）
+	my $st = $H->score_state;
+	check('score: score_state 能读出计数', ref($st) eq 'HASH' && exists $st->{ 'B|kw' }
+		&& $st->{ 'B|kw' }{ok} == 1, join(',', sort keys %$st));
+
+	$H->_score_reset();
 }
 
 print $failed ? "\n$failed FAILED\n" : "\nALL PASS\n";

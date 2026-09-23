@@ -374,6 +374,48 @@ sub _caps_qualitys {
 sub caps_state { return { map { $_ => [ sort keys %{ $CAPS{$_} } ] } keys %CAPS } }
 sub _caps_reset { %CAPS = (); %CAPS_AT = (); return 1 }
 
+# ---------- 0.11.63：每（源 × 平台）**自适应排序** ----------
+# 起因（0.11.62 轮实测，`docs/source-eval-independent-note.md`）：候选从前只按**注册表顺序**派发，
+# 而熔断 `%SRC_BAD` 只记"失败"、不记"谁快/谁稳"。于是多挂一个源就可能把点歌从 0.96s 拖到 8.35s、
+# 档位还从 flac24bit 掉到 flac（屿溪排在玉宁熙前面失败）。
+# 这里给每个「源 × 平台」累计成功/失败与耗时，派发候选时**按分数排序**：
+#   分数 = 成功率（未知按 0.5 中性）× 权重 - 平均耗时惩罚；同分保持注册表原顺序（稳定排序）。
+# 这样 mg 会自动优先交给玉宁熙、wy 交给全豆要、kw/tx 交给最先成功的那个源 —— 不再需要人工挑源。
+my %SRC_SCORE;      # "srcid|platform" => { ok, fail, ms_sum, ms_n }
+
+sub _score_key { my ($s, $plat) = @_; return ($s->{id} // $s->{name} // '?') . '|' . ($plat || '?') }
+
+sub _score_note {
+	my ($k, $ok, $ms) = @_;
+	my $e = $SRC_SCORE{$k} ||= { ok => 0, fail => 0, ms_sum => 0, ms_n => 0 };
+	$e->{ $ok ? 'ok' : 'fail' }++;
+	if (defined $ms && $ms > 0) { $e->{ms_sum} += $ms; $e->{ms_n}++ }
+	return;
+}
+
+# 分数越大越优先；没有任何数据 ⇒ 0（中性，保持原顺序）
+sub _score_of {
+	my ($k) = @_;
+	my $e = $SRC_SCORE{$k} or return 0;
+	my $n = $e->{ok} + $e->{fail} or return 0;
+	my $rate = $e->{ok} / $n;                       # 0..1
+	my $avg  = $e->{ms_n} ? $e->{ms_sum} / $e->{ms_n} : 0;
+	return $rate * 1000 - ($avg > 0 ? $avg / 100 : 0);   # 1 秒平均耗时扣 10 分
+}
+
+# 按分数排序（稳定：同分保持原顺序），供 resolveTrack 派发候选用。
+# 传平台是因为分数是**每（源 × 平台）**的：某源 kw 很快、mg 很慢，两边的排序要各算各的。
+sub _score_sort {
+	my ($class, $plat, @cand) = @_;
+	my $i = 0;
+	my @tagged = map { [ $_, $i++, _score_of(_score_key($_->[1], $plat)) ] } @cand;
+	@tagged = sort { $b->[2] <=> $a->[2] || $a->[1] <=> $b->[1] } @tagged;
+	return map { $_->[0] } @tagged;
+}
+
+sub score_state { return { map { $_ => { %{ $SRC_SCORE{$_} } } } keys %SRC_SCORE } }
+sub _score_reset { %SRC_SCORE = (); return 1 }
+
 # 多源解析：resolveTrack(music=>{}, src=>'kw', type=>'320k', cb=>sub{...})
 # cb 收到 { ok, url, source, quality, verified, actualKbps, tries=>[{source,quality,why|ok}] }
 sub resolveTrack {
@@ -404,6 +446,7 @@ sub resolveTrack {
 		my ($useCaps) = @_;
 		my (@c, @t);
 		for my $q (@ladder) {
+			my @tier;
 			for my $s (@$sources) {
 				my $k = _src_key($s, $plat, $q);
 				if (_src_tripped($k)) { push @t, ($s->{name} // '?') . "\@$q"; next; }
@@ -416,8 +459,10 @@ sub resolveTrack {
 						if ($qs && !$qs->{$q}) { push @noqual, ($s->{name} // '?') . "\@$q"; next; }
 					}
 				}
-				push @c, [ $q, $s ];
+				push @tier, [ $q, $s ];
 			}
+			# 0.11.63：**档位内**按（源 × 平台）分数排序（音质优先级不变：档位仍是外层循环）
+			push @c, $class->_score_sort($plat, @tier);
 		}
 		return (\@c, \@t);
 	};
@@ -478,6 +523,8 @@ sub resolveTrack {
 		return if $done;                 # 并行窗口下只交付一次
 		$done = 1;
 		_src_ok(_src_key($src, $plat, $q));   # 0.11.57：成功即清零该三元组的失败计数
+		# 0.11.63：记下"这个源在这个平台上成功且多快" ⇒ 影响后续派发顺序
+		_score_note(_score_key($src, $plat), 1, $tm->{ms});
 		my $suspect = ($kbps && $kbps < 64) ? 1 : 0;
 		if ($suspect) {
 			$log->warn("LxMusic resolve: SUSPECT short/preview file ([" . ($src->{name} // '?')
@@ -547,6 +594,7 @@ sub resolveTrack {
 			push @tries, { source => $src->{name}, quality => $q, why => 'verify: ' . ($pi->{error} // '?'), %$tm };
 			$log->warn("LxMusic resolve: verify rejected [" . $src->{name} . "] $q: " . ($pi->{error} // '?'));
 			_src_failed(_src_key($src, $plat, $q), ($src->{name} // '?') . "\@$q");   # 0.11.57 熔断计数
+			_score_note(_score_key($src, $plat), 0, $tm->{ms});   # 0.11.63：校验被拒也算这个源在这平台上不靠谱
 			$settle->();
 		}, $prio);
 		return;
@@ -619,6 +667,7 @@ sub resolveTrack {
 							. (@tail ? ' {' . join(' | ', map { substr($_, 0, 100) } @tail) . '}' : '');
 						push @tries, { source => $src->{name}, quality => $q, why => $why, %tm };
 						_src_failed(_src_key($src, $plat, $q), ($src->{name} // '?') . "\@$q");   # 0.11.57 熔断计数
+						_score_note(_score_key($src, $plat), 0, $tm{ms});   # 0.11.63 排序用
 						return $settle->();
 					}
 					my $friendly = $class->streamFriendly($url) ? 1 : 0;
