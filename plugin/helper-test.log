@@ -1,8 +1,6 @@
-Ambiguous call resolved as CORE::warn(), qualify as such or use & at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/Slim/Utils/Log.pm line 27.
-Ambiguous call resolved as CORE::warn(), qualify as such or use & at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/Slim/Utils/Log.pm line 28.
-Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 592.
+Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 1042.
 	(Maybe you meant system() when you said exec()?)
-Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 690.
+Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 1142.
 	(Maybe you meant system() when you said exec()?)
 ok - parse ok=1
 ok - parse data url
@@ -21,11 +19,9 @@ ok - installSource wrote the file
 ok - installSource rejects junk
 
 ALL PASS
-Ambiguous call resolved as CORE::warn(), qualify as such or use & at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/Slim/Utils/Log.pm line 27.
-Ambiguous call resolved as CORE::warn(), qualify as such or use & at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/Slim/Utils/Log.pm line 28.
-Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 592.
+Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 1042.
 	(Maybe you meant system() when you said exec()?)
-Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 690.
+Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 1142.
 	(Maybe you meant system() when you said exec()?)
 LOG-WARN: LxMusic resolve: try [srcA] type=flac
 LOG-WARN: LxMusic resolve: try [srcB] type=flac
@@ -39,6 +35,33 @@ LOG-WARN: LxMusic resolve: [srcA] flac 直链无音频后缀（脚本中转链�
 LOG-WARN: LxMusic resolve: [srcB] flac 直链无音频后缀（脚本中转链），暂缓
 LOG-WARN: LxMusic resolve: 没有"播放器友好"直链，改用兜底中转链 [srcA] http://relay.example/kw/kw.php?type=mp3&id=1
 LOG-WARN: LxMusic resolve OK: [srcA] type=flac verified=1 ~1000kbps total=0ms path=worker friendly=0 url=http://relay.example/kw/kw.php?type=mp3&id=1
+LOG-WARN: LxMusic caps: [B.js] declares kw(128k/320k)
+LOG-WARN: LxMusic resolve: try [srcA] type=flac
+LOG-WARN: LxMusic resolve FAILED after 1 tries: srcA@flac: x
+LOG-WARN: LxMusic caps: [B.js] declares wy(flac)
+LOG-WARN: LxMusic resolve: try [srcA] type=flac
+LOG-WARN: LxMusic resolve: try [srcB] type=flac
+LOG-WARN: LxMusic caps: [B.js] declares wy(128k/320k)
+LOG-WARN: LxMusic resolve: try [srcA] type=flac
+LOG-WARN: LxMusic resolve: try [srcA] type=flac
+LOG-WARN: LxMusic resolve: try [srcB] type=flac
+LOG-WARN: LxMusic resolve: resolve budget 1s exceeded (queued=0 inflight=2)
+LOG-WARN: LxMusic resolve: try [srcA] type=flac
+LOG-WARN: LxMusic resolve: try [srcB] type=flac
+LOG-WARN: LxMusic resolve FAILED after 2 tries: srcA@flac: x; srcB@flac: y
+Use of uninitialized value $TIER_ORDER[7] in hash element at /loader/0x563771ab3e30/Plugins/LxMusic/ProtocolHandler.pm line 1236.
+LOG-WARN: LxMusic resolve: try [srcA] type=flac
+LOG-WARN: LxMusic resolve: try [srcB] type=flac
+LOG-WARN: LxMusic resolve: try [srcB] type=flac
+LOG-WARN: LxMusic resolve: try [srcA] type=flac
+LOG-WARN: LxMusic resolve: try [srcA] type=flac
+LOG-WARN: LxMusic resolve: try [srcB] type=flac
+LOG-WARN: LxMusic caps: [A.js] declares kw(128k/flac), wy(flac)
+LOG-WARN: LxMusic state: loaded 1 caps, 2 scored pairs from /tmp/mgvfksRtHC/state.json
+LOG-WARN: LxMusic resolve: try [srcB] type=flac
+LOG-WARN: LxMusic resolve: try [srcA] type=flac
+LOG-WARN: LxMusic state: /tmp/mgvfksRtHC/state.json 解析失败，忽略（'"' expected, at character offset 2 (before "this is not json") at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 452.
+）
 ok - window: 未回调前已启动 2 个候选
 ok - window: 两个候选来自不同源
 ok - deliver: 先到者交付
@@ -50,5 +73,69 @@ ok - allfail: 错误里提到两个源
 ok - deferred: 只交付一次
 ok - deferred: 两个候选都先被标记为暂缓
 ok - deferred: 交付的是中转链（兜底路径）
+ok - caps: 未声明该平台的源不再生成候选（只派 A）
+ok - caps: 失败路径仍然只回调一次
+ok - caps: 声明支持的平台照旧参与
+ok - caps: 档位不支持时该源被裁掉
+ok - budget: 预算内没有候选返回 ⇒ 尚未回调
+ok - budget: 超预算只回调一次
+ok - budget: 回调标了 timeout 且 ok=0
+ok - budget: 错误信息说明是预算超时
+ok - bg: 预热的 bg 优先级传到了候选请求
+ok - bg: 设备空闲时 _load_busy 为假（不会误丢后台请求）
+ok - bg: 照常收尾（只回调一次）
+ok - tier: flac 且位深 24 -> flac24bit
+ok - tier: flac 且位深 16 -> flac
+ok - tier: flac 无位深 + 1647kbps + 上游只声明 flac -> flac（不再吹成 24bit）
+ok - tier: flac 无位深 + 1709kbps + 上游含 flac24bit -> flac24bit
+ok - tier: mp3 320kbps -> 320k
+ok - tier: mp3 256kbps -> 256k
+ok - tier: mp3 192kbps -> 192k
+ok - tier: mp3 96kbps -> 128k
+ok - tier: m4a -> aac
+ok - tier: 未知格式原样大写
+ok - label: 192k -> MP3 192kbps
+ok - label: 256k -> MP3 256kbps
+ok - label: 已是人读标签则幂等（不再被 uc 成 FLAC 24BIT）
+ok - thumb: wy 追加 param=300y300
+ok - thumb: wy 已有 param 不重复追加
+ok - thumb: tx R500x500 -> R300x300
+ok - thumb: kw albumcover/500 -> /300/
+ok - thumb: kg 没有尺寸变体 -> 原样
+ok - thumb: mg 没有尺寸变体 -> 原样
+ok - thumb: size=0 关闭改写 -> 原样
+ok - thumb(big): 显式 500 -> param=500y500
+ok - thumb(big): kind=big 走 coverThumbBig（默认 500）
+ok - thumb: 列表档仍是 300（未被大图档带偏）
+ok - thumb: 未知域 -> 原样
+ok - score: 无数据时保持注册表顺序（A 先）
+ok - score: 按（源×平台）分数重排（B 先）
+ok - score: 分平台隔离（kw 的数据不影响 wy 顺序）
+ok - score: score_state 能读出计数
+ok - state: state_save 写出文件
+ok - state: reset 后能力表为空
+ok - state: state_load 成功
+ok - state: 能力表恢复
+ok - state: 分数恢复（B|wy ok=1 / A|wy fail=1）
+ok - state: 恢复的分数真的影响派发顺序（B 先）
+ok - state: 坏文件只告警不抛异常
 
 ALL PASS
+Statement unlikely to be reached at t_build/Plugins/LxMusic/Helper.pm line 1042.
+	(Maybe you meant system() when you said exec()?)
+Statement unlikely to be reached at t_build/Plugins/LxMusic/Helper.pm line 1142.
+	(Maybe you meant system() when you said exec()?)
+Use of uninitialized value $TIER_ORDER[7] in hash element at /loader/0x5566f44b5d70/Plugins/LxMusic/ProtocolHandler.pm line 1236.
+ok - A1 首轮写满 300 行
+ok - A2 之后 4 轮"通知风暴"零写入（指纹止血）
+ok - B0 订阅者已注册
+ok - B1 playlist newmetadata 不排补发（自激回路的原料）
+ok - B2 playlist newsong 不排补发
+ok - B3 playlist open 不排补发
+ok - B4 playlist pause 不排补发
+ok - B5 playlist loadtracks 排一次尾部补发（改队列成员）
+ok - C1 10 轮回声回路累计写入 0 行
+ok - D1 连续"写了却队列没变" ⇒ 进入 60s 隔离
+ok - D2 隔离期内即使内容变了也不写
+
+ALL OK
