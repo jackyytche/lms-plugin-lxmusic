@@ -164,7 +164,10 @@ async function main(std, os) {
 		const fBody = '/tmp/lx-b-' + uniq, fHdr = '/tmp/lx-h-' + uniq, fErr = '/tmp/lx-e-' + uniq, fIn = '/tmp/lx-i-' + uniq;
 		const timeout = Math.min(Math.max(Number(options.timeout) || 15, 1), 60);
 
-		const args = ['curl', '-sS', '-L', '--max-time', String(timeout), '-D', fHdr, '-o', fBody, '--stderr', fErr];
+		// 0.11.66：**加 `--compressed`** —— 让 curl 主动声明并透明解压 gzip/deflate。
+		// 起因：静态扫描 178 个候选源发现有源依赖 `lx.utils.zlib.inflate`，而我们没有实现它；
+		// 绝大多数场景只是"上游把 JSON 压了"，curl 自己就能解开，不需要源去 inflate。
+		const args = ['curl', '-sS', '-L', '--compressed', '--max-time', String(timeout), '-D', fHdr, '-o', fBody, '--stderr', fErr];
 		if (options.method) args.push('-X', String(options.method).toUpperCase());
 		const method = String(options.method || 'GET').toUpperCase();
 		if (options.headers) {
@@ -505,8 +508,11 @@ async function main(std, os) {
 		utils: {
 			crypto: {
 				md5: (data) => md5Hex(data),
-				aesEncrypt: () => { throw new Error('shim: aesEncrypt not implemented yet'); },
-				rsaEncrypt: () => { throw new Error('shim: rsaEncrypt not implemented yet'); },
+				// 0.11.66：**说明是引擎的限制**，而不是让源看起来"自己坏了"。
+				// 静态扫描 178 个候选源：aesEncrypt 13 个、rsaEncrypt 7 个、randomBytes 7 个（已支持）、
+				// zlib.inflate/deflate 需要看源（curl 侧已加 --compressed，能挡住绝大多数 gzip 场景）。
+				aesEncrypt: () => { throw new Error('ENGINE_UNSUPPORTED: lx.utils.crypto.aesEncrypt'); },
+				rsaEncrypt: () => { throw new Error('ENGINE_UNSUPPORTED: lx.utils.crypto.rsaEncrypt'); },
 				randomBytes,
 			},
 			buffer: {
@@ -516,8 +522,8 @@ async function main(std, os) {
 					: (enc === 'base64' ? b64Encode(buf) : utf8Decode(buf))),
 			},
 			zlib: {
-				inflate: () => { throw new Error('shim: zlib.inflate not implemented yet'); },
-				deflate: () => { throw new Error('shim: zlib.deflate not implemented yet'); },
+				inflate: () => { throw new Error('ENGINE_UNSUPPORTED: lx.utils.zlib.inflate'); },
+				deflate: () => { throw new Error('ENGINE_UNSUPPORTED: lx.utils.zlib.deflate'); },
 			},
 		},
 		currentScriptInfo: null,
@@ -551,7 +557,7 @@ async function main(std, os) {
 		const run = (extra) => {
 			// 必须 -L 跟随重定向：真实播放链路会跟随（binHttp 也是手动跟 3 跳），
 			// 不跟随就会把 301/302 误判成不可播（0.8.5 现场：长青音源的直链是 301，被误杀）
-			const a = ['curl', '-sS', '-L', '--max-redirs', '3', '--max-time', String(tmo),
+			const a = ['curl', '-sS', '-L', '--compressed', '--max-redirs', '3', '--max-time', String(tmo),
 				'-A', 'Mozilla/5.0', '-D', hdrF, '-o', bodyF, '--max-filesize', '400000'];
 			for (const x of extra) a.push(x);
 			a.push(url);
@@ -801,7 +807,7 @@ async function main(std, os) {
 			const mHost = String(url).match(/^https?:\/\/([^\/]+)/i);
 			const capSec = (mHost && /migu\.cn/i.test(mHost[1])) ? Math.min(3, baseCap) : baseCap;
 			const tmo = Math.min(capSec, Math.max(2, Math.ceil((opts.timeout || 15000) / 1000)));
-			const args = ['curl', '-sS', '--max-time', String(tmo),
+			const args = ['curl', '-sS', '--compressed', '--max-time', String(tmo),
 				'-o', outBin, '-D', outHdr, '--path-as-is', '--stderr', outErr];
 			const hdrs = opts.headers || {};
 			for (const k of Object.keys(hdrs)) {

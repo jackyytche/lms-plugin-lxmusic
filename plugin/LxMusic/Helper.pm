@@ -756,6 +756,13 @@ sub resolveTrack {
 						@tail = @tail[ -2 .. -1 ] if @tail > 2;
 						my $why = ($res->{error} // 'no url')
 							. (@tail ? ' {' . join(' | ', map { substr($_, 0, 100) } @tail) . '}' : '');
+						# 0.11.66：把"引擎缺功能"从源自身错误里区分出来（否则看起来像源坏了）
+						if ($why =~ /ENGINE_UNSUPPORTED:\s*([\w.]+)/) {
+							my $need = $1;
+							$log->warn('LxMusic resolve: [' . ($src->{name} // '?')
+								. "] needs an engine feature we do not have yet: $need");
+							$why = "engine-unsupported:$need (plugin engine gap, not the source's fault) | $why";
+						}
 						push @tries, { source => $src->{name}, quality => $q, why => $why, %tm };
 						_src_failed(_src_key($src, $plat, $q), ($src->{name} // '?') . "\@$q");   # 0.11.57 熔断计数
 						_score_note(_score_key($src, $plat), 0, $tm{ms});   # 0.11.63 排序用
