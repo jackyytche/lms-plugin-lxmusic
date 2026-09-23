@@ -74,10 +74,11 @@ sub prefs {
 		quality bridgeTimeout helperConcurrency resolveTtl coverProxy
 		boardsKw boardsKg boardsTx boardsWy boardsMg qualityFallback verifyUrl autoSkipOnError
 		workerEnable workerIdle preferStreamable
+		warmEnable warmMax resolveBudget sdkWorkers
 	));
 }
 
-my @BOOL_PREFS = qw(coverProxy boardsKw boardsKg boardsTx boardsWy boardsMg qualityFallback verifyUrl autoSkipOnError workerEnable preferStreamable);
+my @BOOL_PREFS = qw(coverProxy boardsKw boardsKg boardsTx boardsWy boardsMg qualityFallback verifyUrl autoSkipOnError workerEnable preferStreamable warmEnable);
 
 sub handler {
 	my ($class, $client, $params, $callback, $httpClient, $response) = @_;

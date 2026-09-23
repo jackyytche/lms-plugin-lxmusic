@@ -781,8 +781,12 @@ sub request {
 			);
 		}
 		elsif ($SDK_WORKER_ACTIONS{$action} && $source eq $SDK) {
+			# 0.11.59：**sdk 动作走 worker 池**（默认 2 个）。0.11.43 把它们塞进**同一个**串行 worker
+			# ⇒ 设备实测（突发 8 并发 × 4 轮）：p50 84ms 但 p90 6960ms —— 排队排出来的。池化后
+			# 下钻一层（列表→详情）不再互相堵；池位用"负载最小者"，没起的池位优先。
 			return if $class->_worker_submit(
-				source   => $SDK,
+				source   => $class->_sdk_slot,
+				sdkArg   => $SDK,          # argv[1] 必须是真 bundle 路径（shim 用它判定 worker 形态）
 				sourceId => $args{sourceId},
 				action   => $action,
 				info     => $args{info},
@@ -1081,8 +1085,9 @@ sub _worker_poll {
 			$w->{info} = $1;
 			$log->warn("LxMusic worker($src): READY $1 (warm)");
 			# 0.11.58：READY 里带源声明的能力表 ⇒ 立即可用（无需再等一次 CAPS 行）
+			# 0.11.59：按 `$w->{src}`（真 argv1 路径）归档，别用 key——sdk 池的 key 是 `$SDK#0`
 			my $info = eval { $JSON->decode($1) };
-			Plugins::LxMusic::Helper->_caps_note($w->{key}, $info->{caps})
+			Plugins::LxMusic::Helper->_caps_note($w->{src}, $info->{caps})
 				if ref($info) eq 'HASH' && $info->{caps};
 			while (defined(my $qid = shift @{ $w->{queue} })) {
 				my $qjob = $w->{jobs}{$qid} or next;
@@ -1093,7 +1098,7 @@ sub _worker_poll {
 		# 0.11.58：源在 inited 时声明的能力表（fork 与 worker 两条路径都会打这一行）
 		if ($line =~ /^CAPS (.*)$/s) {
 			my $c = eval { $JSON->decode($1) };
-			Plugins::LxMusic::Helper->_caps_note($w->{key}, $c) if ref($c) eq 'HASH';
+			Plugins::LxMusic::Helper->_caps_note($w->{src}, $c) if ref($c) eq 'HASH';
 			next;
 		}
 		if ($line =~ /^RESULT (\d+) (.*)$/s) {
@@ -1185,11 +1190,33 @@ sub _load_busy {
 	return 0;
 }
 
+# 0.11.59：sdk worker 池——挑一个负载最小的池位（没起过的池位优先，冷启动只需一次）。
+# 池大小 `sdkWorkers`（默认 2，范围 1~4）：设备是双核 i386，2 个足以让"列表→详情"不互相排队。
+sub _sdk_slot {
+	my ($class) = @_;
+	my $n = _pref('sdkWorkers', 2);
+	$n = 1 if !$n || $n < 1;
+	$n = 4 if $n > 4;
+	my ($best, $bestload);
+	for my $i (0 .. $n - 1) {
+		my $k = $SDK . '#' . $i;
+		my $w = $WORKER{$k};
+		my $load = ($w && !$w->{dead} && $w->{pid} && kill(0, $w->{pid}))
+			? scalar(keys %{ $w->{jobs} }) : -1;      # -1 = 没起/已死 ⇒ 最优先
+		if (!defined $bestload || $load < $bestload) { $bestload = $load; $best = $k }
+		last if defined $bestload && $bestload <= 0;
+	}
+	return $best // ($SDK . '#0');
+}
+
 # 把一个请求交给常驻 worker；返回 1 = 已接管，0 = 调用方应退回 fork 路径
 sub _worker_submit {
 	my ($class, %a) = @_;
 	# 探测 worker：与取链 worker 分开（argv1='-'），长探测不会卡住取链
-	my ($key, $arg1) = $a{probe} ? ($PROBE_KEY, '-') : ($a{source}, undef);
+	# sdk worker 池（0.11.59）：key 是 `$SDK#<池位>`，argv1 仍是真 bundle 路径
+	my ($key, $arg1) = $a{probe} ? ($PROBE_KEY, '-')
+		: defined $a{sdkArg} ? ($a{source}, $a{sdkArg})
+		: ($a{source}, undef);
 	my $w = $WORKER{$key};
 	$w = $class->_worker_spawn($key, $arg1) unless $w && !$w->{dead} && kill(0, $w->{pid});
 	return 0 unless $w;
