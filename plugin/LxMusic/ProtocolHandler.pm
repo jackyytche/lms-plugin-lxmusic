@@ -54,6 +54,12 @@ use Slim::Utils::Log;
 use Slim::Utils::Prefs;
 use Slim::Utils::Timers;      # 0.11.29：整榜入队后延迟补发队列元数据（见 explodePlaylist）
 
+# ⚠️ 0.11.76：**自己加载 JSON::XS**。从前这里直接 `JSON::XS->new`，靠的是
+# `use Plugins::LxMusic::Helper`（Helper 里有 `use JSON::XS`）顺带把它装进来 ——
+# 一种隐式依赖：任何"Helper 被替换/未加载"的场景都会在**编译期**炸
+# `Can't locate object method "new" via package "JSON::XS"`（测试存根环境现场）。
+use JSON::XS ();
+
 use Plugins::LxMusic::Helper;
 my $log = logger('plugin.lxmusic');
 Slim::Player::ProtocolHandlers->registerHandler('lxm', __PACKAGE__);
@@ -501,7 +507,9 @@ sub _coverFromMusic {
 		return 'https://imge.kugou.com/stdmusic/240/' . $m->{albumId} . '.jpg';
 	}
 	if (($src || '') eq 'tx' && ($m->{albumMid} || '') =~ /^[A-Za-z0-9]+$/) {
-		my $s = Plugins::LxMusic::Helper->coverThumbSize(undef, 'big') || 500;
+		# ⚠️ 0.11.76：`Helper::coverThumbSize` 没有 `$class` 形参，必须按**函数**调用
+		# （写成 `Helper->coverThumbSize` 会把类名当尺寸，返回 0 ⇒ 恒落到 500）。
+		my $s = Plugins::LxMusic::Helper::coverThumbSize(undef, 'big') || 500;
 		return 'https://y.gtimg.cn/music/photo_new/T002R' . $s . 'x' . $s
 			. 'M000' . $m->{albumMid} . '.jpg';
 	}
@@ -517,7 +525,8 @@ sub _coverFromMusic {
 # 统一到 `Plugin::_coverOf` 之后，队列行与正在播放行拿到的是同一个 URL。
 sub _cover_url {
 	my ($src, $music) = @_;
-	my $cover = eval { Plugins::LxMusic::Plugin::_coverOf($music) } // '';
+	# 0.11.72：这里是**队列/正在播放**元数据的封面（不是列表行），要 500 档
+	my $cover = eval { Plugins::LxMusic::Plugin::_coverOf($music, 'big') } // '';
 	$cover = _coverFromMusic($src, $music) unless $cover;
 	return $cover;
 }
@@ -1233,7 +1242,10 @@ sub qualityLabel {
 #   的就是"标签与来源自相矛盾"。规则：在"≤ 推出来的档位"的上游声明里取最高的那个。
 my @TIER_ORDER = qw(128k 192k 256k 320k flac flac24bit hires);
 my %TIER_RANK;
-{ my $i = 0; $TIER_RANK{ $TIER_ORDER[$i] } = ++$i for 0 .. $#TIER_ORDER }
+# ⚠️ 0.11.76：**别**写成 `$TIER_RANK{ $TIER_ORDER[$i] } = ++$i for 0 .. $#TIER_ORDER`——
+# `++$i` 可能先求值，最后一轮下标变成 7（越界）⇒ 登记到 undef 上，
+# **`hires` 永远没有排名**（perl 还会每轮报 "uninitialized value $TIER_ORDER[7]"）。
+{ my $i = 0; for my $t (@TIER_ORDER) { $TIER_RANK{$t} = ++$i } }
 
 sub _actualTier {
 	my ($class, $fmt, $kbps, $bits, $declared) = @_;

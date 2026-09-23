@@ -214,7 +214,18 @@ sub lmsFormat {
 #   · kg `imge.kugou.com/stdmusic/{120,150,240,500}/<id>.jpg` 四个尺寸**同一份字节**
 #   · mg 加 `?size=/?w=/?param=/?width=` 全部 403，路径段变体 404
 sub coverThumbSize {
-	my ($size, $kind) = @_;
+	my (@a) = @_;
+	# ⚠️ 0.11.76：**方法/函数双调用防御**。本函数历史上只按"函数"写（形参里没有 `$class`），
+	# 却被 `Plugins::LxMusic::Helper->coverThumbSize(...)` 这样当"方法"调用过 ⇒ 第一个实参
+	# 收到类名字符串 `"Plugins::LxMusic::Helper"`，一路走到 `int($v)` = **0**
+	# ⇒ 缩略尺寸**静默失效**（现场：kw 的代理目标里根本没有尺寸段、tx 恒 500、
+	# "列表 300 / 队列·正在播放 500"的分档形同虚设）。
+	# 这里丢掉"看起来像**包名**"的首参（`Plugins::…`/`Slim::…`/`main::…`），两种调用法都对；
+	# 数字/undef/引用/普通字符串一律不动（收紧到包名前缀，避免误吞真实参数）。
+	if (@a && defined $a[0] && !ref $a[0] && $a[0] =~ /^(?:Plugins|Slim|main)::/) {
+		shift @a;
+	}
+	my ($size, $kind) = @a;
 	# 0.11.62：**分级尺寸**。列表行只要 54~150px，而"正在播放"面板会请求 300~500px；
 	# 用 300 的源去撑 500 的框会发虚（用户会立刻看出来），所以队列/正在播放用
 	# `coverThumbBig`（默认 500，仍比 wy 的 4.8MB 原图小 7.7 倍）。

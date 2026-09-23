@@ -514,6 +514,7 @@ sub sdkBoardTracksHandler {
 }
 
 # 渲染榜单窗口（0.11.4 从 handler 拆出）：页头 + items + 原生翻页契约
+
 sub board_render {
 	my ($cb, $src, $bangid, $bname, $info, $acc, $list, $total, $index) = @_;
 
@@ -525,8 +526,12 @@ sub board_render {
 	#   albumData        -> 页头 details 行（榜单名 / 来源·总数）
 	# 封面优先级：榜单自带封面（kw kbangserver v9_pic2）→ 第一首的封面兜底。
 	my $cover;
-	if ($info && $info->{img} && $info->{img} =~ m{^https?://}) {
-		$cover = $prefs->get('coverProxy') ? _coverProxyUrl($info->{img}) : $info->{img};
+	my $bimg = ($info && $info->{img}) ? $info->{img} : '';
+	# mg 榜单图偶见相对路径（与曲目路径同一套归一化）
+	$bimg = 'https://d.musicapp.migu.cn' . $bimg if $bimg =~ m{^/};
+	if ($bimg =~ m{^https?://}) {
+		# 0.11.72：mg 走直取（见 _shouldProxyCover；mg 榜单图也是 migu 域）
+		$cover = _shouldProxyCover($bimg) ? _coverProxyUrl($bimg) : $bimg;
 	}
 	elsif (@$acc && $acc->[0]) {
 		$cover = _coverOf($acc->[0]);
@@ -541,7 +546,7 @@ sub board_render {
 	# 原生翻页契约：offset=窗口首曲绝对下标，total=全榜数（Slim/Control/XMLBrowser
 	# L787 count=total、L1002 start-=offset、L1009 按其切窗）。UI 自己渲染页码，
 	# feed 不掺导航行（0.11.3 方案废弃）。
-	$cb->({
+	my $feed = {
 		items    => $tracks,
 		offset   => $index,
 		(defined $total ? (total => $total) : ()),
@@ -554,12 +559,15 @@ sub board_render {
 				? { name => _u('[' . $src . '] · ' . int($total) . ' 首'), type => 'text', label => 'ARTIST' }
 				: { name => _u('[' . $src . ']'), type => 'text', label => 'ARTIST' }),
 		]),
-	});
+	};
+	$cb->($feed);
 	# 诊断（warn 级，需 plugin.lxmusic=DEBUG/WARN 才落盘）：页头按钮依赖 feed 级 play/actions
-	$log->warn(sprintf('LxMusic board_render: src=%s bangid=%s play=%s total=%s rows=%d',
+	$log->warn(sprintf('LxMusic board_render: src=%s bangid=%s play=%s total=%s rows=%d image=%s actions=%s',
 		$src, (length $bangid ? $bangid : '<empty>'),
 		(length $bangid ? "lxm://b/$src/$bangid" : '<none>'),
-		(defined $total ? $total : '?'), scalar(@$tracks)));
+		(defined $total ? $total : '?'), scalar(@$tracks),
+		($cover ? 'yes' : 'NO'),
+		(length $bangid ? join('/', sort keys %{ _board_play_actions($src, $bangid) }) : 'none')));
 }
 
 # 页头播放按钮命令（喜马拉雅 _album_play_actions 同形，只留 *all 键——
@@ -615,6 +623,11 @@ sub _trackItems {
 		);
 		next unless $url;
 		my ($secs, $cover) = (_secsOf($t), _coverOf($t));
+		# 0.11.72：队列行/正在播放用**大档**封面（500），列表行仍用列表档（300）。
+		# 两者是不同的 URL（kw 走代理目标里的尺寸段、mg/tx 直接换尺寸段），
+		# 所以 LMS 的图像缓存不会互相污染：列表页依旧轻，正在播放不再发虚。
+		my $coverBig = _coverOf($t, 'big');
+		$coverBig = $cover if !defined $coverBig || $coverBig eq '';
 
 		# 0.11.56：**列表期也别乱报档位**。此前一律拿"请求档位"（pref，常见 flac24bit）当显示值，
 		# 于是上游只给到 flac/320k 的曲目也写着 "FLAC 24bit" —— 与 LMS 从真实流里读出的
@@ -653,7 +666,7 @@ sub _trackItems {
 			title   => ($singer ne '' ? "$singer - $name" : $name),
 			secs    => $secs,
 			kbps    => $est_kbps,
-			cover   => $cover,
+			cover   => $coverBig,
 			quality => $rowq,
 		});
 		# 0.11.30：记下来，稍后**对真的进了队列的行**再发一遍（见文件末尾 Timer 的注释）
@@ -662,7 +675,7 @@ sub _trackItems {
 			title   => ($singer ne '' ? "$singer - $name" : $name),
 			secs    => $secs,
 			kbps    => $est_kbps,
-			cover   => $cover,
+			cover   => $coverBig,
 			quality => $rowq,
 		};
 		push @items, {
@@ -675,6 +688,16 @@ sub _trackItems {
 		};
 		last if $n >= 1000;   # 安全上限（真分页见 handler 的 index/quantity 处理）
 	}
+	# 0.11.75：**兜底**——万一整个列表一行时长都拿不到（上游既不给 interval 又给不出
+	# 各档体积），LMS 仍然不会把页头按钮渲染出来（门槛见 _secsFromTypes 顶部注释）。
+	# 这里补一条**渲染时被跳过**（`ignore`，达菲模板 `IF item.ignore; NEXT; END`）的
+	# 占位行，唯一作用是让 LMS 的 `itemsHaveAudio` 成立。放在**最后**，前面的行下标不受影响，
+	# 且它不携带任何会被用户看到的内容（无 name/url/image）。
+	if (@items && !grep { defined $_->{duration} } @items) {
+		push @items, { type => 'audio', duration => 1, ignore => 1, __sentinel => 1 };
+		$log->warn('LxMusic: rows=' . scalar(@items) . ' no duration at all -> sentinel row added (head play/add buttons)');
+	}
+
 	$log->debug('LxMusic: rows=' . scalar(@items) . ' without-cover='
 		. scalar(grep { !$_->{image} } @items)
 		. ' without-duration=' . scalar(grep { !defined $_->{duration} } @items)
@@ -709,15 +732,52 @@ sub _trackItems {
 
 # 'mm:ss' / 'hh:mm:ss' -> 秒
 sub _secsOf {
-	my ($t) = @_;
+	my ($t) = _stripClass(@_);
 	my $iv = $t->{interval} || $t->{duration};
-	return undef unless defined $iv && $iv ne '';
-	return int($iv) if $iv =~ /^\d+$/;
-	my @p = split(/:/, $iv);
-	return undef unless @p;
-	my $s = 0;
-	$s = $s * 60 + ($_ || 0) for @p;
-	return $s > 0 ? $s : undef;
+	if (defined $iv && $iv ne '') {
+		return int($iv) if $iv =~ /^\d+$/;
+		my @p = split(/:/, $iv);
+		if (@p) {
+			my $s = 0;
+			$s = $s * 60 + ($_ || 0) for @p;
+			return $s if $s > 0;
+		}
+	}
+	return _secsFromTypes($t);
+}
+
+# 0.11.75（用户报的第 3 个问题：mg 榜单曲目页头没有「播放全部/添加」按钮）：
+# 上游**没给时长**时，用体积 ÷ 档位标称码率估算。
+#
+# 现场（设备实测，`diag=feed` 抓的原始上游行）：
+#   kw 行 interval="02:19"            → 50/50 行有 duration
+#   mg 行 interval=null / duration=null → 0/50 行有 duration
+# 而 LMS 的页头按钮门槛（Slim/Web/XMLBrowser.pm:764-771）要求**至少一行**
+# `type=audio` 且 `defined duration`（否则视为电台列表，按 bug 6531 不显示"全部播放"）：
+#     next unless ($item->{type} && $item->{type} eq 'audio') || ...;
+#     next unless defined $item->{duration} || $item->{playall};
+#     $stash->{itemsHaveAudio} = 1;
+# 达菲皮肤模板（HTML/Daphile/xmlbrowser.html:12834）：
+#     IF songinfo.playLink/... → gencontrol ; ELSIF itemsHaveAudio → allcontrol(playAllLink/addAllLink)
+# ⇒ 时长缺失 = 页头按钮消失。128k/320k 是 CBR，体积÷码率就是时长（实测 mg 热歌榜首曲
+#   128k=4.12 MiB ⇒ 270s，与上游真实 04:30 完全吻合）。
+my %NOMINAL_KBPS = ( '128k' => 128, '320k' => 320 );
+
+sub _secsFromTypes {
+	my ($t) = _stripClass(@_);
+	return undef unless ref $t->{types} eq 'ARRAY';
+	my %size;
+	for my $ty (@{ $t->{types} }) {
+		next unless ref $ty eq 'HASH' && defined $ty->{type};
+		my $b = _bytesOf($ty->{size});
+		$size{ $ty->{type} } = $b if $b;
+	}
+	for my $tier (qw(128k 320k)) {
+		my $b = $size{$tier} or next;
+		my $s = int($b * 8 / ($NOMINAL_KBPS{$tier} * 1000) + 0.5);
+		return $s if $s > 5 && $s < 7200;
+	}
+	return undef;
 }
 
 # 曲目封面：各源 musicInfo 字段不一（wy/tx/mg 有 img；kg/kw 常为 null）
@@ -725,8 +785,23 @@ sub _secsOf {
 # - tx：img 缺失时用 albumMid 推导 T002 封面
 # - kw：PC 端 getPic = pic.web?rid=<songmid>，其响应体才是图片 URL（纯文本）——
 #       列表行改指插件自己的封面代理（懒加载 + LMS 图像缓存 30 天，不阻塞列表）
+# 0.11.72：新增 `$kind`（undef=列表档 300 / 'big'=队列·正在播放档 500）。
+# 现场（用户报的第 1 个问题）：「正在播放」封面清晰度太低 —— 因为**列表行与队列行
+# 共用同一个封面 URL**，而这条主路径走的是列表档（`_coverThumb` 默认 300），
+# `coverThumbBig`（500）只在"`_coverOf` 拿不到图"的兜底分支里生效过，
+# 于是正在播放面板把 300 的源顶到 500 的框里 ⇒ 发虚。
+# 0.11.76：本文件里的"工具函数"（没有 `$class` 形参的那些）**经常被误当方法调用**
+# （`Plugins::LxMusic::Plugin->_coverOf($t)`）⇒ 首参拿到类名、后面所有形参整体错位。
+# 这个坑在本项目反复出现（`coverThumbSize` 就因此让缩略尺寸静默失效）。统一在这里
+# 剥掉"看起来像包名"的首参；数字/undef/引用/普通字符串一律不动。
+sub _stripClass {
+	my (@a) = @_;
+	shift @a if @a && defined $a[0] && !ref $a[0] && $a[0] =~ /^(?:Plugins|Slim|main)::/;
+	return @a;
+}
+
 sub _coverOf {
-	my ($t) = @_;
+	my ($t, $kind) = _stripClass(@_);
 	my $src = $t->{source} || '';
 
 	# 设置页「封面代理」开关（0.6.0）：关掉后 kg/kw 列表行不再经插件中转 ——
@@ -743,7 +818,8 @@ sub _coverOf {
 		my $aaid = (($t->{albumAudioId} || $t->{songmid} || '') =~ /^\d+$/)
 			? ($t->{albumAudioId} || $t->{songmid}) : '';
 		return $proxy
-			? _coverProxyUrl('kg:' . $aaid . ':' . ($t->{albumId} || 0) . ':' . $t->{hash})
+			? _coverProxyUrl('kg:' . $aaid . ':' . ($t->{albumId} || 0) . ':' . $t->{hash}
+				. ($kind && $kind eq 'big' ? ':big' : ''))
 			: '';
 	}
 	if ($src eq 'kg' && ($t->{albumId} || '') =~ /^\d+$/) {
@@ -763,13 +839,13 @@ sub _coverOf {
 		$img = 'https://d.musicapp.migu.cn' . $img if $img =~ m{^/};
 		if ($img =~ m{^https?://}) {
 			$img =~ s/\.webp$/.jpg/i;
-			return _u(_coverThumb($img));
+			return _u(_coverThumb($img, undef, $kind));
 		}
 	}
 	if ($src eq 'kw' && ($t->{songmid} || '') =~ /^\d+$/) {
 		# 代理内解析 pic.web 再取图；关掉代理则无图可给（pic.web 返回的是文本 URL）
 		# 0.11.61：把缩略尺寸一起交给代理（`pictype/size` 决定 kwcdn 路径里的尺寸段）
-		my $s = _coverThumbSize();
+		my $s = _coverThumbSize(undef, $kind);
 		return $proxy ? _coverProxyUrl('kw:' . $t->{songmid} . ($s ? ":$s" : '')) : '';
 	}
 
@@ -777,11 +853,11 @@ sub _coverOf {
 		my $v = $t->{$k};
 		if (defined $v && $v ne '' && $v =~ m{^https?://}) {
 			$v =~ s/\.webp$/.jpg/i;
-			return _u(_coverThumb($v));
+			return _u(_coverThumb($v, undef, $kind));
 		}
 	}
 	if ($src eq 'tx' && ($t->{albumMid} || '') =~ /^[A-Za-z0-9]+$/) {
-		my $s = _coverThumbSize() || 500;
+		my $s = _coverThumbSize(undef, $kind) || 500;
 		return 'https://y.gtimg.cn/music/photo_new/T002R' . $s . 'x' . $s
 			. 'M000' . $t->{albumMid} . '.jpg';
 	}
@@ -796,8 +872,26 @@ sub _coverProxyUrl {
 	return "http://$srv:$port/plugins/LxMusic/cover?u=" . encode_base64url($target);
 }
 
+# 0.11.72：**该不该经我们的封面代理中转**。
+# 现场（用户报的第 2 个问题：mg 歌单没封面）：
+#   mg 的歌单宫格图在 `https://d.musicapp.migu.cn/data/oss/service66/…/fx.webp`，
+#   实测该 URL：`.webp` 路径 = 200、**字节是 RIFF/WEBP、Content-Type 却谎报 image/jpeg**；
+#   `.jpg` 路径 = 404（所以不能像曲目路径那样改扩展名）。
+#   设备侧直连可用 ⇒ 中转是纯亏：① 多一跳；② 我们原样透出那份"谎报的 Content-Type"，
+#   任何**按声明解码**的客户端（硬件播放器/手机 App）拿到 jpeg 头却收到 WebP ⇒ 有 URL 无图；
+#   ③ LMS 自己的图像代理反而**按字节嗅探**，WebP 也能缩放成 PNG/JPEG 再发给客户端。
+#   ⇒ mg 一律直取（曲目路径 `_coverOf` 本来就是直取，这里对齐）。
+sub _shouldProxyCover {
+	my ($url) = _stripClass(@_);
+	return 0 unless $url && $url =~ m{^https?://};
+	return 0 if $url =~ m{^https?://[^/]*migu\.cn/}i;   # mg 直连可用
+	return $prefs->get('coverProxy') ? 1 : 0;
+}
+
 # ---------- 0.11.61 封面提速：缩略尺寸（实现搬到了 Helper，Plugin/ProtocolHandler 共用） ----------
-sub _coverThumbSize { return Plugins::LxMusic::Helper->coverThumbSize(@_) }
+# ⚠️ 必须按**函数**调用（`Helper::coverThumbSize`）：Helper 里那个 sub 没有 `$class` 形参。
+# 0.11.76 之前这里写成 `Helper->coverThumbSize(@_)` ⇒ 首参被塞进类名、尺寸恒为 0。
+sub _coverThumbSize { return Plugins::LxMusic::Helper::coverThumbSize(@_) }
 sub _coverThumb     { return Plugins::LxMusic::Helper->coverThumb(@_) }
 
 # ---------- M0.3 歌单：搜索 -> 详情 -> 播放/整单 ----------
@@ -852,11 +946,17 @@ sub _plItems {
 			($pl->{total} ? _u($pl->{total}) . _u('首') : ''),
 			($pl->{author} ? _u($pl->{author}) : ''),
 		));
-		my $img = $pl->{img};
-		# 歌单封面也走插件代理（kw/kg 的图 CDN 需要 UA/Referer，设备直连不出图）
+		my $img = $pl->{img} || '';
+		# 0.11.72：mg 歌单接口的 `img` **两种形态都有**（推荐页 = 绝对 https，
+		# 标签页偶见相对路径），与曲目路径（`_coverOf`）保持同一套归一化。
+		$img = 'https://d.musicapp.migu.cn' . $img if $img =~ m{^/};
+		# 歌单封面也走插件代理（kw/kg 的图 CDN 需要 UA/Referer，设备直连不出图）；
+		# mg 例外，见 _shouldProxyCover 的注释（WebP + 谎报 MIME）。
 		# 0.11.61：同样降到缩略尺寸（一页 30 个歌单 × 上游原图是另一处大流量）
-		$img = _coverThumb($img) if $img;
-		$img = _coverProxyUrl($img) if $img && $img =~ m{^https?://} && $prefs->get('coverProxy');
+		if ($img && $img =~ m{^https?://}) {
+			$img = _coverThumb($img);
+			$img = _coverProxyUrl($img) if _shouldProxyCover($img);
+		}
 		# 0.11.33：整单播放靠 LMS 的 **`playlist`** 属性（playall/addall/insert/remove 专用，
 		# Slim/Web/XMLBrowser.pm:336-344 → type=playlist → Slim/Formats/XML.pm:93 → 我们的 explodePlaylist）。
 		# 只给 feed 级 `play` 不行：Web 侧 `play` 只认 action=play/add/insert（:325-333），
@@ -1425,6 +1525,7 @@ sub webHandler {
 	my $msg       = '';
 	my $testHtml  = '';
 
+
 	if ($params->{import} && ($params->{source} || $params->{sourceurl})) {
 		($msg) = _handleImport($params);
 	}
@@ -1816,8 +1917,17 @@ my %COVER_CACHE;   # target => 图片 URL（kw 的 pic.web 解析结果）
 
 sub _respondImage {
 	my ($ct, $body, $client, $params, $callback, $httpClient, $response) = @_;
+	# 0.11.72：**按字节纠偏 Content-Type**。mg 的部分图床把 WebP 字节配上
+	# `Content-Type: image/jpeg` 发出来（实测 d.musicapp.migu.cn/data/oss/service66/
+	# …/fx.webp = 42440B、魔数 RIFF/WEBP、却声明 image/jpeg）。原样透出的话，
+	# 任何**按声明解码**的客户端都会"有 URL 却画不出图"。
+	my $real = ($ct && $ct =~ m{^image/}) ? $ct : 'image/jpeg';
+	if (defined $body && length $body >= 12
+		&& substr($body, 0, 4) eq 'RIFF' && substr($body, 8, 4) eq 'WEBP') {
+		$real = 'image/webp';
+	}
 	$response->code(200);
-	$response->header('Content-Type' => ($ct && $ct =~ m{^image/} ? $ct : 'image/jpeg'));
+	$response->header('Content-Type' => $real);
 	$response->header('Cache-Control' => 'max-age=86400');
 	$callback->($client, $params, \$body, $httpClient, $response);
 	return;
@@ -1929,9 +2039,9 @@ sub _coverProxy {
 
 	# kg：POST get_res_privilege 换真图 URL（官方 kg/pic.js 同款）。
 	# 参数格式 'kg:<albumAudioId>:<albumId>:<hash>'（hash 必需）
-	if ($target =~ /^kg:(\d*):(\d+):([0-9A-Fa-f]+)$/) {
-		my ($aaid, $albumid, $hash) = ($1, $2, $3);
-		my $key = "kg:$aaid:$albumid:$hash";
+	if ($target =~ /^kg:(\d*):(\d+):([0-9A-Fa-f]+)(?::(big|\d+))?$/) {
+		my ($aaid, $albumid, $hash, $ksz) = ($1, $2, $3, $4);
+		my $key = "kg:$aaid:$albumid:$hash" . ($ksz ? ":$ksz" : '');
 		if (my $cached = $COVER_CACHE{$key}) {
 			return _streamImage($cached, $client, $params, $callback, $httpClient, $response);
 		}
@@ -1964,8 +2074,10 @@ sub _coverProxy {
 				};
 				if ($img && $img =~ m{^https?://}) {
 					%COVER_CACHE = () if keys %COVER_CACHE > 300;
-					$COVER_CACHE{$key} = $img;
-					return _streamImage($img, $client, $params, $callback, $httpClient, $response);
+					# `:big` 是「档位」不是「像素」（`_coverThumb($url,$size,$kind)` 的签名）
+					my ($csz, $ckind) = ($ksz && $ksz eq 'big') ? (undef, 'big') : ($ksz, undef);
+					$COVER_CACHE{$key} = _coverThumb($img, $csz, $ckind);
+					return _streamImage($COVER_CACHE{$key}, $client, $params, $callback, $httpClient, $response);
 				}
 				$log->debug("LxMusic: kg get_res_privilege miss for $key");
 				return _respondCoverFail('no cover', $client, $params, $callback, $httpClient, $response);
