@@ -796,6 +796,23 @@ async function main(std, os) {
 			for (let i = 0; i < b.length; i++) s += String.fromCharCode(b[i]);
 			return s;
 		}
+		// ---- 平台级失败短路（0.11.82）----
+		// 现场（2026-09-24 设备实测）：mg 的搜索 API `jadeite.migu.cn` 不可达
+		//   （本机 TLS 握手超时、设备侧 `curl exit=28` after 3002ms），而 SDK 的 mg 搜索
+		//   **会重试 3 次**（`musicSdk/mg/utils/index.js:9-26`，`retryNum > 2` 才抛），
+		//   每次都要吃满下面那个 3s 硬帽 ⇒ **每次歌单/歌曲搜索白等 3×3=9s**（实测首屏 4.5~12.4s 波动全由它造成，
+		//   同期 kg 316ms / tx 702ms / wy 333ms）。
+		// 这里按**精确主机名**记"连续失败"：达到阈值就开闸，其后 60s 内该主机的请求**直接失败、不再起 curl**。
+		// ⚠️ 必须用精确主机名，**不能用 `migu.cn` 后缀**：mg 的音频 CDN（`freetyst.nf.migu.cn`，实测 200/0.09s）
+		//    与图床（`d.musicapp.migu.cn`，200/0.13s）都是好的，用后缀会把它们一起短路（那才会真的"点了没声"）。
+		// 安全阀：3 次失败才开闸（一次完整请求的 3 次重试刚好够触发）、失败计数超过 90s 就重新计、
+		// 闸只关 60s ⇒ 最坏情况下一个"刚连续失败 3 次"的主机被快速失败 1 分钟，其余一切照旧。
+		const HOST_BREAK = new Map();          // host -> { n, last, until }
+		const HOST_BREAK_LIMIT = 3;            // 连续失败阈值
+		const HOST_BREAK_WINDOW = 90 * 1000;   // 失败计数窗口
+		const HOST_BREAK_MS = 60 * 1000;       // 闸时长
+		const HOST_BREAK_ON = !(os.getenv && String(os.getenv('LX_HOST_BREAKER')) === '0');
+
 		function curlOnce(url, opts, outBin, outHdr, inBody) {
 			const t0 = Date.now();
 			const outErr = outHdr + '.err';
@@ -807,6 +824,15 @@ async function main(std, os) {
 			const mHost = String(url).match(/^https?:\/\/([^\/]+)/i);
 			const capSec = (mHost && /migu\.cn/i.test(mHost[1])) ? Math.min(3, baseCap) : baseCap;
 			const tmo = Math.min(capSec, Math.max(2, Math.ceil((opts.timeout || 15000) / 1000)));
+			const hostKey = (mHost && mHost[1]) ? mHost[1].toLowerCase() : '';
+			if (HOST_BREAK_ON && hostKey) {
+				const bs = HOST_BREAK.get(hostKey);
+				if (bs && bs.until > Date.now()) {
+					print('LOG binHttp host-breaker skip ' + hostKey
+						+ ' (open ' + Math.ceil((bs.until - Date.now()) / 1000) + 's left)');
+					throw errCode('binHttp host breaker open: ' + hostKey, 'ETIMEDOUT');
+				}
+			}
 			const args = ['curl', '-sS', '--compressed', '--max-time', String(tmo),
 				'-o', outBin, '-D', outHdr, '--path-as-is', '--stderr', outErr];
 			const hdrs = opts.headers || {};
@@ -825,6 +851,23 @@ async function main(std, os) {
 			// 设备 bellard qjs：block exec 返回纯数字退出码（quickjs-libc.c "exec -> exitcode"）；
 			// 兼容对象形态（node sim stub 旧约定）
 			const code = typeof r === 'number' ? r : (r ? ((r.exit_code != null) ? r.exit_code : 1) : 1);
+			if (HOST_BREAK_ON && hostKey) {
+				if (code === 0) {
+					HOST_BREAK.delete(hostKey);            // 通了就清零
+				}
+				else {
+					const now = Date.now();
+					const bs = HOST_BREAK.get(hostKey) || { n: 0, last: 0, until: 0 };
+					bs.n = (now - (bs.last || 0) > HOST_BREAK_WINDOW) ? 1 : (bs.n + 1);
+					bs.last = now;
+					if (bs.n >= HOST_BREAK_LIMIT) {
+						bs.until = now + HOST_BREAK_MS;
+						bs.n = 0;
+						print('LOG binHttp host-breaker OPEN ' + hostKey + ' for ' + (HOST_BREAK_MS / 1000) + 's');
+					}
+					HOST_BREAK.set(hostKey, bs);
+				}
+			}
 			if (code !== 0) {
 				let errText = '';
 				try { const ef = std.open(outErr, 'r'); if (ef) { for (;;) { const l = ef.getline(); if (l == null) break; errText += l + '\n'; } ef.close(); } } catch (e) {}
@@ -993,17 +1036,24 @@ async function main(std, os) {
 			}
 			if (action === 'songlist') {
 				// 歌单搜索：跨源聚合（kw/kg/tx/wy/mg 各自 songList.search）
+				// 0.11.78：每平台默认条数 8 → 20，并把 page 透传（调用方现在会按窗口要第 N 页）。
+				// 起因见 Plugin.pm 的注释：与 PC 版实测对照后，插件从"只看每源 8 条第 1 页"
+				// 改成 PC 口径（每平台 20 条 + 原生翻页）。
 				const q = String(payload.query || payload.name || '');
 				if (!q) throw new Error('songlist: query required');
 				const page = Number(payload.page) || 1;
-				const perSrc = Number(payload.limit) || 8;
-				const SL_SOURCES = ['kg', 'tx', 'wy', 'mg', 'kw'];
+				const perSrc = Number(payload.limit) || 20;
+				// 0.11.78：支持**只要某一个平台**（`payload.source`）。
+				// 插件的虚拟列表是"平台优先拼接"，一次窗口往往只用到 1~2 个平台；
+				// 没有这个过滤，取 kg 的第 3 页会把 tx/wy/mg/kw 的第 3 页一起打一遍（4/5 是白打）。
+				const only = payload.source || payload.src || '';
+				const SL_SOURCES = only ? [String(only)] : ['kg', 'tx', 'wy', 'mg', 'kw'];
 				const tasks = SL_SOURCES.map(s => {
 					const sl = sdk[s] && sdk[s].songList;
 					if (!sl || !sl.search) return Promise.resolve(null);
 					return sl.search(q, page, perSrc).then(r => {
 						if (!r || !r.list || !r.list.length) return null;
-						return { source: s, list: r.list.slice(0, perSrc), total: r.total };
+						return { source: s, page, list: r.list.slice(0, perSrc), total: r.total };
 					}).catch(() => null);
 				});
 				const groups = (await Promise.all(tasks)).filter(g => g);

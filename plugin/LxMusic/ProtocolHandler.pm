@@ -1281,11 +1281,17 @@ sub _actualTier {
 	}
 
 	# 上游声明封顶：只在"声明的档位集合非空"且"我们推的档位不在声明里"时降级。
-	if ($tier && $declared && ref($declared) eq 'ARRAY' && @$declared) {
+	# ⚠️ 0.11.81：**只对梯档做封顶**。`%TIER_RANK` 里只有 128k/192k/256k/320k/flac/flac24bit/hires
+	# 七个；`ogg/ape/wav/aac/mp4/mkv/未知` 这类**非梯档**没有任何排名，旧代码 `$TIER_RANK{$tier} || 99`
+	# 会给它 99，于是下面的循环把"声明里排名最高的那一档"选成 best ⇒ **OGG 被改写成 flac**。
+	# 现场（2026-09-24 实测）：交付的是 Ogg Vorbis 171kbps（魔数 4f676753、偏移 29 处 vorbis），
+	# 判决行却写 `flac ~171kbps`；该曲 types[] 只有 [128k,320k,flac]（没有 ogg）。详见
+	# docs/pc-vs-plugin-search-code.md §10.3。非梯档一律原样显示。
+	if ($tier && $TIER_RANK{$tier} && $declared && ref($declared) eq 'ARRAY' && @$declared) {
 		my %has = map { (ref($_) eq 'HASH' ? ($_->{type} // '') : $_) => 1 } @$declared;
 		delete $has{''};
 		if (%has && !$has{$tier}) {
-			my $myrank = $TIER_RANK{$tier} || 99;
+			my $myrank = $TIER_RANK{$tier};
 			my ($best, $bestrank) = (undef, -1);
 			for my $d (keys %has) {
 				my $r = $TIER_RANK{$d} or next;

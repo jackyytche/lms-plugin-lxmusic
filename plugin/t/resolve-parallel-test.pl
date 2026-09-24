@@ -240,6 +240,24 @@ sub new_run_budget {
 		'got=' . ($PH->_actualTier('mp4', 200, 0) // 'undef'));
 	check('tier: 未知格式原样大写', $PH->_actualTier('ape', 900, 0) eq 'APE',
 		'got=' . ($PH->_actualTier('ape', 900, 0) // 'undef'));
+
+	# 0.11.81：**非梯档不许被"上游声明封顶"改写**。
+	# 现场（2026-09-24 设备实测）：交付的是 Ogg Vorbis 171kbps（魔数 4f676753），
+	# 而该曲 types[] 只有 [128k,320k,flac]（没有 ogg）⇒ 旧代码用 `$TIER_RANK{'OGG'} || 99`，
+	# 于是封顶循环把声明里排名最高的 flac 选成 best ⇒ 判决行写 `flac ~171kbps`（谎报）。
+	check('tier: ogg + 上游只声明 flac/320k/128k -> 仍是 OGG（不许被改写成 flac）',
+		$PH->_actualTier('ogg', 171, 0, \@decl_flac) eq 'OGG',
+		'got=' . ($PH->_actualTier('ogg', 171, 0, \@decl_flac) // 'undef'));
+	check('tier: ape + 上游声明 flac -> 仍是 APE',
+		$PH->_actualTier('ape', 900, 0, \@decl_flac) eq 'APE',
+		'got=' . ($PH->_actualTier('ape', 900, 0, \@decl_flac) // 'undef'));
+	check('tier: wav + 上游声明 flac -> 仍是 WAV',
+		$PH->_actualTier('wav', 1411, 0, \@decl_flac) eq 'WAV',
+		'got=' . ($PH->_actualTier('wav', 1411, 0, \@decl_flac) // 'undef'));
+	# 反向：梯档仍然要被封顶（别把修复做成"封顶失效"）
+	check('tier: flac24bit + 上游只声明到 flac -> 仍被封顶为 flac',
+		$PH->_actualTier('flc', 1700, 24, \@decl_flac) eq 'flac',
+		'got=' . ($PH->_actualTier('flc', 1700, 24, \@decl_flac) // 'undef'));
 	check('label: 192k -> MP3 192kbps', $PH->qualityLabel('192k') eq 'MP3 192kbps');
 	check('label: 256k -> MP3 256kbps', $PH->qualityLabel('256k') eq 'MP3 256kbps');
 	check('label: 已是人读标签则幂等（不再被 uc 成 FLAC 24BIT）',

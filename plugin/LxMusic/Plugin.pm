@@ -898,6 +898,18 @@ sub _coverThumb     { return Plugins::LxMusic::Helper->coverThumb(@_) }
 
 my $TRACK_JSON = JSON::XS->new->utf8->canonical;   # track/playlist hash -> compact JSON
 
+my $PL_SEARCH_PER      = 50;
+my $PL_SEARCH_MAXPAGES = 3;
+my $PL_SEARCH_TTL      = 600;
+my $PL_SEARCH_MAXQ     = 8;      # 同时缓存几次查询
+my %PL_SEARCH;
+
+# 页宽取 **50**（不是 PC 的 15）是因为 **LMS 的窗口就是 50**，实测对照：
+#   · 页宽 20：首页 50 行要拼 3 个上游页 ⇒ 首次搜索 **11.4s**（3 次 sdk 往返）
+#   · 页宽 50：首次那一次"全平台探测"就把首页铺满 ⇒ **3.9s**（1 次往返），翻页仍只补 1 页
+# 代价是单次响应体大一点，换来首屏少两次往返 —— 设备是 Atom，往返最贵。
+sub _pl_search_params { return ($PL_SEARCH_PER, $PL_SEARCH_MAXPAGES) }
+
 sub sdkSonglistSearchHandler {
 	my ($client, $cb, $args) = @_;
 	my $q = $args->{search} || '';
@@ -908,29 +920,205 @@ sub sdkSonglistSearchHandler {
 		return;
 	}
 
-	Plugins::LxMusic::Helper->request(
-		action  => 'songlist',
-		info    => { query => $q },
-		timeout => 30,
-		cb      => sub {
-			my ($res) = @_;
-			unless ($res->{ok} && $res->{data}) {
-				$cb->({ items => [ { name => _u('歌单搜索失败: ') . ($res->{error} || 'unknown'), type => 'text' } ] });
-				return;
-			}
-			# 歌单搜索是跨源聚合（数组）→ 逐组渲染，总计上限 40
-			my @items;
-			for my $grp (@{ $res->{data} }) {
-				next unless $grp && $grp->{list} && @{ $grp->{list} };
-				my $src = $grp->{source} || '?';
-				push @items, @{ _plItems($src, $grp->{list}, 40 - scalar(@items)) };
-				last if @items >= 40;
-			}
-			$cb->({ items => @items ? \@items : [ { name => _u('无歌单结果'), type => 'text' } ] });
-		},
-	);
+	my $index  = $args->{index} || 0;
+	my $window = $args->{quantity} || 50;
+	$window = 50 if $window < 1 || $window > 300;
+
+	my $st = _pl_search_state($q);      # 取（或新建）这次搜索的页缓存
+
+	# 取数泵：**反复**算"这个窗口还缺什么"，缺就取，取完再算，直到窗口铺满（或到上限）。
+	# ⚠️ 不能只算一次：第一次调用时还不知道各平台 total ⇒ 只能先探第 1 页；
+	#    拿到 total 之后才知道 kg 的 62 行要占满窗口的 50 行 ⇒ 还得补第 2/3 页。
+	#    （第一版只算一次，结果首页只回了 20 行，LMS 按 total 补出 30 行空行 —— §5.2.15 老坑）
+	my $pump;
+	$pump = sub {
+		my $need = _pl_search_missing($st, $index, $window);
+		if (!@$need) {
+			$cb->(_pl_search_feed($st, $index, $window));
+			return;
+		}
+		my $pending = scalar @$need;
+		my $done = 0;
+		my $finish = sub {
+			my ($src, $page, $res) = @_;
+			_pl_search_store($st, $src, $page, $res);
+			return if $done;
+			return if --$pending > 0;
+			$done = 1;
+			$pump->();
+		};
+		for my $n (@$need) {
+			my ($src, $page) = @$n;
+			my %info = ( query => $q, page => $page, limit => $PL_SEARCH_PER );
+			$info{source} = $src unless $src eq '*';    # '*' = 首次全平台探测（学 total）
+			Plugins::LxMusic::Helper->request(
+				action  => 'songlist',
+				info    => \%info,
+				timeout => 30,
+				cb      => sub { my ($res) = @_; $finish->($src, $page, $res); },
+			);
+		}
+		return;
+	};
+	$pump->();
 	return;
 }
+
+# ---------- 0.11.78 歌单搜索：分页 + PC 口径（与 PC 版 2.12.6 实测对照后重做）----------
+# 起因（2026-09-24 对照实测）：同一关键词 PC 能翻 19 页共 **963 行**，插件只有 **33 行**；
+# 逐行回查发现插件那 33 行**全部落在 PC 的第 1 页里** —— 插件不是取错，而是三重自限：
+#   ① `shim.mjs` 每平台只要 8 条（Plugin.pm 从不传 limit）；② 累计 40 条就 `last`；
+#   ③ **从不传 page**（shim 恒用 page=1）⇒ 永远只有第 1 页。
+# 现在改成 PC 口径，并把"翻页"接进 LMS 原生窗口契约：
+#   · 每平台每页 **50** 条（= LMS 窗口大小，见 _pl_search_params 的实测对比）
+#   · 每平台最多 **3** 页 ⇒ ≤150 行/平台、≤500 行/查询（PC 实测 963 行 / 19 页）
+#   · 虚拟列表是**平台优先拼接**：kg 的全部 → tx 的全部 → …（与旧版"页 1 各平台成块"顺序一致）
+#   · 只为**当前窗口**缺的上游页打请求；翻页才花下一次往返（不预热）
+
+sub _pl_search_state {
+	my ($q) = @_;
+	if (scalar(keys %PL_SEARCH) >= $PL_SEARCH_MAXQ && !$PL_SEARCH{$q}) {
+		my ($old) = sort { ($PL_SEARCH{$a}{at} || 0) <=> ($PL_SEARCH{$b}{at} || 0) } keys %PL_SEARCH;
+		delete $PL_SEARCH{$old} if defined $old;
+	}
+	my $e = $PL_SEARCH{$q};
+	if (!$e || (time() - ($e->{at} || 0)) >= $PL_SEARCH_TTL) {
+		$e = $PL_SEARCH{$q} = { at => time(), query => $q, pages => {}, total => {}, order => [], failed => 0 };
+	}
+	$e->{at} = time();
+	return $e;
+}
+
+# ---------- 页缓存 / 几何 ----------
+# 页键 = "<src>|<page>"；首次探测那次 src 记作 '*'（一次问全部平台，用来学 total 与平台顺序）。
+# 单平台取页是 0.11.78 加的：虚拟列表是"平台优先拼接"，一个 50 行的窗口往往只落在 1 个平台上，
+# 没有单平台过滤就会把"kg 第 3 页"取成"5 个平台的第 3 页"（4/5 是白打，设备是 Atom）。
+
+sub _pl_search_store {
+	my ($st, $src, $page, $res) = @_;
+	$st->{pages}{"$src|$page"} = [] if $src eq '*';   # 占位，防重入
+	if (!($res && $res->{ok} && ref $res->{data} eq 'ARRAY')) {
+		$st->{fail}{"$src|$page"} = 1;
+		$st->{failed}++;
+		if ($src ne '*') {
+			my $seen = ($page - 1) * $PL_SEARCH_PER;
+			my $cur  = $st->{slots}{$src};
+			$st->{slots}{$src} = (defined $cur && $cur < $seen) ? $cur : $seen;
+		}
+		$log->warn(sprintf('LxMusic pl-search %s page %d failed: %s',
+			$src, $page, ($res && $res->{error}) ? $res->{error} : 'no data'));
+		return;
+	}
+	for my $grp (@{ $res->{data} }) {
+		next unless $grp && ref $grp->{list} eq 'ARRAY';
+		my $g = $grp->{source} || '?';
+		next unless @{ $grp->{list} };
+		$st->{pages}{"$g|$page"} = $grp->{list};
+		$st->{total}{$g} = $grp->{total} if defined $grp->{total};
+		if ($src eq '*') {          # 探测轮：定顺序 + 定各平台上界（此后只许缩，不许长）
+			push @{ $st->{order} }, $g unless grep { $_ eq $g } @{ $st->{order} };
+			my $cap = $PL_SEARCH_PER * $PL_SEARCH_MAXPAGES;
+			my $t   = $grp->{total};
+			my $s   = (defined $t && $t > 0) ? ($t < $cap ? $t : $cap) : $cap;
+			my $cur = $st->{slots}{$g};
+			$st->{slots}{$g} = (defined $cur && $cur < $s) ? $cur : $s;
+		}
+		# 末页不足一页 ⇒ 收敛上界（上游 total 常是近似值）
+		my $n = scalar @{ $grp->{list} };
+		if ($n < $PL_SEARCH_PER) {
+			my $seen = ($page - 1) * $PL_SEARCH_PER + $n;
+			my $cur  = $st->{slots}{$g};
+			$st->{slots}{$g} = (defined $cur && $cur < $seen) ? $cur : $seen;
+		}
+	}
+	$st->{probed} = 1 if $src eq '*';
+	return;
+}
+
+# 平台顺序 = 首次探测返回的顺序（与 shim 的 SL_SOURCES 一致：kg,tx,wy,mg,kw）
+sub _pl_search_order {
+	my ($st) = @_;
+	return @{ $st->{order} || [] };
+}
+
+# 虚拟列表几何：平台优先拼接 ⇒ 返回 [ [src, base, slots], ... ] 与总行数
+sub _pl_search_geom {
+	my ($st) = @_;
+	my @geom;
+	my $base = 0;
+	for my $src (_pl_search_order($st)) {
+		my $s = $st->{slots}{$src} || 0;
+		push @geom, [ $src, $base, $s ];
+		$base += $s;
+	}
+	return (\@geom, $base);
+}
+
+# 这个窗口还缺哪些上游页：[ ['*',1] ] = 首次探测；否则是 [ [src,page], ... ]
+sub _pl_search_missing {
+	my ($st, $index, $window) = @_;
+	return [ [ '*', 1 ] ] unless $st->{probed};
+
+	my ($geom) = _pl_search_geom($st);
+	my @need;
+	my $stop = $index + $window;
+	for my $g (@$geom) {
+		my ($src, $base, $slots) = @$g;
+		next if $slots <= 0;
+		my $lo = $index > $base ? $index - $base : 0;
+		my $hi = $stop < $base + $slots ? $stop - $base : $slots;
+		next if $hi <= $lo;
+		my $p1 = int($lo / $PL_SEARCH_PER) + 1;
+		my $p2 = int(($hi - 1) / $PL_SEARCH_PER) + 1;
+		for my $p ($p1 .. $p2) {
+			next if $p > $PL_SEARCH_MAXPAGES;
+			next if $st->{pages}{"$src|$p"} && @{ $st->{pages}{"$src|$p"} };
+			next if $st->{fail}{"$src|$p"};        # 取过且失败 ⇒ 不再重试（本查询内）
+			push @need, [ $src, $p ];
+		}
+	}
+	return \@need;
+}
+
+# 组装这个窗口的 feed（items + 原生翻页契约）
+sub _pl_search_feed {
+	my ($st, $index, $window) = @_;
+	my ($geom, $total) = _pl_search_geom($st);
+
+	my @items;
+	my $stop = $index + $window;
+	for my $g (@$geom) {
+		my ($src, $base, $slots) = @$g;
+		next if $slots <= 0 || $base >= $stop || $base + $slots <= $index;
+		my $lo = $index > $base ? $index - $base : 0;
+		my $hi = $stop < $base + $slots ? $stop - $base : $slots;
+		my @rows;
+		for my $local ($lo .. $hi - 1) {
+			my $p   = int($local / $PL_SEARCH_PER) + 1;
+			my $off = $local % $PL_SEARCH_PER;
+			my $list = $st->{pages}{"$src|$p"};
+			next unless ref $list eq 'ARRAY' && @$list > $off;
+			push @rows, $list->[$off];
+		}
+		next unless @rows;
+		push @items, @{ _plItems($src, \@rows, scalar @rows) };
+	}
+
+	my $feed = {
+		items  => \@items,
+		offset => $index,
+		total  => $total,
+	};
+	$log->warn(sprintf('LxMusic pl-search win idx=%d qty=%d rows=%d total=%d pages=%d failed=%d',
+		$index, $window, scalar(@items), $total, scalar(keys %{ $st->{pages} }), $st->{failed} || 0));
+	return @items
+		? $feed
+		: { items => [ {
+			name   => $st->{failed} ? _u('歌单搜索失败（上游页取不到）') : _u('无歌单结果'),
+			type   => 'text',
+		} ] };
+}
+
 
 # 歌单条目渲染（歌单搜索 / 推荐·最热·最新 共用）：名称 +（来源 · N首 · 作者）+ 封面
 sub _plItems {
@@ -1773,7 +1961,8 @@ sub _webPlSearch {
 	my $started = time();
 	Plugins::LxMusic::Helper->request(
 		action  => 'songlist',
-		info    => { query => $q },
+		# 0.11.78：这个诊断页也跟上页宽（从前不传 limit ⇒ 吃 shim 默认，与真实搜索口径不一致）
+		info    => { query => $q, limit => $PL_SEARCH_PER },
 		timeout => 30,
 		cb      => sub {
 			my ($res) = @_;

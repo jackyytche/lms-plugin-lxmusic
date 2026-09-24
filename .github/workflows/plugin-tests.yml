@@ -60,6 +60,30 @@ jobs:
           LX_TEST_QUIET_WARN=1 perl -I t -I t_build t/republish-loop-test.pl 2>&1 | tee -a helper-test.log
           exit ${PIPESTATUS[0]}
 
+      # 0.11.72/0.11.75/0.11.76/0.11.81: cover tier (list 300 vs big 500), duration
+      # fallback for the page-head "play all" gate, the method/function call
+      # tolerance in coverThumbSize, and "non-ladder formats must not be relabelled"
+      # in _actualTier (delivered Ogg Vorbis used to be reported as flac).
+      - name: Cover tier + duration regression (0.11.72-0.11.81)
+        run: |
+          cd plugin
+          set -o pipefail
+          LX_TEST_QUIET_WARN=1 perl -I t -I t_build t/cover-tier-test.pl 2>&1 | tee -a helper-test.log
+          exit ${PIPESTATUS[0]}
+
+      # 0.11.78: songlist search pagination. The plugin used to show only 8 results
+      # per platform from page 1 with a hard cap of 40 and no paging at all
+      # (PC 2.12.6 served 963 rows over 19 pages for the same keyword while those
+      # 33 rows were all on PC's first page). This suite pins the virtual-list
+      # geometry, the "probe once, then top up only the missing [source,page]"
+      # plan, and the shrink-on-short/failed-page rules.
+      - name: Songlist search pagination regression (0.11.78)
+        run: |
+          cd plugin
+          set -o pipefail
+          LX_TEST_QUIET_WARN=1 perl -I t -I t_build t/pl-search-page-test.pl 2>&1 | tee -a helper-test.log
+          exit ${PIPESTATUS[0]}
+
       - name: CHECK Helper.pm
         run: cd plugin && perl -I t -I t_build -c t_build/Plugins/LxMusic/Helper.pm
 

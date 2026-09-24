@@ -16,6 +16,13 @@ sub main::DEBUGLOG { 0 }
 sub logger    { return Slim::Utils::Log::Stub->new(@_) }
 sub logWarning { my $c = shift; Slim::Utils::Log::Stub->new->warn(@_) }
 sub logError   { my $c = shift; Slim::Utils::Log::Stub->new->error(@_) }
+# 0.11.76：Plugin.pm 在 initPlugin 里会调 `Slim::Utils::Log->addLogCategory(...)`，
+# 缺了它整个 Plugin 包 require 不起来（cover-tier-test.pl 现场）
+# 0.11.78：返回值必须是**带 warn/info/error 的对象**（真环境是 Log4perl logger）。
+# 从前返回 1 ⇒ 测试里只要走到 `$log->warn(...)` 就 `Can't locate object method "warn"
+# via package "1"`（歌单搜索分页的用例现场）。存根要照抄契约，别只求"能编译"。
+sub addLogCategory  { return Slim::Utils::Log::Stub->new(@_) }
+sub setDefaultLevel { return 1 }
 
 package Slim::Utils::Log::Stub;
 
