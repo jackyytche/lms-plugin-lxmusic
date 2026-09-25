@@ -254,10 +254,18 @@ sub new_run_budget {
 	check('tier: wav + 上游声明 flac -> 仍是 WAV',
 		$PH->_actualTier('wav', 1411, 0, \@decl_flac) eq 'WAV',
 		'got=' . ($PH->_actualTier('wav', 1411, 0, \@decl_flac) // 'undef'));
-	# 反向：梯档仍然要被封顶（别把修复做成"封顶失效"）
-	check('tier: flac24bit + 上游只声明到 flac -> 仍被封顶为 flac',
-		$PH->_actualTier('flc', 1700, 24, \@decl_flac) eq 'flac',
+	# 反向：**位深未知**时梯档仍然被封顶（0.11.60 的行为必须保留）。
+	# ⚠️ 0.11.84（A0 矩阵）改的口径：**量出来的位深不受声明封顶**。
+	# 现场（2026-09-25 设备实测）：kw《晴天》请求 flac24bit → 交付 `bits=24`、1647kbps，
+	# 而 kw 的 types[] 只声明到 flac ⇒ 旧规则把标签压成 "FLAC"（低于事实）；
+	# wy《海阔天空》同理（bits=24、1511kbps）。声明的用途是"别拿码率启发式吹牛"，
+	# 不是"否认量出来的位深" ⇒ 这两格现在都判 flac24bit（见 plugin/t/tier-label-test.pl）。
+	check('tier: flc + 位深实测 24bit + 上游只声明到 flac -> flac24bit（0.11.84：量出来的位深优先）',
+		$PH->_actualTier('flc', 1700, 24, \@decl_flac) eq 'flac24bit',
 		'got=' . ($PH->_actualTier('flc', 1700, 24, \@decl_flac) // 'undef'));
+	check('tier: flc + 位深未知 + 上游只声明到 flac -> 仍被封顶为 flac（启发式不许吹牛）',
+		$PH->_actualTier('flc', 1700, 0, \@decl_flac) eq 'flac',
+		'got=' . ($PH->_actualTier('flc', 1700, 0, \@decl_flac) // 'undef'));
 	check('label: 192k -> MP3 192kbps', $PH->qualityLabel('192k') eq 'MP3 192kbps');
 	check('label: 256k -> MP3 256kbps', $PH->qualityLabel('256k') eq 'MP3 256kbps');
 	check('label: 已是人读标签则幂等（不再被 uc 成 FLAC 24BIT）',
