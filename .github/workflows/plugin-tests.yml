@@ -84,6 +84,19 @@ jobs:
           LX_TEST_QUIET_WARN=1 perl -I t -I t_build t/pl-search-page-test.pl 2>&1 | tee -a helper-test.log
           exit ${PIPESTATUS[0]}
 
+      # 0.11.83: board window filling. The page-head "play all" enumerates the whole
+      # feed with one big window, and the handler used to keep pulling upstream pages
+      # until the window was full -- without de-duplicating and without honouring the
+      # upstream `total`. Sources whose board URL ignores `page` (mg always returns the
+      # same page; wy returns the whole board every time) therefore had their first page
+      # appended over and over: on the device mg's 100-song board queued 300 rows.
+      - name: Board window filling regression (0.11.83)
+        run: |
+          cd plugin
+          set -o pipefail
+          LX_TEST_QUIET_WARN=1 perl -I t -I t_build t/board-window-test.pl 2>&1 | tee -a helper-test.log
+          exit ${PIPESTATUS[0]}
+
       - name: CHECK Helper.pm
         run: cd plugin && perl -I t -I t_build -c t_build/Plugins/LxMusic/Helper.pm
 

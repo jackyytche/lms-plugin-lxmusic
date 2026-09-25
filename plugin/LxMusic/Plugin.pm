@@ -430,7 +430,21 @@ sub sdkBoardTracksHandler {
 
 	# ---- WINDOW FILLING（喜马拉雅 0.1.51）：顺序取上游页，攒够 [skip, skip+window)
 	# 才切——窗口比上游页宽时绝不吐空行（0.11.3 前身曾把窗口夹到 50 导致缺位空行）----
+	#
+	# ⚠️ 0.11.83 修「列表说 N 首、点播放全部却进 3N 首」：页头按钮走的是
+	# **枚举本 feed 的全部条目**（LMS 用一个大 quantity 问一次，我们夹到 300），
+	# 于是窗口常大于该榜真实长度。而有些平台的上游 **根本不认 page**
+	# （mg 的 `querycontentbyId.do?columnId=…&needAll=0` 恒回同一页；wy 一次给整榜），
+	# 于是"补页凑窗口"会把同一页反复追加：
+	#   设备实测（2026-09-25，修前）：mg 热歌榜 列表 100 首 → 队列 300 行（100 首 ×3，stride=100）；
+	#                                 wy 热歌榜 列表 200 首 → 队列 300 行（200 唯一）；
+	#                                 kw/tx 榜恰好 300 首、kg 43 首（第二页即空）⇒ 掩盖了这个 bug。
+	# 两条不变量（与 ProtocolHandler::explodePlaylist 同款）：
+	#   ① **跨上游页去重**（键序 songmid/hash/id/name）——上游不认 page 时不会重复追加；
+	#   ② 上游声明的 **total 是硬上界**：攒满 total 就不再打下一页（也不会超发）。
+	# 窗口越过榜尾时回**空页**（带 offset/total），而不是显示"获取失败"。
 	my ($acc, $info, $total, $lastErr) = ([], undef, undef, undef);
+	my %acc_key;                       # 跨上游页去重（0.11.83）
 	my $slice = sub {
 		my $last = $skip + $window - 1;
 		$last = $#$acc if $last > $#$acc;
@@ -463,6 +477,7 @@ sub sdkBoardTracksHandler {
 							$page          = $first_page;
 							$pages_fetched = 0;
 							@$acc    = ();
+							%acc_key = ();      # 0.11.83：重取时去重表必须一起清（否则新页全被判成"已见"）
 							$info    = undef;
 							$total   = undef;
 							$lastErr = undef;
@@ -485,26 +500,49 @@ sub sdkBoardTracksHandler {
 
 				my $up = ($res->{ok} && $res->{data} && $res->{data}{list})
 					? $res->{data}{list} : [];
+				my $added = 0;
 				if (@$up) {
-					push @$acc, @$up;
+					for my $t (@$up) {
+						next unless ref($t) eq 'HASH';
+						my $k = $t->{songmid} // $t->{hash} // $t->{id} // $t->{name};
+						# 有键才判重（缺键的行照留：去重是"防重复"，不是"防新"）
+						next if defined $k && $acc_key{$k}++;
+						push @$acc, $t;
+						$added++;
+					}
 					$info = $res->{data}{info} if $pages_fetched == 1;
 					$total = $res->{data}{total}
 						if !defined $total && defined $res->{data}{total};
+					# 上游不认 page（给了重复行）时留一条 warn，便于以后一眼认出这类源
+					$log->warn(sprintf('LxMusic board dedupe: src=%s bangid=%s page=%d got=%d added=%d acc=%d total=%s',
+						$src, $bangid, $page, scalar(@$up), $added, scalar(@$acc),
+						(defined $total ? $total : '?')) ) if $added != scalar(@$up);
 				}
 				else {
 					$lastErr = $res->{error} || 'unknown';
 				}
-				my $enough = @$acc >= $skip + $window;
-				if (!$enough && @$up && $pages_fetched < $max_pages) {
+				# 够了的两条路：攒满窗口，或攒满上游声明的 total（后者是硬上界）
+				my $known  = (defined $total && $total =~ /^\d+$/ && $total > 0) ? $total : undef;
+				my $enough = @$acc >= $skip + $window || ($known && @$acc >= $known);
+				# $added == 0 ⇒ 这一页全是重复（上游不认 page）⇒ 再翻也是同一页，收手
+				if (!$enough && $added > 0 && $pages_fetched < $max_pages) {
 					$page++;
 					$again->();
 					return;
 				}
 				my $list = $slice->();
-				unless (@$list) {
+				if (!@$list) {
+					# 窗口整体越过榜尾：回空页（带 offset/total），别渲染成"获取失败"。
+					# index>0 说明这不是"打开榜单的第一屏"，而是翻页/枚举走到了榜尾之外。
+					if ((@$acc && $skip >= @$acc) || $index > 0) {
+						$cb->({ items => [], offset => $index,
+							(defined $total ? (total => $total) : ()) });
+						return;
+					}
 					$cb->({ items => [ { name => _u('获取失败: ') . ($lastErr || '无数据'), type => 'text' } ] });
 					return;
 				}
+				# $acc 是去过重的真实曲目表；$list 是窗口切片。board_render 的 total 仍取上游值
 				board_render($cb, $src, $bangid, $bname, $info, $acc, $list, $total, $index);
 			},
 		);
