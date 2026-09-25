@@ -1,6 +1,6 @@
-Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 1053.
+Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 1063.
 	(Maybe you meant system() when you said exec()?)
-Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 1153.
+Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 1163.
 	(Maybe you meant system() when you said exec()?)
 ok - parse ok=1
 ok - parse data url
@@ -19,9 +19,9 @@ ok - installSource wrote the file
 ok - installSource rejects junk
 
 ALL PASS
-Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 1053.
+Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 1063.
 	(Maybe you meant system() when you said exec()?)
-Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 1153.
+Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 1163.
 	(Maybe you meant system() when you said exec()?)
 LOG-WARN: LxMusic resolve: try [srcA] type=flac
 LOG-WARN: LxMusic resolve: try [srcB] type=flac
@@ -56,10 +56,10 @@ LOG-WARN: LxMusic resolve: try [srcA] type=flac
 LOG-WARN: LxMusic resolve: try [srcA] type=flac
 LOG-WARN: LxMusic resolve: try [srcB] type=flac
 LOG-WARN: LxMusic caps: [A.js] declares kw(128k/flac), wy(flac)
-LOG-WARN: LxMusic state: loaded 1 caps, 2 scored pairs from /tmp/Aoq2GfZ5dh/state.json
+LOG-WARN: LxMusic state: loaded 1 caps, 2 scored pairs from /tmp/_dg8wkew4g/state.json
 LOG-WARN: LxMusic resolve: try [srcB] type=flac
 LOG-WARN: LxMusic resolve: try [srcA] type=flac
-LOG-WARN: LxMusic state: /tmp/Aoq2GfZ5dh/state.json 解析失败，忽略（unexpected end of string while parsing JSON string, at character offset 3 (before "his is not json") at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/JSON/XS.pm line 49.
+LOG-WARN: LxMusic state: /tmp/_dg8wkew4g/state.json 解析失败，忽略（unexpected end of string while parsing JSON string, at character offset 3 (before "his is not json") at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/JSON/XS.pm line 49.
 ）
 ok - window: 未回调前已启动 2 个候选
 ok - window: 两个候选来自不同源
@@ -96,7 +96,7 @@ ok - tier: 未知格式原样大写
 ok - tier: ogg + 上游只声明 flac/320k/128k -> 仍是 OGG（不许被改写成 flac）
 ok - tier: ape + 上游声明 flac -> 仍是 APE
 ok - tier: wav + 上游声明 flac -> 仍是 WAV
-ok - tier: flac24bit + 上游只声明到 flac -> 仍被封顶为 flac
+NOT OK - tier: flac24bit + 上游只声明到 flac -> 仍被封顶为 flac : got=flac24bit
 ok - label: 192k -> MP3 192kbps
 ok - label: 256k -> MP3 256kbps
 ok - label: 已是人读标签则幂等（不再被 uc 成 FLAC 24BIT）
@@ -123,83 +123,4 @@ ok - state: 分数恢复（B|wy ok=1 / A|wy fail=1）
 ok - state: 恢复的分数真的影响派发顺序（B 先）
 ok - state: 坏文件只告警不抛异常
 
-ALL PASS
-Statement unlikely to be reached at t_build/Plugins/LxMusic/Helper.pm line 1053.
-	(Maybe you meant system() when you said exec()?)
-Statement unlikely to be reached at t_build/Plugins/LxMusic/Helper.pm line 1153.
-	(Maybe you meant system() when you said exec()?)
-ok - A1 首轮写满 300 行
-ok - A2 之后 4 轮"通知风暴"零写入（指纹止血）
-ok - B0 订阅者已注册
-ok - B1 playlist newmetadata 不排补发（自激回路的原料）
-ok - B2 playlist newsong 不排补发
-ok - B3 playlist open 不排补发
-ok - B4 playlist pause 不排补发
-ok - B5 playlist loadtracks 排一次尾部补发（改队列成员）
-ok - C1 10 轮回声回路累计写入 0 行
-ok - D1 连续"写了却队列没变" ⇒ 进入 60s 隔离
-ok - D2 隔离期内即使内容变了也不写
-
-ALL OK
-Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 1053.
-	(Maybe you meant system() when you said exec()?)
-Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 1153.
-	(Maybe you meant system() when you said exec()?)
-ok - size: 函数调用默认 -> 300
-ok - size: 函数调用 kind=big -> 500
-ok - size: 方法调用默认 -> 300（曾被类名污染成 0）
-ok - size: 方法调用 kind=big -> 500（曾被类名污染成 0）
-ok - size: 显式像素优先于档位
-ok - kw: 列表档代理目标 = kw:<songmid>:300
-ok - kw: 大图档代理目标 = kw:<songmid>:500（正在播放不再发虚）
-ok - kw: 两档是不同 URL（图像缓存不会互相污染）
-ok - wy: 列表档 300
-ok - wy: 大图档 500
-ok - tx: 列表档 R300x300
-ok - tx: 大图档 R500x500
-ok - mg: webp -> jpg
-ok - mg: mg 直取（不经我们的代理）
-ok - proxy: migu 域不中转（WebP + 谎报 MIME 的坑）
-ok - proxy: kw 图床仍中转（需 UA/Referer）
-ok - proxy: 非 http 一律不中转
-ok - secs: mm:ss -> 秒
-ok - secs: hh:mm:ss -> 秒
-ok - secs: 数字串直接当秒
-ok - secs: 无 interval 时按 128k 体积估算 = 270s（与上游真实 04:30 吻合）
-ok - secs: 第二首估算 223s
-ok - secs: 只有 flac 体积（无标称码率）-> 不硬造
-ok - secs: 什么都没有 -> undef
-ok - secs: 明显不合理的估算被丢弃
-
-ALL PASS
-Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 1053.
-	(Maybe you meant system() when you said exec()?)
-Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 1153.
-	(Maybe you meant system() when you said exec()?)
-ok - 空状态只发一次全平台探测
-ok - 平台顺序 = kg,tx,wy,mg,kw
-ok - 几何 kg: base0 slots
-ok - 几何 tx: base120 slots75
-ok - 几何 wy: base195 slots10（末页收敛）
-ok - 几何 mg: base205 slots1（末页收敛）
-ok - 几何 kw: base206 slots58
-ok - total = 各平台 slots 之和 (264)
-ok - 窗口[0,50) 由探测页直接覆盖 ⇒ 不补页
-ok - 窗口[50,50) 只需补 kg 第 2 页
-ok - 窗口[120,20) 命中已缓存页 ⇒ 不取
-ok - 窗口[206,50) 命中 kw 第 1 页 ⇒ 不取
-ok - 补页后窗口铺满 50 行
-ok - 第 1 行来自 kg 第 2 页
-ok - 第 50 行来自 kg 第 2 页末尾
-ok - 末页不足 ⇒ kg slots 恰好 120
-ok - total 仍为 264
-ok - 跨平台窗口铺满 15 行
-ok - 第 1 行来自 kg 第 3 页
-ok - 第 11 行跨到 tx 第 1 页
-ok - 失败页 2 ⇒ tx 上界收到 50
-ok - kg 不受影响
-ok - 失败页不再重试
-ok - 无结果时给一行 text 提示
-
-(PER=50 MAXPAGES=3 CAP=150)
-ALL OK
+1 FAILED
