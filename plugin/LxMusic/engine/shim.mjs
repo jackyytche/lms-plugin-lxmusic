@@ -627,9 +627,41 @@ async function main(std, os) {
 		// 布局：'fLaC'(4) + 元数据块头(4) + STREAMINFO：min/max blocksize(4) min/max framesize(6)
 		// ⇒ 第 12/13 字节起是 20bit 采样率 + 3bit 声道 + 5bit (位深-1)。
 		let bits = 0;
+		let samplerate = 0;
+		let channels = 0;
 		if (magic === 'flac' && bytes.length > 21) {
 			bits = (((bytes[20] & 0x01) << 4) | ((bytes[21] & 0xf0) >> 4)) + 1;
 			if (bits < 4 || bits > 32) bits = 0;      // 不可信就丢掉
+			// 0.11.84（A0）：同一个 STREAMINFO 里还有**采样率**(20bit)与**声道数**(3bit)——
+			// 一起交出去，好让"正在播放"面板的采样率/位深/声道**全部来自同一次嗅探**。
+			// 现场（2026-09-25 矩阵实测）：来自 QQ CDN 的 .flac 直链，LMS 自己的轨道行
+			// T/I/H 全是空（它只认 CDN 声明的 audio/x-ogg），而同类 FLAC 从别家 CDN 来时
+			// LMS 能读出 44100/16/2 ⇒ 同一份流在不同来源下字段有无不一致。
+			samplerate = ((bytes[18] << 12) | (bytes[19] << 4) | (bytes[20] >> 4));
+			channels   = ((bytes[20] >> 1) & 0x07) + 1;
+			if (samplerate < 8000 || samplerate > 384000) samplerate = 0;
+			if (channels < 1 || channels > 8) channels = 0;
+		}
+		else if (magic === 'mp3' && bytes.length > 10) {
+			// MP3：ID3v2 之后找帧同步 0xFFEx，从帧头读采样率索引与声道模式（4 字节就够）
+			let off = 0;
+			if (tag('ID3')) {
+				off = 10 + (((bytes[6] & 0x7f) << 21) | ((bytes[7] & 0x7f) << 14)
+					| ((bytes[8] & 0x7f) << 7) | (bytes[9] & 0x7f));
+				if (off < 0 || off > bytes.length - 4) off = 0;
+			}
+			for (let i = off; i + 3 < bytes.length && i < off + 8192; i++) {
+				if (bytes[i] !== 0xff || (bytes[i + 1] & 0xe0) !== 0xe0) continue;
+				const ver = (bytes[i + 1] >> 3) & 0x03;
+				const lay = (bytes[i + 1] >> 1) & 0x03;
+				const sri = (bytes[i + 2] >> 2) & 0x03;
+				if (ver === 1 || lay === 0 || sri === 3) continue;     // reserved
+				const base = ver === 3 ? [44100, 48000, 32000]
+					: (ver === 2 ? [22050, 24000, 16000] : [11025, 12000, 8000]);
+				samplerate = base[sri];
+				channels = ((bytes[i + 3] >> 6) & 0x03) === 3 ? 1 : 2;
+				break;
+			}
 		}
 		const head = bytes.slice(0, 32).map(c => (c >= 32 && c < 127) ? String.fromCharCode(c) : '.').join('');
 		const looksHtml = /^\s*(<!doctype|<html|<\?xml|\{|\[)/i.test(head);
@@ -678,6 +710,8 @@ async function main(std, os) {
 			bytes: bytes.length,
 			magic,
 			bits,
+			samplerate,
+			channels,
 			head: head,
 			url_effective: eff,
 		};

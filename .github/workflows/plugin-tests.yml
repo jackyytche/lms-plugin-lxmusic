@@ -97,6 +97,19 @@ jobs:
           LX_TEST_QUIET_WARN=1 perl -I t -I t_build t/board-window-test.pl 2>&1 | tee -a helper-test.log
           exit ${PIPESTATUS[0]}
 
+      # 0.11.84 (A0 matrix): tier/bitrate label derivation, pinned to the *measured* cells
+      # of the source x platform x tier matrix (tmp/label_matrix.py). A measured bit depth
+      # (FLAC STREAMINFO) now outranks the upstream `types[]` declaration -- kw's "晴天"
+      # really delivers 24bit/1647kbps while kw only declares up to flac, and the old cap
+      # reported "FLAC" (below the truth). Non-ladder formats (OGG/APE/WAV) must never be
+      # relabelled, and mp3 must land on the nearest measured bitrate tier.
+      - name: Tier label derivation regression (0.11.84)
+        run: |
+          cd plugin
+          set -o pipefail
+          LX_TEST_QUIET_WARN=1 perl -I t -I t_build t/tier-label-test.pl 2>&1 | tee -a helper-test.log
+          exit ${PIPESTATUS[0]}
+
       - name: CHECK Helper.pm
         run: cd plugin && perl -I t -I t_build -c t_build/Plugins/LxMusic/Helper.pm
 

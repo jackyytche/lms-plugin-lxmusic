@@ -205,6 +205,10 @@ sub _fresh_window { 30 }
 
 my $MAX_CACHE   = 200;
 
+# 0.11.84：扫描后重压 Content-Type/元数据的定时器宿主。**必须是本包自己的引用**——
+# 用 $client 当宿主时 LMS 会在队列变更/停止播放时把它身上的定时器全 kill（0.11.32 现场）。
+my $TYPE_ASSERT_OWNER = {};
+
 sub _cache_get {
 	my ($url) = @_;
 	my $c = $RESOLVE_CACHE{$url} or return undef;
@@ -216,7 +220,7 @@ sub _cache_get {
 }
 
 sub _cache_put {
-	my ($url, $direct, $fmt, $kbps, $secs, $len, $bits) = @_;
+	my ($url, $direct, $fmt, $kbps, $secs, $len, $bits, $samplerate, $channels) = @_;
 	return unless $url && $direct;
 	%RESOLVE_CACHE = () if keys %RESOLVE_CACHE > $MAX_CACHE;
 	my $rec = {
@@ -224,6 +228,9 @@ sub _cache_put {
 		# 0.11.56：位深也要进缓存——命中路径要靠它算出**真实档位**，
 		# 否则缓存命中时会退回"请求的档位"，于是又出现 "44.1kHz/16bit + FLAC 24bit" 这种自相矛盾。
 		bits   => $bits,
+		# 0.11.84：采样率/声道同样要进缓存（命中路径也要把这三把键发给 LMS）
+		samplerate => $samplerate,
+		channels   => $channels,
 		born   => time(),          # 出生时间：播放路径按它判"还新鲜吗"（_fresh_window）
 		expires => time() + _resolveTtl(),
 	};
@@ -268,9 +275,35 @@ sub getSeekData {
 }
 
 
+# 0.11.84（A0）：把**同一份嗅探**得到的采样率/位深/声道写进轨道行。
+# 为什么不能只靠 setRemoteMetadata：它只处理 TITLE/CT/SECS/BITRATE/YEAR（Slim/Music/Info.pm:395-491），
+# 而 LMS 状态查询里的 T/I/H 三个 tag 读的是 `tracks.samplerate/samplesize/channels`
+# （Slim/Control/Queries.pm:5509-5511）。这三个值本来就是"从真实流里读出来的"，
+# 我们不写，LMS 就只能在它自己认得出格式时才填（实测：同为 FLAC，一家 CDN 有值、另一家全空）。
+# 只写"合理范围"内的值；任何异常一律吞掉（写失败只影响面板显示，绝不能影响播放）。
+sub _write_audio_attrs {
+	my ($url, $samplerate, $bits, $channels) = @_;
+	return 0 unless $url;
+	my %attr;
+	$attr{SAMPLERATE} = int($samplerate) if $samplerate && $samplerate >= 8000 && $samplerate <= 384000;
+	$attr{SAMPLESIZE} = int($bits)       if $bits && $bits >= 8 && $bits <= 32;
+	$attr{CHANNELS}   = int($channels)   if $channels && $channels >= 1 && $channels <= 8;
+	return 0 unless %attr;
+	eval {
+		Slim::Schema->updateOrCreate({
+			url        => $url,
+			attributes => \%attr,
+			readTags   => 0,
+			commit     => 1,
+		});
+	};
+	return %attr ? 1 : 0;
+}
+
 # 解析收尾（快慢路径共用）：元数据 + 客户端刷新信号 + 流地址替换
 sub _finish_resolve {
-	my ($class, $song, $url, $info, $direct, $args, $cb, $fmt, $kbps, $secs, $tier) = @_;
+	my ($class, $song, $url, $info, $direct, $args, $cb, $fmt, $kbps, $secs, $tier,
+	    $bits, $samplerate, $channels) = @_;
 
 	# 0.11.52：档位标签一律用**真实拿到的**（$tier 由 _actualTier 从 fmt/码率/位深推出来），
 	# 拿不到才退回"请求的档位"。用户报的问题：pref 选 flac24bit 时，**连 128kbps 的 MP3
@@ -298,7 +331,21 @@ sub _finish_resolve {
 		$m{bitrate} = int($kbps) if $kbps && $kbps > 0;   # kbps；"格式码率"靠它
 		$m{secs}    = int($secs) if $secs && $secs > 0;   # 时长；canSeek 要求它已知
 		$m{title}   = $info->{name} if $info->{name};
+		# 0.11.84（A0）：**采样率/位深/声道也从同一次嗅探发出去**。
+		# 现场（2026-09-25 矩阵实测）：QQ CDN 的 .flac 直链，LMS 自己的轨道行
+		# `type=ogg, T/I/H 全空`，而同类 FLAC 从别家 CDN 来时 LMS 能读出 44100/16/2
+		# ⇒ 面板字段随来源忽有忽无，且与我们的标签不同源（用户报的"44.1kHz 16bit +
+		# FLAC 24bit 并存"就是这种自相矛盾）。LMS 的 remoteMeta 认这三把键
+		# （Slim/Control/Queries.pm:5749 `$remoteMeta->{T}=samplerate` 等）⇒ 我们发，
+		# 面板就与我们发布的档位同源；探测没读到就不发（宁可空着，也不编）。
+		$m{samplerate} = int($samplerate) if $samplerate && $samplerate >= 8000 && $samplerate <= 384000;
+		$m{samplesize} = int($bits)       if $bits && $bits >= 8 && $bits <= 32;
+		$m{channels}   = int($channels)   if $channels && $channels >= 1 && $channels <= 8;
 		eval { Slim::Music::Info::setRemoteMetadata($url, \%m) };
+		# ⚠️ `setRemoteMetadata` **只认 TITLE/CT/SECS/BITRATE/YEAR**（Slim/Music/Info.pm:395-491），
+		# 采样率/位深/声道它直接忽略 ⇒ 必须自己写进轨道行（tag T/I/H 读的就是这几列）。
+		# 值全部来自同一份嗅探；写失败只影响面板显示，故一律 eval 包住。
+		_write_audio_attrs($url, $samplerate, $bits, $channels);
 
 		# ⚠️ 同一份码率/时长**也必须发给真实直链 URL**（0.11.17）：
 		# 拖动时 LMS 走 `HTTP::getSeekData`，它第一行是
@@ -312,7 +359,12 @@ sub _finish_resolve {
 		$md{ct}      = $mime;
 		$md{bitrate} = int($kbps) if $kbps && $kbps > 0;
 		$md{secs}    = int($secs) if $secs && $secs > 0;
+		# 0.11.84：直链那条记录同样带上采样率/位深/声道（队列行/正在播放读的就是它）
+		$md{samplerate} = int($samplerate) if $samplerate && $samplerate >= 8000 && $samplerate <= 384000;
+		$md{samplesize} = int($bits)       if $bits && $bits >= 8 && $bits <= 32;
+		$md{channels}   = int($channels)   if $channels && $channels >= 1 && $channels <= 8;
 		eval { Slim::Music::Info::setRemoteMetadata($direct, \%md) } if $direct;
+		_write_audio_attrs($direct, $samplerate, $bits, $channels) if $direct;
 
 		return \%m;
 	};
@@ -329,6 +381,11 @@ sub _finish_resolve {
 		title   => $info->{name},
 		quality => (defined $tier && length $tier ? $tier : $info->{type}),
 		format  => $fmt,
+		# 0.11.84：采样率/位深/声道也进 %METADATA ⇒ getMetadataFor（LMS 的 remoteMeta）
+		# 能把它们交给 UI（tag T/I/H 的另一条路径，lxm:// 那一行走的就是它）
+		samplerate => $samplerate,
+		samplesize => $bits,
+		channels   => $channels,
 	});
 
 	# 用真实格式覆盖 CDN 撒谎的 Content-Type（只用 LMS 公开 API）
@@ -411,6 +468,29 @@ sub _finish_resolve {
 		# 扫描还会冲掉我们发布的 bitrate/secs（表现："格式码率闪一下就没"+不能拖进度条）
 		# ⇒ 扫完按真实值再发一次（见 $publish 注释）
 		$publish->() if $track;
+		# 0.11.84（A0 矩阵）：**再压一次真实 Content-Type**。
+		# 现场（2026-09-25 设备实测，`tmp/label_matrix.py`）：同一份 FLAC 流，来自 QQ CDN
+		# （`ws.stream.qqmusic.qq.com` 声明 `audio/x-ogg`）时，LMS 的**轨道行** `type=ogg`、
+		# T/I/H 全空；来自酷我 CDN 时却是 `type=flc, T=44100 I=16 H=2`。也就是说
+		# `Slim::Schema` 里那条 CT 是**扫描器在回调之后写进去的**（我们前面的
+		# setContentType/setRemoteMetadata 被它盖掉）⇒ 面板类型与"我们发布的档位"互相矛盾
+		# （用户报的正是这一类）。这里在扫描回调之后按真实 fmt 重压一次，并把
+		# 采样率/位深/声道一起发（见 $publish）。
+		if ($fmt && $direct) {
+			my $assert = sub {
+				eval {
+					Slim::Music::Info::setContentType($direct, $fmt);
+					Slim::Music::Info::setContentType($url, $fmt) if $url;
+				};
+				$publish->();
+			};
+			$assert->();
+			# 扫描器的属性写入可能比回调更晚 ⇒ 再补两次（4s / 12s）；只碰这两个我们自己的 URL，
+			# 定时器宿主用本包自己的 hashref 而不是 $client（LMS 会在队列变更时 kill 客户端的定时器）。
+			for my $delay (4, 12) {
+				Slim::Utils::Timers::setTimer($TYPE_ASSERT_OWNER, time() + $delay, $assert);
+			}
+		}
 		# 透传扫描器给的其余参数（原本写成 $cb->($track, @_)，$track 被传了两次、
 		# 后续参数整体错位一格；Song.pm 只读 ($newTrack,$error)，错位会让真实错误串丢失）
 		$cb->($track, @rest);
@@ -883,7 +963,8 @@ sub scanUrl {
 		my $ctier = $class->_actualTier($cached->{fmt}, $cached->{kbps}, $cached->{bits},
 			(ref($info->{music}{types}) eq 'ARRAY' ? $info->{music}{types} : undef));
 		$class->_finish_resolve($song, $url, $info, $cached->{direct}, $args, $cb,
-			$cached->{fmt}, $cached->{kbps}, $cached->{secs}, $ctier);
+			$cached->{fmt}, $cached->{kbps}, $cached->{secs}, $ctier,
+			$cached->{bits}, $cached->{samplerate}, $cached->{channels});
 		return;
 	}
 	if ($cached) {
@@ -942,7 +1023,8 @@ sub _resolve_fresh {
 				(defined $res->{actualKbps} ? " ~$res->{actualKbps}kbps" : ''),
 				$res->{format} // '<undef>',
 				(($res->{bits} || 0) ? " bits=$res->{bits}" : '')));
-			_cache_put($url, $direct, $res->{format}, $res->{actualKbps}, $res->{secs}, $res->{length}, $res->{bits});
+			_cache_put($url, $direct, $res->{format}, $res->{actualKbps}, $res->{secs}, $res->{length}, $res->{bits},
+				$res->{samplerate}, $res->{channels});
 
 			# 实际档位/码率如实进队列元数据（PC 端拿不到这个信息，我们靠 HEAD 反推）
 			$class->cache_metadata($url, {
@@ -955,7 +1037,8 @@ sub _resolve_fresh {
 
 			# 直链是实际流地址；playlist 里保持稳定的 lxm:// URL
 			$class->_finish_resolve($song, $url, $info, $direct, $args, $cb,
-				$res->{format}, $res->{actualKbps}, $res->{secs}, $tier);
+				$res->{format}, $res->{actualKbps}, $res->{secs}, $tier,
+				$res->{bits}, $res->{samplerate}, $res->{channels});
 			return;
 		},
 	);
@@ -1161,6 +1244,10 @@ sub cache_metadata {
 		# "格式"标签与**数字**码率（此前误把档位 key 当码率发 ⇒ 队列行显示 br=flac24bit）
 		kbps    => $info->{kbps}    || $old->{kbps}    || 0,
 		format  => $info->{format}  || $old->{format}  || '',
+		# 0.11.84（A0）：采样率/位深/声道同样按字段合并（getMetadataFor 要发 T/I/H）
+		samplerate => $info->{samplerate} || $old->{samplerate} || 0,
+		samplesize => $info->{samplesize} || $old->{samplesize} || 0,
+		channels   => $info->{channels}   || $old->{channels}   || 0,
 	);
 	$METADATA{$url} = \%new;
 
@@ -1207,6 +1294,13 @@ sub getMetadataFor {
 		}
 		# bitrate 必须是**数字 kbps**；没有真实码率就别发（否则 UI 显示乱值）
 		$meta{bitrate} = int($m->{kbps}) if $m->{kbps} && $m->{kbps} > 0;
+		# 0.11.84（A0）：采样率/位深/声道——LMS 把它们映射成 status 的 T/I/H
+		# （Slim/Control/Queries.pm:5749-5750 `$remoteMeta->{T}=samplerate` 等）。
+		# 有了它们，"正在播放"面板的 44.1kHz/16bit/2ch 与我们的档位标签**同源**，
+		# 不会再出现"面板 16bit + 标签 FLAC 24bit"这种用户看得到的自相矛盾。
+		$meta{samplerate} = int($m->{samplerate}) if $m->{samplerate} && $m->{samplerate} > 0;
+		$meta{samplesize} = int($m->{samplesize}) if $m->{samplesize} && $m->{samplesize} > 0;
+		$meta{channels}   = int($m->{channels})   if $m->{channels}   && $m->{channels}   > 0;
 		return %meta ? \%meta : {};
 	}
 
@@ -1287,7 +1381,13 @@ sub _actualTier {
 	# 现场（2026-09-24 实测）：交付的是 Ogg Vorbis 171kbps（魔数 4f676753、偏移 29 处 vorbis），
 	# 判决行却写 `flac ~171kbps`；该曲 types[] 只有 [128k,320k,flac]（没有 ogg）。详见
 	# docs/pc-vs-plugin-search-code.md §10.3。非梯档一律原样显示。
-	if ($tier && $TIER_RANK{$tier} && $declared && ref($declared) eq 'ARRAY' && @$declared) {
+	#
+	# ⚠️ 0.11.84（A0 矩阵）：**位深是实测出来的（STREAMINFO）时不受声明封顶**。
+	# 现场：kw《晴天》请求 flac24bit → 交付 bits=**24**、1647kbps，而 kw 的 types[] 只声明到 flac
+	# ⇒ 旧规则把标签压成 "FLAC"（**低于事实**）；wy《海阔天空》同理（bits=24、1511kbps）。
+	# 声明的用途是"别拿码率启发式吹牛"，不是"否认量出来的位深" ⇒ 只有**没量到位深**时才封顶。
+	my $measured_depth = ($f eq 'flc' && ($bits || 0) > 0) ? 1 : 0;
+	if ($tier && $TIER_RANK{$tier} && !$measured_depth && $declared && ref($declared) eq 'ARRAY' && @$declared) {
 		my %has = map { (ref($_) eq 'HASH' ? ($_->{type} // '') : $_) => 1 } @$declared;
 		delete $has{''};
 		if (%has && !$has{$tier}) {

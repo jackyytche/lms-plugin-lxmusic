@@ -287,6 +287,10 @@ sub probeUrl {
 				bytes  => $d->{bytes},
 				# 0.11.52：FLAC 位深（探测时从 STREAMINFO 读出来的）——用于"真实档位"标签
 				bits   => ($d->{bits} || 0),
+				# 0.11.84（A0）：同一次嗅探里的采样率/声道数 —— 发布给 LMS 的 remoteMeta，
+				# 让"正在播放"面板的采样率/位深/声道与我们的档位标签**同源**（不再自相矛盾）
+				samplerate => ($d->{samplerate} || 0),
+				channels   => ($d->{channels} || 0),
 				# 0.11.51：重定向链的**最终 URL**（无跳转时为空串）——上层用它替代原直链，
 				# 免得把一条会 302 的聚合中转链交给 LMS 的开流路径（现场会挂死，见 shim 注释）。
 				effective => ($d->{url_effective} && $d->{url_effective} ne $url)
@@ -661,6 +665,10 @@ sub resolveTrack {
 			# 0.11.60：把"该曲上游声明的档位"也交出去 ⇒ 上层算**同一个**真实档位
 			# （否则工具页/元数据/日志各算各的，又会出现"同一曲目显示不一致"，A0）
 			declared   => (ref($track->{types}) eq 'ARRAY' ? $track->{types} : undef),
+			# 0.11.84（A0）：采样率/声道（同一次 probe 嗅探；探测拿不到就是 0/undef）——
+			# 上层随 remoteMeta 发布，保证面板字段与我们发布的档位**同源**
+			samplerate => ($tm->{sr} || 0),
+			channels   => ($tm->{ch} || 0),
 			format     => $fmt,
 			friendly   => $friendly,
 			tries      => \@tries,
@@ -691,6 +699,8 @@ sub resolveTrack {
 					$log->warn("LxMusic resolve: following redirect -> "
 						. ($deliver =~ m{^https?://([^/]+)} ? $1 : $deliver));
 				}
+				$tm->{sr} = $pi->{samplerate} || 0;      # 0.11.84：同一次嗅探的采样率/声道
+				$tm->{ch} = $pi->{channels} || 0;
 				return $finish->($src, $q, $deliver, $tm, $friendly, 1, $kbps, $pi->{magic}, $pi->{length}, $pi->{bits});
 			}
 			push @tries, { source => $src->{name}, quality => $q, why => 'verify: ' . ($pi->{error} // '?'), %$tm };
