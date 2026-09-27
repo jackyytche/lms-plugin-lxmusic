@@ -1717,11 +1717,20 @@ sub sdkSonglistDetailHandler {
 	#   一次就落在正确页上（没有空页那一跳），且只取窗口那么宽的页。
 	#   下界 20：window=1 是"点单行"的形态（多数由 `_feed_cache_cover` 命中，漏网时才真打上游），
 	#   取 20 行 ~60KB 比取 1 行稳；上界 300 与 `$window` 的夹取一致。
+	#
+	# 0.11.90（待办 B-8）：**tx / wy 也并进"按窗取数"**。第二十三轮曾判定这两个平台
+	# "上游一次给整单、不认 page" —— 那是**误判**：当时走的是 SDK，而 SDK 把页码参数写死了
+	# （tx `song_begin: 0` 硬编码；wy `n: limit_song=100000`）。绕过 SDK 直打上游实测：
+	#   · tx `musicu.fcg` **认 `song_begin`**：`begin=0&num=50` 50 行/100285B，
+	#     `begin=50&num=50` 16 行/33576B 且**首曲不重叠** ⇒ 真翻页（`tmp/detail_paging_probe.py`）；
+	#   · wy 的 `v6/playlist/detail` **认 `n`**（200 首歌单：n=100000→481KB，n=0→44KB），
+	#     但 `s` **不是 offset** ⇒ 走"n=0 拿全部 trackIds + SDK 的 song/detail 按窗口 ids 取"两跳。
+	#   与 kw 完全同款接线：给 `rn` ⇒ 快路径；不给（整单展开/m3u）⇒ shim 回落 SDK，行为不变。
 	my $rn = $window;
 	$rn = 20  if $rn < 20;
 	$rn = 300 if $rn > 300;
-	my $kw_window = ($src eq 'kw') ? 1 : 0;
-	my $upw   = $kw_window ? $rn : 50;
+	my $win_src = ($src eq 'kw' || $src eq 'tx' || $src eq 'wy') ? 1 : 0;
+	my $upw   = $win_src ? $rn : 50;
 	my $page  = int($index / $upw) + 1;
 	my $skip  = $index % $upw;
 	my $retuned = 0;
@@ -1732,7 +1741,7 @@ sub sdkSonglistDetailHandler {
 	Plugins::LxMusic::Helper->request(
 		action  => 'songlistdetail',
 		info    => { source => $src, id => $plid, page => $page,
-			($lean ? (lean => 1) : ()), ($kw_window ? (rn => $rn) : ()) },
+			($lean ? (lean => 1) : ()), ($win_src ? (rn => $rn) : ()) },
 		timeout => 30,
 		cb      => sub {
 			my ($res) = @_;
@@ -1804,13 +1813,14 @@ sub sdkSonglistDetailHandler {
 			};
 			_feed_cache_put($ckey, $feed, $window);
 			# 0.11.89（B-7）：**上游一次就把整单给了我们** ⇒ 顺手把**下一个窗口**本地切好。
-			# 实测（`tmp/pl_board_pagewidth_probe.py`，走 shim-sim 真打上游）：
-			#   tx 详情 p1 = 66 行 / **limit=100000** / p2 **与 p1 完全相同**（`getListDetail2` 的
-			#   `song_begin` 硬编码 0，根本不认 page）；wy limit=1000、kg limit=100 也是"一次给整单"。
-			# 后果：插件按 50 猜页宽与真页宽不符 ⇒ 用户点"下一页"时**重取一遍整单**
+			# ⚠️ 0.11.90 订正：第二十三轮归因"tx 的 `song_begin` 硬编码 0、根本不认 page"是**误判**
+			#   （那是 SDK 写死的，不是上游）—— 见本文件 pl-detail 顶部 0.11.90 的注释与
+			#   `tmp/detail_paging_probe.py` 实测。tx/wy 现已按窗取数（limit=rn < total）⇒ **不再走这里**。
+			#   这条现在只对"确实把整单塞给我们"的源生效（判据就是 `limit >= total`），是**兜底**：
+			#   实测 kg 详情 `limit=100`、tx 老路径 `limit=100000` 命中过；mg 真翻页（limit=50<total）不受影响。
+			# 后果（若不兜底）：插件按 50 猜页宽与真页宽不符 ⇒ 用户点"下一页"时**重取一遍整单**
 			#   （tx 实测 131220B/545ms ×2）。这里把下一窗**纯本地切片**备好（0 上游流量），
-			#   于是下一页直接命中 feed 缓存。只对"limit ≥ total"（= 已经拿到全部）生效；
-			#   mg 是真翻页（limit=50 < total）、kw 现在按窗取数（limit=rn < total）⇒ 都不受影响。
+			#   于是下一页直接命中 feed 缓存。
 			if (defined $res->{data}{limit} && ($total || 0) > 0
 				&& $res->{data}{limit} >= $total && $total > ($index + $window))
 			{

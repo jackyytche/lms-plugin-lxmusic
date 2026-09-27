@@ -100,12 +100,18 @@ sub run_detail {
 		push @req, \%a;
 		my %data = (list => [ map { { source => 'mg', songmid => "s$_", name => "歌$_", singer => 'A' } } 1 .. 5 ],
 			limit => 50, total => 111);
-		# 0.11.87（B-6）：真实上游**会回显我们请求的 rn**（实测 kw `rn=20/50/100/1000` 全部回显），
+		my $dsrc = $a{info}{source} // '';
+		# 0.11.87（B-6）/ 0.11.90（B-8）：真实上游**会回显我们请求的 rn**
+		# （实测 kw `rn=20/50/100/1000`、tx `song_num`、wy `window` 全部按请求宽度回），
 		# 所以桩也照此回显 —— 这样"首猜页宽 == 响应的 limit ⇒ 不再重取"这条断言才有意义。
 		$data{limit} = $a{info}{rn} if $a{info}{rn};
-		# 0.11.89（B-7）：tx 这类平台**一次就把整单给我们**（实测 limit=100000、p2 与 p1 完全相同）
-		$data{limit} = 100000 if ($a{info}{source} // '') eq 'tx';
-		$data{total} = 66     if ($a{info}{source} // '') eq 'tx';
+		# 0.11.90 订正：**只有"不给 rn 的老路径"才是一次给整单**（tx 实测 limit=100000）。
+		$data{limit} = 100000 if $dsrc eq 'tx' && !$a{info}{rn};
+		$data{total} = 66     if $dsrc eq 'tx';
+		# kg 的 vendored SDK `listDetailLimit = 10000` ⇒ 至今仍是"一次给整单"
+		# ⇒ 它才是 PRE-NEXT 兜底（§6）的现实用例。
+		$data{limit} = 10000 if $dsrc eq 'kg';
+		$data{total} = 300   if $dsrc eq 'kg';
 		$data{info} = { name => '上游名', author => '上游作者', img => 'https://up.example/c.jpg', count => 999 }
 			if $a{action} eq 'songlistdetail' && !$a{info}{lean};
 		$a{cb}->({ ok => 1, data => \%data, ms => 12 });
@@ -191,23 +197,40 @@ my ($r4) = kw_req(index => 7, qty => 1, id => 'kw0004');
 check('kw window=1 ⇒ rn 取**下界 20**（不抠成 1 行）', (($r4->[0]{info}{rn} // 0) == 20), $r4->[0]{info}{rn} // 'undef');
 check('kw window=1 ⇒ page 按 20 行算（idx=7 ⇒ 第 1 页）', (($r4->[0]{info}{page} // 0) == 1), $r4->[0]{info}{page} // 'undef');
 
-# 非 kw 平台必须**完全不受影响**：不带 rn、页宽仍按 50 猜（否则会动到 kg/tx/wy/mg 的既有行为）
+# 0.11.90（待办 B-8）：**tx / wy 也并进"按窗取数"**（上游认页码，实测见 `tmp/detail_paging_probe.py`
+# 与 `tmp/detail_lean_shim_probe.py`：tx 自带 `song_begin` 真翻页；wy 无 offset 但可以
+# "v6 `n=0` 拿 trackIds + 明文 `/api/v3/song/detail` 按窗口 id 取"）。
+# 它们必须**带 rn**、且页宽首猜 = rn；**其余平台（kg/mg）行为一点都不能变**。
 my ($r5) = kw_req(src => 'tx', index => 100, qty => 300, id => 'tx0001');
-check('非 kw（tx）⇒ info 里**没有** rn 键', !exists $r5->[0]{info}{rn}, join(',', sort keys %{ $r5->[0]{info} }));
-check('非 kw（tx）⇒ 页宽仍按 50 猜（idx=100 ⇒ page=3）', (($r5->[0]{info}{page} // 0) == 3), $r5->[0]{info}{page} // 'undef');
+check('tx 也带 rn（0.11.90，按窗取数）', (($r5->[0]{info}{rn} // 0) == 300), $r5->[0]{info}{rn} // 'undef');
+check('tx 页宽 = rn ⇒ idx=100/page=1（不再按 50 猜出 page=3）',
+	(($r5->[0]{info}{page} // 0) == 1), $r5->[0]{info}{page} // 'undef');
+check('tx：limit 与首猜页宽一致 ⇒ 只打一次上游', @$r5 == 1, scalar @$r5);
 
-# ---------- 6. 上游"一次给整单"时，顺手本地预切下一窗（0.11.89，待办 B-7） ----------
-# 实测（`tmp/pl_board_pagewidth_probe.py`）：tx 详情 limit=100000 且**第 2 页与第 1 页完全相同**
-# （SDK 的 `song_begin` 硬编码 0）⇒ 插件从前点"下一页"会把整单**再取一遍**（131KB/545ms ×2）。
+my ($r5w) = kw_req(src => 'wy', index => 150, qty => 50, id => 'wy0001');
+check('wy 也带 rn（0.11.90）', (($r5w->[0]{info}{rn} // 0) == 50), $r5w->[0]{info}{rn} // 'undef');
+check('wy idx=150 window=50 ⇒ page=4（页宽 = rn）', (($r5w->[0]{info}{page} // 0) == 4), $r5w->[0]{info}{page} // 'undef');
+check('wy：只打一次上游', @$r5w == 1, scalar @$r5w);
+
+my ($r6) = kw_req(src => 'kg', index => 100, qty => 300, id => 'kg0001');
+check('非窗口平台（kg）⇒ info 里**没有** rn 键', !exists $r6->[0]{info}{rn}, join(',', sort keys %{ $r6->[0]{info} }));
+check('非窗口平台（kg）⇒ 页宽仍按 50 猜（idx=100 ⇒ page=3）', (($r6->[0]{info}{page} // 0) == 3), $r6->[0]{info}{page} // 'undef');
+my ($r6m) = kw_req(src => 'mg', index => 100, qty => 300, id => 'mg0001');
+check('非窗口平台（mg）⇒ 也没有 rn', !exists $r6m->[0]{info}{rn}, join(',', sort keys %{ $r6m->[0]{info} }));
+
+# ---------- 6. 上游"一次给整单"时，顺手本地预切下一窗（0.11.89 B-7；0.11.90 起是**兜底**） ----------
+# ⚠️ 0.11.90 订正：这条**曾经**用 tx 当例子，但那是误判（tx 的 `song_begin` 是 SDK 写死的，
+# 上游其实认页码）。tx/wy/kw 现在都按窗取数 ⇒ 只对"确实把整单塞给我们"的源生效，
+# 现实用例是 **kg**（vendored SDK `listDetailLimit = 10000`）。
 # 这里钉死：limit ≥ total 时，同一个 handler 的下一个窗口必须是**缓存命中**（0 次新请求）。
 {
 	@req = ();
-	my ($rr, $ff) = kw_req(src => 'tx', index => 0, qty => 50, id => 'tx9001');
+	my ($rr, $ff) = kw_req(src => 'kg', index => 0, qty => 50, id => 'kg9001');
 	check('pre-next: 第一窗仍打一次上游', @$rr == 1, scalar @$rr);
 	check('pre-next: 第一窗有条目（桩 5 行 + 哨兵行）',
 		ref($ff->[0]{items}) eq 'ARRAY' && @{ $ff->[0]{items} } >= 5, scalar @{ $ff->[0]{items} || [] });
 
-	my ($rr2, $ff2) = kw_req(src => 'tx', index => 50, qty => 50, id => 'tx9001');
+	my ($rr2, $ff2) = kw_req(src => 'kg', index => 50, qty => 50, id => 'kg9001');
 	check('pre-next: 第二窗**零新增上游请求**（本地预切命中）', @$rr2 == 0, scalar @$rr2);
 	check('pre-next: 第二窗仍产出条目（不是空页）',
 		ref($ff2->[0]{items}) eq 'ARRAY' && @{ $ff2->[0]{items} } >= 5, scalar @{ $ff2->[0]{items} || [] });
@@ -218,6 +241,13 @@ check('非 kw（tx）⇒ 页宽仍按 50 猜（idx=100 ⇒ page=3）', (($r5->[0
 	check('pre-next: 对照 mg 第一窗打上游', @$r3 == 1, scalar @$r3);
 	my ($r4) = kw_req(src => 'mg', index => 50, qty => 50, id => 'mg9002');
 	check('pre-next: 真翻页平台（mg，limit<total）第二窗仍打上游', @$r4 == 1, scalar @$r4);
+
+	# 0.11.90 新增：**按窗取数的平台不许触发 PRE-NEXT**（limit = rn < total ⇒ 判据不成立）
+	@req = ();
+	my ($t1) = kw_req(src => 'tx', index => 0, qty => 50, id => 'tx9101');
+	check('按窗平台 tx：第一窗打上游', @$t1 == 1, scalar @$t1);
+	my ($t2) = kw_req(src => 'tx', index => 50, qty => 50, id => 'tx9101');
+	check('按窗平台 tx：第二窗**照旧打上游**（窗口由上游给出，不该被本地预切顶掉）', @$t2 == 1, scalar @$t2);
 }
 
 print $failed ? "\n$failed FAILED\n" : "\nALL PASS\n";

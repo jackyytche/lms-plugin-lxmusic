@@ -1019,6 +1019,23 @@ async function main(std, os) {
 			const p = (x) => (x < 10 ? '0' + x : String(x));
 			return (m == 0 && s2 == 0) ? '--/--' : p(m) + ':' + p(s2);
 		}
+		// 与 vendored `renderer/utils/index.js::formatPlayCount` 同口径 ——
+		// 歌单详情快路径自带解析时要还原同一个 play_count（插件当前不消费它，但探针/A-B 会看）
+		function __fmtCount(num) {
+			const n = Number(num) || 0;
+			if (n > 100000000) return (Math.trunc(n / 10000000) / 10) + '\u4ebf';
+			if (n > 10000) return (Math.trunc(n / 1000) / 10) + '\u4e07';
+			return String(n);
+		}
+		// 窗口宽度：与 Perl 侧 `$rn` 的夹取一致（下界 20 是为"点单行"时别只取 1 行，上界 300）
+		function __leanWindow(rn) {
+			const rq = Number(rn);
+			return (rq >= 1 && rq <= 300) ? Math.floor(rq) : 100;
+		}
+		function __leanPage(page) {
+			const p = Number(page);
+			return (p >= 1) ? Math.floor(p) : 1;
+		}
 		async function kgLeanDetail(rawId, page) {
 			const id = String(rawId).replace(/^id_/, '').replace(/.*special\/single\//, '');
 			if (!/^\d+$/.test(id)) throw new Error('lean: not a numeric special id');
@@ -1122,6 +1139,158 @@ async function main(std, os) {
 					author: body.uname || '', count: total,
 					play_count: (typeof sl.formatPlayCount === 'function') ? sl.formatPlayCount(body.playnum) : '',
 				},
+			};
+		}
+
+		// ---- tx 歌单详情「按窗取数」快路径（0.11.90，待办 B-8）----
+		// ⚠️ 先纠正第二十三轮的一条**误判**：当时说"tx 上游一次给整单、不认 page"。那条结论
+		// 走的是 SDK 的 `getListDetail2`，而它把 `song_begin: 0` **写死在请求里**
+		// （`renderer/utils/musicSdk/tx/songList.js:224`）⇒ "第 2 页 == 第 1 页"只能说明
+		// **我们没把页码传下去**，不能说明上游不认。
+		// 本轮绕过 SDK 直接量上游（`tmp/detail_paging_probe.py`，明文 POST `musicu.fcg`）：
+		//   · `song_begin=0&song_num=100000` -> 66 行 / 131167B / total=66
+		//   · `song_begin=0&song_num=50`     -> 50 行 / 100285B（约 2.0KB/行，线性）
+		//   · `song_begin=50&song_num=50`    -> 16 行 / 33576B，**首曲与第 1 窗不重叠**（真翻页）
+		//   · `song_begin=100&song_num=50`   -> 0 行（越界回空，`total` 仍是 66）
+		// ⇒ 上游**完全认 `song_begin`/`song_num`**：按窗取数与 kw 同款；解析仍交回 SDK 的
+		//   `filterListDetail`（不重写字段映射）。任何一步不对就抛错，由调用方回落到 SDK 原路径。
+		async function txLeanDetail(rawId, page, rn) {
+			const sl = sdk.tx && sdk.tx.songList;
+			if (!sl || !sl.filterListDetail) throw new Error('lean: tx songList unavailable');
+			const id = String(rawId == null ? '' : rawId).trim();
+			// 只接管纯数字 disstid（歌单搜索/列表给的就是它）；URL、带参数、非数字一律回落 SDK
+			if (!/^\d+$/.test(id)) throw new Error('lean: tx non-numeric id -> sdk');
+			const want = __leanWindow(rn);
+			const begin = (__leanPage(page) - 1) * want;
+			const body = {
+				comm: {
+					cv: 4747474, ct: 24, format: 'json', inCharset: 'utf-8',
+					outCharset: 'utf-8', platform: 'yqq.json', needNewCode: 1, uin: 0,
+				},
+				req_1: {
+					module: 'music.srfDissInfo.aiDissInfo',
+					method: 'uniform_get_Dissinfo',
+					param: {
+						disstid: Number(id), userinfo: 1, tag: 1, orderlist: 1,
+						song_begin: begin, song_num: want, onlysonglist: 0, enc_host_uin: '',
+					},
+				},
+			};
+			const r = await globalThis.__lxBinHttp.fetch('https://u.y.qq.com/cgi-bin/musicu.fcg', {
+				method: 'POST',
+				headers: {
+					'Content-Type': 'application/json',
+					'Origin': 'https://y.qq.com',
+					'Referer': 'https://y.qq.com/n/yqq/playsquare/' + id + '.html',
+				},
+				body: toUtf8(JSON.stringify(body)),
+				timeout: 15000,
+			});
+			if (r.statusCode !== 200) throw new Error('lean http ' + r.statusCode);
+			const j = JSON.parse(utf8Decode(r.bytes));
+			const req1 = j && j.req_1;
+			const d = req1 && req1.data;
+			// SDK 的同款判据：body.code 与 req_1.code 都要 0，且 songlist 必须是数组
+			if (!j || j.code !== 0 || !req1 || req1.code !== 0 || !d || !Array.isArray(d.songlist)) {
+				throw new Error('lean: bad body (code=' + (j && j.code) + ', req1=' + (req1 && req1.code) + ')');
+			}
+			const dir = d.dirinfo || {};
+			const total = Number(d.total_song_num) || 0;
+			return {
+				list: sl.filterListDetail(d.songlist),
+				page: __leanPage(page),
+				limit: want,
+				total,
+				source: 'tx',
+				info: {
+					name: dir.title || '', img: dir.picurl || '',
+					desc: String(dir.desc == null ? '' : dir.desc).replace(/<br>/g, '\n'),
+					author: dir.host_nick || '', count: dir.songnum || total,
+					play_count: __fmtCount(dir.listennum),
+				},
+			};
+		}
+
+		// ---- wy 歌单详情「按窗取数」快路径（0.11.90，待办 B-8）----
+		// wy 与 tx 不同：**没有服务端 offset**，但也不需要任何加密（下面两跳全是明文口）。
+		// 实测（`tmp/detail_paging_probe.py` + 直打上游，歌单 3778678 共 200 首）：
+		//   · `api/playlist/track/all` 是 **404**（那是 NCMApi 本地服务的路由，不是网易的路由）；
+		//   · `api/v6/playlist/detail?id=&n=&s=8` 的 **`s` 不是 offset**：n=50 时 s=0/1/8/50/100
+		//     拿到的**永远是第 0 首**；`offset`/`o`/`start`/`pn` 也一律被忽略；
+		//   · 但 `n` 是**真页宽**：同一歌单 `n=100000` 481741B(tracks=200) → `n=50` 155171B(50) →
+		//     `n=0` **44249B(tracks=0)**，而 `trackIds` **无论 n 都是全量**（200 个），
+		//     元数据（name/coverImgUrl/description/creator/playCount/trackCount）**也都在**；
+		//   · ⚠️ 不能用 `n=W` 的 `tracks` 当行源：**上游会裁**（歌单 18129092448：trackIds=27
+		//     而 `n=100000` 也只回 10 行）⇒ 拿它渲染会**缺行**；
+		//   · ✅ 真正的第二跳是**明文 POST** `api/v3/song/detail`（form: `ids=[...]&c=[{"id":N},...]`）：
+		//     实测 50 个 id → 108197B、**songs=50 且 privileges=50**（`maxbr=999000`/`maxBrLevel=hires`
+		//     等档位字段齐全），`start=50` 的窗口首曲 == `trackIds[50]`（偏移正确、与 SDK 的
+		//     `weapi/v3/song/detail` 同源）。⚠️ 换个口就不行：`api/song/detail`（无 v3）**privileges 是空的**，
+		//     而 `filterListDetail` 缺 privilege 会**整行丢弃** ⇒ 必须用 v3 这个口。
+		// ⇒ 两跳取一窗（每页恒定 ≈44KB + ≈108KB，与歌单总长**基本无关**）：
+		//   ① `v6/playlist/detail?n=0`（明文）拿元数据 + 全部 trackIds ⇒ 算 total 与这一窗的 id；
+		//   ② `v3/song/detail`（明文 POST）只取这一窗 id 的歌曲 + privileges；
+		//   解析仍交回 SDK 的 `wy.songList.filterListDetail({playlist:{tracks},privileges})`。
+		// 拒绝的输入（带 `###` MUSIC_U token、URL、非数字 id）与任何一步失败 ⇒ 回落 SDK 原路径。
+		async function wyLeanDetail(rawId, page, rn) {
+			const sl = sdk.wy && sdk.wy.songList;
+			if (!sl || !sl.filterListDetail) throw new Error('lean: wy songList unavailable');
+			const id = String(rawId == null ? '' : rawId).trim();
+			if (/###/.test(id)) throw new Error('lean: wy id carries MUSIC_U token -> sdk');
+			if (/[?&:/]/.test(id)) throw new Error('lean: wy non-numeric id -> sdk');
+			if (!/^\d+$/.test(id)) throw new Error('lean: wy non-numeric id -> sdk');
+			const want = __leanWindow(rn);
+			const pageNo = __leanPage(page);
+			const start = (pageNo - 1) * want;
+			const WY_HDRS = {
+				'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/60.0.3112.90 Safari/537.36',
+				'Referer': 'https://music.163.com/',
+				'Cookie': 'MUSIC_U=',
+			};
+			// ① 元数据 + 全部 trackIds（n=0 ⇒ 不下载任何 tracks/privileges）
+			const r1 = await globalThis.__lxBinHttp.fetch(
+				'https://music.163.com/api/v6/playlist/detail?id=' + id + '&n=0&s=8',
+				{ headers: WY_HDRS, timeout: 15000 });
+			if (r1.statusCode !== 200) throw new Error('lean http ' + r1.statusCode);
+			const b1 = JSON.parse(utf8Decode(r1.bytes));
+			const pl = b1 && b1.playlist;
+			if (!pl || !Array.isArray(pl.trackIds)) throw new Error('lean: bad body (no trackIds)');
+			const tids = [];
+			for (const t of pl.trackIds) { const v = t && t.id; if (v != null) tids.push(v); }
+			const total = tids.length;
+			const info = {
+				name: pl.name || '', img: pl.coverImgUrl || '',
+				desc: pl.description || '',
+				author: (pl.creator && pl.creator.nickname) || '',
+				count: pl.trackCount || total,
+				play_count: __fmtCount(pl.playCount),
+			};
+			const win = tids.slice(start, start + want);
+			if (!win.length) {
+				return { list: [], page: pageNo, limit: want, total, source: 'wy', info };
+			}
+			// ② 这一窗的歌曲 + privileges（明文 POST /api/v3/song/detail）
+			const ids = '[' + win.join(',') + ']';
+			const cjson = '[' + win.map(v => '{"id":' + v + '}').join(',') + ']';
+			const form = 'ids=' + encodeURIComponent(ids) + '&c=' + encodeURIComponent(cjson);
+			const r2 = await globalThis.__lxBinHttp.fetch('https://music.163.com/api/v3/song/detail', {
+				method: 'POST',
+				headers: Object.assign({ 'Content-Type': 'application/x-www-form-urlencoded' }, WY_HDRS),
+				body: toUtf8(form),
+				timeout: 15000,
+			});
+			if (r2.statusCode !== 200) throw new Error('lean http ' + r2.statusCode);
+			const b2 = JSON.parse(utf8Decode(r2.bytes));
+			const songs = b2 && b2.songs;
+			const privs = b2 && b2.privileges;
+			// ⚠️ 两者缺一个都不能用（缺 privileges 时 filterListDetail 会在 `privilege.id` 上抛）
+			if (!Array.isArray(songs) || !Array.isArray(privs) || !privs.length) {
+				throw new Error('lean: bad body (songs=' + (songs ? songs.length : '-')
+					+ ', privileges=' + (privs ? privs.length : '-') + ')');
+			}
+			return {
+				list: sl.filterListDetail({ playlist: { tracks: songs }, privileges: privs }),
+				page: pageNo, limit: want, total, source: 'wy', info,
 			};
 		}
 
@@ -1240,6 +1409,24 @@ async function main(std, os) {
 					}
 					catch (e) {
 						print('LOG kw lean failed, fallback to sdk: ' + String((e && e.message) || e));
+					}
+				}
+				// tx / wy 按窗取数（0.11.90，待办 B-8）：同 kw 的约定 —— 调用方给 `rn`（这一窗要几行）
+				// 才走快路径；整单展开/m3u/网页详情等"要全量"的入口不给 `rn` ⇒ 回落 SDK（行为不变）。
+				if (src === 'tx' && Number(payload.rn) > 0) {
+					try {
+						return await txLeanDetail(id, page, payload.rn);
+					}
+					catch (e) {
+						print('LOG tx lean failed, fallback to sdk: ' + String((e && e.message) || e));
+					}
+				}
+				if (src === 'wy' && Number(payload.rn) > 0) {
+					try {
+						return await wyLeanDetail(id, page, payload.rn);
+					}
+					catch (e) {
+						print('LOG wy lean failed, fallback to sdk: ' + String((e && e.message) || e));
 					}
 				}
 				return await sl.getListDetail(id, page);
