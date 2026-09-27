@@ -91,6 +91,10 @@ sub initPlugin {
 		coverThumb     => 300,
 		# 0.11.62：大图档（队列行/正在播放面板会请求 300~500px，用 300 会发虚）
 		coverThumbBig  => 500,
+		# 0.11.86：渲染期**封面预热**前 N 行（0 = 关，上限 5）。只对需要"二次解析"的
+		# kw/kg 代理目标有意义（kw 一次 pic.web GET、kg 一次 get_res_privilege POST），
+		# 详见 Plugin::warmCovers 的说明。
+		coverWarmMax   => 3,
 	});
 
 	unless (Plugins::LxMusic::Helper->init) {
@@ -765,6 +769,12 @@ sub _trackItems {
 	# 渲染期预热**只热 1 首**（0.11.58）：预热是后台行为，Helper 侧标 bg、设备一忙就丢弃。
 	# 从前热 3 首 × 多源 × 全档位，纯浏览就能把串行 worker 堆到 22 个在跑请求（实测）。
 	Plugins::LxMusic::ProtocolHandler->warmTracks([ map { $_->{url} } @items ], 1) if @items;
+
+	# 0.11.86：**同时预热前 N 行封面**（大图档；kw/kg 需二次解析，见 warmCovers 的注释）。
+	# 走的是 LMS 的 SimpleAsyncHTTP，与上面的取链预热是两条独立通道，不会互相排队。
+	# 包 eval：列表渲染是用户可见路径，任何封面侧的意外都不该让整页 500。
+	eval { __PACKAGE__->warmCovers($list) };
+	$log->warn('LxMusic: warmCovers died: ' . $@) if $@;
 	return \@items;
 }
 
@@ -1189,11 +1199,24 @@ sub _plItems {
 		# 而 action=playall 会退化成"把详情 feed 当前这一页（quantity=itemsPerPage=50）当播放列表入队"
 		# ⇒ 用户报的「歌单播放队列只有 50 首」。id 只允许 [A-Za-z0-9_-]（explodePlaylist 的 URL 正则）。
 		my $plurl = ($pl->{id} =~ /^[A-Za-z0-9_-]+$/) ? "lxm://l/$src/$pl->{id}" : undef;
+		# 0.11.86（待办 B-5）：把"列表行**已经有**的歌单头部数据"随下钻链接带下去。
+		# 现场（`tmp/sdk_endpoint_size.py` 实测）：mg 的歌单详情要打两跳——歌曲页 81KB/~0.4s，
+		# 外加一跳 `resource/playlist/v2.0` 只有 **2.2KB 却要 886~1354ms**，而且它只提供
+		# name/img/desc/author/play_count —— 这些**列表行里全都有**（名字、作者、首数、封面）。
+		# 带下去之后 mg 走 lean 路径（只打歌曲页）；拿不到就退回现取，零风险。
+		my $head = eval {
+			encode_base64url($TRACK_JSON->encode({
+				name   => $pl->{name} || '',
+				img    => ($img && $img =~ m{^https?://}) ? $img : '',
+				author => $pl->{author} || '',
+				count  => ($pl->{total} || 0) + 0,
+			}))
+		} // '';
 		push @items, {
 			name        => _u('🎼 ') . $name . ($meta ne '' ? "  ($meta)" : ''),
 			type        => 'link',
 			url         => \&sdkSonglistDetailHandler,
-			passthrough => [ 'songlistdetail', $src, $pl->{id} ],
+			passthrough => [ 'songlistdetail', $src, $pl->{id}, $head ],
 			($plurl ? (playlist => $plurl) : ()),
 			(($img && $img =~ m{^https?://}) ? (image => _u($img)) : ()),
 		};
@@ -1326,12 +1349,80 @@ sub sdkPlPlatformsHandler {
 	return;
 }
 
+# ---------- 0.11.86（待办 B-4）：进平台就**并行预热下一层** ----------
+# 现场：歌单树是四层下钻（平台 → 排序 tab → 分类标签 → 列表），每层都要等一次上游；
+# 用户体感的"mg 加载慢"就来自这里（实测单层 pl-list 604ms / pl-detail 893ms，逐层叠加）。
+# 进平台那一刻其实已经确定了下一层要什么：
+#   · 分类标签 —— `songlisttags` 只吃 `source`，与排序无关 ⇒ 立刻可发；
+#   · 第一页列表 —— `songlistbytag(source, 默认排序, tag='', page=1)`，排序一到手就能发。
+# 两个都标 `bg`：Helper 见 worker 忙就**直接丢弃**（绝不跟用户抢），
+# 结果写进**与前台路径同一套缓存**（`_pl_meta` / `_feed_cache_put`）⇒ 用户点进去就是 CACHE-HIT。
+# 幂等：已在 TTL 内缓存/已发过就不再发（`$PL_WARM_BUSY` 防同一次进入重复发）。
+my %PL_WARM_BUSY;
+sub _pl_warm_platform {
+	my ($src, $sorts) = @_;
+	return unless $src;
+	my $c = _pl_meta($src);
+
+	# ① 分类标签（6h TTL）
+	# `%PL_WARM_BUSY` 带 60s 过期：万一某次预热回调永远不来（Helper 侧异常），
+	# 也不会把这条路永久堵死。
+	my $busy_tags = $PL_WARM_BUSY{"tags|$src"};
+	if (!($c->{tags} && (time() - ($c->{tags_at} || 0)) < $PL_TAGS_TTL)
+		&& !(defined $busy_tags && time() - $busy_tags < 60)) {
+		$PL_WARM_BUSY{"tags|$src"} = time();
+		Plugins::LxMusic::Helper->request(
+			action   => 'songlisttags',
+			info     => { source => $src },
+			timeout  => 30,
+			priority => 'bg',
+			cb       => sub {
+				my ($res) = @_;
+				delete $PL_WARM_BUSY{"tags|$src"};
+				if ($res->{ok} && $res->{data} && ref $res->{data}{tags} eq 'ARRAY') {
+					my $m = _pl_meta($src);
+					$m->{tags}    = { tags => $res->{data}{tags}, hotTag => ($res->{data}{hotTag} || []) };
+					$m->{tags_at} = time();
+					$log->warn("LxMusic pl-tags WARM ok src=$src rows="
+						. scalar(@{ $res->{data}{tags} }) . ' shim_ms=' . ($res->{ms} // '?'));
+				}
+				else {
+					# 预热失败不写缓存（前台再问一次），只记一行
+					$log->warn('LxMusic pl-tags WARM failed src=' . $src . ' ' . ($res->{error} || '?'));
+				}
+			},
+		);
+	}
+
+	# ② 第一页列表（默认排序 × 全部标签）。走 `_pl_list_fetch` ⇒ 与前台同一套缓存与页宽校正。
+	return unless ref $sorts eq 'ARRAY' && @$sorts && ref $sorts->[0] eq 'HASH';
+	my $first = $sorts->[0]{id};
+	return unless defined $first;
+	my $ckey = join('|', 'pl', $src, $first, '', 0);
+	return if _feed_cache_get($ckey, $PL_LIST_TTL, 50);
+	my $busy_list = $PL_WARM_BUSY{"list|$ckey"};
+	return if defined $busy_list && time() - $busy_list < 60;
+	$PL_WARM_BUSY{"list|$ckey"} = time();
+	_pl_list_fetch($src, $first, '', 0, 50, 'bg', sub {
+		my ($feed) = @_;
+		delete $PL_WARM_BUSY{"list|$ckey"};
+		my $n = ($feed && ref $feed->{items} eq 'ARRAY') ? scalar(@{ $feed->{items} }) : 0;
+		$log->warn("LxMusic pl-list WARM src=$src sort=$first rows=$n");
+	});
+	return;
+}
+
 # 排序 tab 层：条目完全来自该平台 sortList（不再有插件自造的"推荐/最热/最新"档位映射）
 sub sdkPlSortsHandler {
 	my ($client, $cb, $args, $mode, $src) = @_;
 	$src ||= 'kw';
 	my $t0 = time();
 	my $c = _pl_meta($src);
+
+	# 0.11.86（待办 B-4）：**进平台就并行预热下一层**。
+	# 分类标签只吃 source（不需要排序），所以此刻就能发出去；第一页列表要等 sorts 到手
+	# 才知道"默认排序 id"，在下面的 render 里补发（两件事互不等待）。
+	_pl_warm_platform($src, undef);
 
 	my $render = sub {
 		my @items = map { {
@@ -1341,6 +1432,8 @@ sub sdkPlSortsHandler {
 			passthrough => [ 'pltag', $src, $_->{id} ],
 		} } @{ $c->{sorts} || [] };
 		$log->warn(sprintf('LxMusic pl-sorts src=%s rows=%d ms=%d', $src, scalar(@items), int((time() - $t0) * 1000)));
+		# 排序已知 ⇒ 顺手把"默认排序 × 全部标签 × 第一页"也预取（bg，忙则丢）
+		_pl_warm_platform($src, $c->{sorts});
 		$cb->({ items => @items ? \@items : [ { name => _u('该平台没有可用的排序'), type => 'text' } ] });
 	};
 
@@ -1469,6 +1562,18 @@ sub sdkPlListHandler {
 		$cb->($hit);
 		return;
 	}
+	_pl_list_fetch($src, $sort, $tag, $index, $window, undef, $cb);
+	return;
+}
+
+# 列表层的上游取数（0.11.86 从 `sdkPlListHandler` 里抽出来）：**前台渲染**与
+# **进平台预热**（`_pl_warm_platform`）共用同一份代码与同一套 feed 缓存。
+#   `$prio = 'bg'` ⇒ 后台请求：Helper 发现 worker 忙就**直接丢弃**（不排队），
+#   所以预热永远不会把用户点歌挤在后面（0.11.58 的核心教训）。
+sub _pl_list_fetch {
+	my ($src, $sort, $tag, $index, $window, $prio, $cb) = @_;
+	my $t0   = time();
+	my $ckey = join('|', 'pl', $src, $sort, $tag, $index);
 
 	# 上游页宽各源不同（vendored limit_list：kw 36 / kg 20 / tx 36 / wy 30；mg 未定），
 	# 先按 30 猜，拿到首响应的 limit 再重算重取一次（同榜单 0.11.5 与歌单详情 0.11.13 的教训）。
@@ -1485,6 +1590,7 @@ sub sdkPlListHandler {
 		action  => 'songlistbytag',
 		info    => { source => $src, sortId => $sort, tagId => $tag, page => $page },
 		timeout => 30,
+		($prio ? (priority => $prio) : ()),
 		cb      => sub {
 			my ($res) = @_;
 			unless ($res->{ok} && $res->{data} && $res->{data}{list}) {
@@ -1554,7 +1660,7 @@ sub sdkPlListHandler {
 }
 
 sub sdkSonglistDetailHandler {
-	my ($client, $cb, $args, $mode, $src, $plid) = @_;
+	my ($client, $cb, $args, $mode, $src, $plid, $headB64) = @_;
 	$src  ||= 'kg';
 	$plid ||= '';
 
@@ -1562,6 +1668,17 @@ sub sdkSonglistDetailHandler {
 		$cb->({ items => [ { name => _u('歌单 id 缺失'), type => 'text' } ] });
 		return;
 	}
+
+	# 0.11.86：列表行随链接带下来的歌单头部数据（name/img/author/count）。
+	# 有它 ⇒ mg 可以只打歌曲页（`lean`），把那一跳 886~1354ms 的 playlist/v2.0 省掉；
+	# 没有 ⇒ 一切照旧（上游 info 仍是权威）。
+	my $head = {};
+	if (defined $headB64 && length $headB64) {
+		my $hj = eval { decode_base64url($headB64) };
+		my $h  = $hj ? eval { JSON::XS->new->utf8->decode($hj) } : undef;
+		$head = $h if ref $h eq 'HASH';
+	}
+	my $lean = (($head->{name} // '') ne '' && $src eq 'mg') ? 1 : 0;
 
 	my $index  = $args->{index} || 0;
 	my $window = $args->{quantity} || 50;
@@ -1597,7 +1714,7 @@ sub sdkSonglistDetailHandler {
 	$fetch = sub {
 	Plugins::LxMusic::Helper->request(
 		action  => 'songlistdetail',
-		info    => { source => $src, id => $plid, page => $page },
+		info    => { source => $src, id => $plid, page => $page, ($lean ? (lean => 1) : ()) },
 		timeout => 30,
 		cb      => sub {
 			my ($res) = @_;
@@ -1635,6 +1752,10 @@ sub sdkSonglistDetailHandler {
 			if ($info->{img} && $info->{img} =~ m{^https?://}) {
 				$cover = $prefs->get('coverProxy') ? _coverProxyUrl($info->{img}) : $info->{img};
 			}
+			elsif (($head->{img} // '') =~ m{^https?://}) {
+				# 0.11.86：列表行那份已过缩略/代理处理 ⇒ 直接用（比原图更适合设备，也省一跳）
+				$cover = $head->{img};
+			}
 			elsif (@$all && $all->[0]) {
 				$cover = _coverOf($all->[0]);
 			}
@@ -1644,8 +1765,9 @@ sub sdkSonglistDetailHandler {
 			@list = @list[ 0 .. $window - 1 ] if @list > $window;
 			my $tracks = _trackItems(\@list, undef, undef, $index);
 
-			my $total = $info->{count} || $res->{data}{total} || scalar @$all;
-			my $plname = $info->{name} || $plid;
+			my $total  = $info->{count} || $head->{count} || $res->{data}{total} || scalar @$all;
+			my $plname = $info->{name}  || $head->{name} || $plid;
+			my $author = $info->{author} || $head->{author} || '';
 
 			my $feed = {
 				items  => $tracks,
@@ -1657,14 +1779,14 @@ sub sdkSonglistDetailHandler {
 				(albumData => [
 					{ name => _u('🎼 ') . _u($plname), type => 'text', label => 'ALBUM' },
 					{ name => _u('[' . $src . ']')
-						. ($info->{author} ? _u(' · ') . _u($info->{author}) : '')
+						. ($author ? _u(' · ') . _u($author) : '')
 						. _u(' · ') . int($total) . _u(' 首'),
 					  type => 'text', label => 'ARTIST' },
 				]),
 			};
 			_feed_cache_put($ckey, $feed, $window);
-			$log->warn(sprintf('LxMusic pl-detail MISS src=%s id=%s idx=%d win=%d tracks=%d total=%d shim_ms=%s ms=%d',
-				$src, $plid, $index, $window, scalar(@$tracks), int($total),
+			$log->warn(sprintf('LxMusic pl-detail MISS src=%s id=%s idx=%d win=%d tracks=%d total=%d lean=%d shim_ms=%s ms=%d',
+				$src, $plid, $index, $window, scalar(@$tracks), int($total), $lean,
 				(defined $res->{ms} ? $res->{ms} : '?'), int((time() - $t0) * 1000)));
 			$cb->($feed);
 		},
@@ -2218,24 +2340,44 @@ sub _streamImage {
 	return;
 }
 
-sub _coverProxy {
-	my ($uParam, $client, $params, $callback, $httpClient, $response) = @_;
-
-	my $target = eval { decode_base64url($uParam) };
-	unless (defined $target && length $target) {
-		return _respondCoverFail('bad cover param', $client, $params, $callback, $httpClient, $response);
+# ---------- 0.11.86（待办 A-2）：封面代理的"解析"这一步抽出来复用 ----------
+# 代理目标分两类：
+#   · 直链（`https://…`）——取图即可，无需解析；
+#   · **需二次解析**（`kw:<songmid>[:<size>]` / `kg:<aaid>:<albumId>:<hash>[:big]`）——
+#     kw 要 GET 一次 `pic.web` 换出真图 URL、kg 要 POST 一次 `get_res_privilege`，
+#     每次 8s 超时，结果缓存在 `%COVER_CACHE`（键见 `_coverCacheKey`）。
+# 抽出来的目的：`_coverProxy`（解析后推流）与 `warmCovers`（**只解析**、暖缓存）共用同一份
+# 逻辑与同一个缓存，避免"预热一套、真请求另一套"这种最容易漂移的写法。
+# `$cb->($img, $err)`：$img = 可直接推流的图片 URL；失败时 $img = undef 且 $err 是人话。
+# 返回 1 = 本目标需要解析（调用方等回调）；0 = 直链，调用方自己推流。
+sub _coverCacheKey {
+	# ⚠️ `_stripClass`：本文件里"没有 `$class` 形参的工具函数"经常被误当方法调用
+	# （0.11.76 的坑），这里也按同一约定剥掉包名。
+	my ($target) = _stripClass(@_);
+	# ⚠️ 捕获后立刻落成词法变量：`_coverThumbSize` 内部会跑正则，`$1/$2` 会被它冲掉
+	# （Perl 的匹配变量是全局的，见 §五之二）。
+	if ($target =~ /^kw:(\d+)(?::(\d+))?$/) {
+		my ($songmid, $rawsize) = ($1, $2);
+		# 与 `_coverResolve` 完全一致：尺寸先过 `_coverThumbSize`（缺省落回列表档，默认 300）
+		my $size = _coverThumbSize($rawsize);
+		return "kw:$songmid" . ($size ? ":$size" : '');
 	}
+	if ($target =~ /^kg:(\d*):(\d+):([0-9A-Fa-f]+)(?::(big|\d+))?$/) {
+		my ($aaid, $albumid, $hash, $ksz) = ($1, $2, $3, $4);
+		return "kg:$aaid:$albumid:$hash" . ($ksz ? ":$ksz" : '');
+	}
+	return '';
+}
+
+sub _coverResolve {
+	my ($target, $cb) = _stripClass(@_);
+	my $key = _coverCacheKey($target);
+	return 0 unless length $key;
+	if (my $cached = $COVER_CACHE{$key}) { $cb->($cached); return 1 }
 
 	# kw：先解析 pic.web（响应体是图片 URL 纯文本，落雪 PC 端 getPic 同款），再取图
-	# 0.11.61：目标可带缩略尺寸 `kw:<songmid>:<size>`（pictype/size 决定 kwcdn 路径里的尺寸段；
-	# 实测 500→108KB / 300→44.6KB / 240→30KB / 150→14.4KB）
 	if ($target =~ /^kw:(\d+)(?::(\d+))?$/) {
-		my ($songmid, $size) = ($1, $2);
-		$size = _coverThumbSize($size);
-		my $ckey = "kw:$songmid" . ($size ? ":$size" : '');
-		if (my $cached = $COVER_CACHE{$ckey}) {
-			return _streamImage($cached, $client, $params, $callback, $httpClient, $response);
-		}
+		my ($songmid, $size) = ($1, _coverThumbSize($2));
 		my $api = 'http://artistpicserver.kuwo.cn/pic.web?corp=kuwo&type=rid_pic&pictype='
 			. ($size || 500) . '&size=' . ($size || 500) . '&rid=' . $songmid;
 		Slim::Networking::SimpleAsyncHTTP->new(
@@ -2247,81 +2389,135 @@ sub _coverProxy {
 				if ($img =~ m{^https?://\S+$}) {
 					%COVER_CACHE = () if keys %COVER_CACHE > 300;
 					# pic.web 偶尔忽略 pictype，返回的仍是 500 尺寸 ⇒ 再改写一次兜底
-					$COVER_CACHE{$ckey} = _coverThumb($img);
-					return _streamImage($COVER_CACHE{$ckey}, $client, $params, $callback, $httpClient, $response);
+					$COVER_CACHE{$key} = _coverThumb($img);
+					return $cb->($COVER_CACHE{$key});
 				}
 				$log->debug('LxMusic: kw pic.web miss for ' . $songmid);
-				return _respondCoverFail('no cover', $client, $params, $callback, $httpClient, $response);
+				return $cb->(undef, 'no cover');
 			},
 			# 0.11.47：补错误回调（见上面 SimpleAsyncHTTP 的签名说明）
 			sub {
 				my ($http, $error) = @_;
 				$log->warn('LxMusic: kw pic.web error: ' . ($error || '?'));
-				return _respondCoverFail('kw pic.web error', $client, $params, $callback, $httpClient, $response);
+				return $cb->(undef, 'kw pic.web error');
 			},
 			{ timeout => 8 },
 		)->get($api);
-		return;
+		return 1;
 	}
 
-	# kg：POST get_res_privilege 换真图 URL（官方 kg/pic.js 同款）。
-	# 参数格式 'kg:<albumAudioId>:<albumId>:<hash>'（hash 必需）
-	if ($target =~ /^kg:(\d*):(\d+):([0-9A-Fa-f]+)(?::(big|\d+))?$/) {
-		my ($aaid, $albumid, $hash, $ksz) = ($1, $2, $3, $4);
-		my $key = "kg:$aaid:$albumid:$hash" . ($ksz ? ":$ksz" : '');
-		if (my $cached = $COVER_CACHE{$key}) {
-			return _streamImage($cached, $client, $params, $callback, $httpClient, $response);
-		}
-		my $api = 'http://media.store.kugou.com/v1/get_res_privilege';
-		my $body = $TRACK_JSON->encode({
-			appid => 1001, area_code => '1', behavior => 'play', clientver => '9020',
-			need_hash_offset => 1, relate => 1,
-			resource => [ {
-				album_audio_id => $aaid eq '' ? 0 : $aaid,
-				album_id       => $albumid,
-				hash           => $hash,
-				id             => 0,
-				name           => 'lxmusic.mp3',
-				type           => 'audio',
-			} ],
-			token => '', userid => 2626431536, vip => 1,
-		});
-		Slim::Networking::SimpleAsyncHTTP->new(
-			sub {
-				my $res = shift;
-				my $img = '';
-				eval {
-					my $d = JSON::XS->new->utf8->decode($res ? $res->content : '');
-					my $info = $d->{data}[0]{info} || {};
-					$img = $info->{image} || '';
-					if ($img && $info->{imgsize} && ref($info->{imgsize}) eq 'ARRAY' && @{ $info->{imgsize} }) {
-						my $sz = $info->{imgsize}[0];
-						$img =~ s/\{size\}/$sz/;
-					}
-				};
-				if ($img && $img =~ m{^https?://}) {
-					%COVER_CACHE = () if keys %COVER_CACHE > 300;
-					# `:big` 是「档位」不是「像素」（`_coverThumb($url,$size,$kind)` 的签名）
-					my ($csz, $ckind) = ($ksz && $ksz eq 'big') ? (undef, 'big') : ($ksz, undef);
-					$COVER_CACHE{$key} = _coverThumb($img, $csz, $ckind);
-					return _streamImage($COVER_CACHE{$key}, $client, $params, $callback, $httpClient, $response);
+	# kg：POST get_res_privilege 换真图 URL（官方 kg/pic.js 同款）
+	my ($aaid, $albumid, $hash, $ksz) = $target =~ /^kg:(\d*):(\d+):([0-9A-Fa-f]+)(?::(big|\d+))?$/;
+	my $api = 'http://media.store.kugou.com/v1/get_res_privilege';
+	my $body = $TRACK_JSON->encode({
+		appid => 1001, area_code => '1', behavior => 'play', clientver => '9020',
+		need_hash_offset => 1, relate => 1,
+		resource => [ {
+			album_audio_id => $aaid eq '' ? 0 : $aaid,
+			album_id       => $albumid,
+			hash           => $hash,
+			id             => 0,
+			name           => 'lxmusic.mp3',
+			type           => 'audio',
+		} ],
+		token => '', userid => 2626431536, vip => 1,
+	});
+	Slim::Networking::SimpleAsyncHTTP->new(
+		sub {
+			my $res = shift;
+			my $img = '';
+			eval {
+				my $d = JSON::XS->new->utf8->decode($res ? $res->content : '');
+				my $info = $d->{data}[0]{info} || {};
+				$img = $info->{image} || '';
+				if ($img && $info->{imgsize} && ref($info->{imgsize}) eq 'ARRAY' && @{ $info->{imgsize} }) {
+					my $sz = $info->{imgsize}[0];
+					$img =~ s/\{size\}/$sz/;
 				}
-				$log->debug("LxMusic: kg get_res_privilege miss for $key");
-				return _respondCoverFail('no cover', $client, $params, $callback, $httpClient, $response);
-			},
-			# 0.11.47：补错误回调（见上面 SimpleAsyncHTTP 的签名说明）
-			sub {
-				my ($http, $error) = @_;
-				$log->warn('LxMusic: kg pic error: ' . ($error || '?'));
-				return _respondCoverFail('kg pic error', $client, $params, $callback, $httpClient, $response);
-			},
-			{ timeout => 8 },
-		)->post($api,
-			'KG-RC'        => 1,
-			'KG-THash'     => 'expand_search_manager.cpp:852736169:451',
-			'User-Agent'   => 'KuGou2012-9020-ExpandSearchManager',
-			'Content-Type' => 'application/json',
-			$body);
+			};
+			if ($img && $img =~ m{^https?://}) {
+				%COVER_CACHE = () if keys %COVER_CACHE > 300;
+				# `:big` 是「档位」不是「像素」（`_coverThumb($url,$size,$kind)` 的签名）
+				my ($csz, $ckind) = ($ksz && $ksz eq 'big') ? (undef, 'big') : ($ksz, undef);
+				$COVER_CACHE{$key} = _coverThumb($img, $csz, $ckind);
+				return $cb->($COVER_CACHE{$key});
+			}
+			$log->debug("LxMusic: kg get_res_privilege miss for $key");
+			return $cb->(undef, 'no cover');
+		},
+		# 0.11.47：补错误回调（见上面 SimpleAsyncHTTP 的签名说明）
+		sub {
+			my ($http, $error) = @_;
+			$log->warn('LxMusic: kg pic error: ' . ($error || '?'));
+			return $cb->(undef, 'kg pic error');
+		},
+		{ timeout => 8 },
+	)->post($api,
+		'KG-RC'        => 1,
+		'KG-THash'     => 'expand_search_manager.cpp:852736169:451',
+		'User-Agent'   => 'KuGou2012-9020-ExpandSearchManager',
+		'Content-Type' => 'application/json',
+		$body);
+	return 1;
+}
+
+# ---------- 0.11.86：渲染期**封面预热**前 N 行 ----------
+# 为什么值得做（现场口径：用户三次抱怨的"慢"里，封面是第一优先）：
+#   · 列表行的 `image` = `/plugins/LxMusic/cover?u=…`，LMS 皮肤渲染完就会去取**列表档**（300）；
+#     kw/kg 的这一次请求本身就要先让代理解析（pic.web GET / get_res_privilege POST）。
+#   · 但用户点播放后，**队列行/正在播放面板**请求的是**大图档**（500 / `:big`）——那是
+#     与列表档**不同的缓存键**，等于第二次解析，而且正好落在最需要快的时刻。
+#   所以预热只做**大图档**：列表档皮肤自己马上就会取（预热它纯属重复劳动），
+#   预热大图档则是纯粹的提前量。只对 kw/kg 有意义（mg/tx/wy 是直链，无需解析）。
+#
+# 限流与总开关：跟随 `warmEnable`；条数 `coverWarmMax`（0 = 关，上限 5）。
+# 只解析、**不推流**；解析结果进同一个 `%COVER_CACHE` ⇒ 真被请求时零上游往返。
+sub warmCovers {
+	my ($class, $list, $max) = @_;
+	return 0 if defined $prefs->get('warmEnable') && !$prefs->get('warmEnable');
+	$max = $prefs->get('coverWarmMax') if !defined $max;
+	$max = 3 unless defined $max;
+	return 0 if $max <= 0;
+	$max = 5 if $max > 5;
+	return 0 unless $list && ref($list) eq 'ARRAY';
+
+	my ($n, %seen) = (0, ());
+	for my $t (@$list) {
+		last if $n >= $max;
+		next unless $t && ref($t) eq 'HASH';
+		my $url = eval { _coverOf($t, 'big') } // '';
+		my ($u) = $url =~ m{/cover\?u=([^&]+)};
+		next unless defined $u;
+		my $target = eval { decode_base64url($u) } // '';
+		my $key = _coverCacheKey($target);
+		next unless length $key;          # 直链：无可预热
+		next if $seen{$key}++;            # 同一页里重复的行只热一次
+		next if $COVER_CACHE{$key};       # 已经在缓存里
+		next unless _coverResolve($target, sub {
+			my ($img, $err) = @_;
+			$log->info('LxMusic: warm cover ' . (defined $img ? 'ok' : ('failed: ' . ($err || '?'))) . " ($key)");
+		});
+		$n++;
+	}
+	$log->info("LxMusic: warm covers n=$n (max=$max)") if $n;
+	return $n;
+}
+
+sub _coverProxy {
+	my ($uParam, $client, $params, $callback, $httpClient, $response) = @_;
+
+	my $target = eval { decode_base64url($uParam) };
+	unless (defined $target && length $target) {
+		return _respondCoverFail('bad cover param', $client, $params, $callback, $httpClient, $response);
+	}
+
+	# 0.11.86：kw / kg 两种"需二次解析"的目标交给 `_coverResolve`（与 `warmCovers` 共用）。
+	if (length _coverCacheKey($target)) {
+		_coverResolve($target, sub {
+			my ($img, $err) = @_;
+			return _streamImage($img, $client, $params, $callback, $httpClient, $response) if $img;
+			return _respondCoverFail($err || 'no cover', $client, $params, $callback, $httpClient, $response);
+		});
 		return;
 	}
 

@@ -1120,6 +1120,24 @@ sub shutdown {
 }
 
 # ---------- 常驻 qjs worker（M0.10）----------
+# ⚠️ CBM 审计 F.13：下面这几个函数构成一个**四元环**，动其中任何一个之前先读这段：
+#
+#     request() ─→ _worker_submit() ─→ _worker_poll()   [job 超时]
+#        ↑                                    │
+#        └─── _worker_fail_all('retry:…') ←─── _worker_kill($w, 'retry:worker timed out')
+#
+#   环的**终止性**靠两道闸，两条都不能删：
+#     ① `$job->{forked}`——retry 只生效一次；已 fork 过的 job 再进来只能报错
+#        （`_worker_fail_all` 里的 `if ($retry && !$job->{forked})`），否则会无限重试。
+#     ② `%WORKER_BAD{$w->{key}}`（TTL 600s）——超时过的源此后改走 fork 路径
+#        （`request` 里判 `_worker_hostile($source)`），环不会再被触发。
+#   另有一条**不得回退**的写法：`_worker_kill` 收尾只删**自己那一格**
+#     `delete $WORKER{ $w->{key} } if $WORKER{ $w->{key} } == $w;`
+#   —— retry 分支会**同步重入 `request()`**，而那里可能已经 spawn 出一个新 worker
+#   登记在同一个 key 上；无条件 delete 会把新 worker 的登记删掉（孤儿进程 + 同源双 qjs）。
+#   回归：`plugin/t/worker-lifecycle-test.pl`（29 项：retry 语义 / 超时改走 fork /
+#   两条源码级护栏），改动本段代码后必须一起跑。
+#
 # 动机：每请求 fork 一个 qjs 时，冷启动要付「qjs 起进程 + shim 解析 + 源脚本解析 + 源初始化
 # （rconfig 握手等）」——设备实测 ~2.3s，而真正取链只占一小部分。常驻 worker 把这份成本
 # 摊销到进程生命周期里：初始化一次，之后每请求只走 shim 的 serve 行协议。

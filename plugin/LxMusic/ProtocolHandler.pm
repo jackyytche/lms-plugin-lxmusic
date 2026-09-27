@@ -638,7 +638,7 @@ sub republish_queued_rows {
 			my $sig = join("\x1f", map { defined $_ ? $_ : '' }
 				@{$r}{qw(cover title secs kbps quality)});
 			if (($REPUBLISHED{$u} || '') eq $sig) { $skip++; next; }
-			eval {
+			my $wrote = eval {
 				$class->publishQueueMetadata($u, {
 					title   => $r->{title},
 					secs    => $r->{secs},
@@ -646,9 +646,11 @@ sub republish_queued_rows {
 					cover   => $r->{cover},
 					quality => $r->{quality},
 				});
-			};
+			} ? 1 : 0;
 			$REPUBLISHED{$u} = $sig;
-			$n++;
+			# 0.11.86：publishQueueMetadata 自己也做指纹判断（整榜入队那条路已经写过一遍）
+			# ⇒ 以它的返回值为准记账，免得诊断行虚报"写了 N 行"。
+			if ($wrote) { $n++ } else { $skip++ }
 		}
 	}
 	%REPUBLISHED = () if scalar(keys %REPUBLISHED) > 3000;
@@ -762,15 +764,16 @@ sub republish_known_queued {
 				my $sig = join("\x1f", map { defined $_ ? $_ : '' }
 					@{$m}{qw(cover title secs kbps quality)});
 				if (($REPUBLISHED{$u} || '') eq $sig) { $skip++; next; }
-				$class->publishQueueMetadata($u, {
+				my $wrote = $class->publishQueueMetadata($u, {
 					title   => $m->{title},
 					secs    => $m->{secs},
 					kbps    => $m->{kbps},
 					cover   => $m->{cover},
 					quality => $m->{quality},
-				});
+				}) ? 1 : 0;
 				$REPUBLISHED{$u} = $sig;
-				$n++;
+				# 0.11.86：以 publishQueueMetadata 的返回值为准（它也做指纹判断）
+				if ($wrote) { $n++ } else { $skip++ }
 			}
 		}
 	};
@@ -841,8 +844,8 @@ sub _publish_cover {
 
 	my $cover = _cover_url($src, $music);
 	if ($cover) {
-		Slim::Music::Info::setRemoteMetadata($url, { cover => $cover });
-		$class->cache_metadata($url, { cover => $cover });
+		# 0.11.86：走 publishQueueMetadata（它带内容指纹）⇒ 重复渲染/重复补发不再重复写库。
+		$class->publishQueueMetadata($url, { cover => $cover });
 		return 1;
 	}
 
@@ -857,8 +860,8 @@ sub _publish_cover {
 					my $img = $res ? $res->content : '';
 					if ($img && $img =~ m{^https?://\S+$}) {
 						$img =~ s/\s+$//;
-						Slim::Music::Info::setRemoteMetadata($url, { cover => $img });
-						$class->cache_metadata($url, { cover => $img });
+						# 0.11.86：同样走带指纹的发布路径
+						$class->publishQueueMetadata($url, { cover => $img });
 						$log->debug('LxMusic: kw cover ok');
 					}
 					else {
@@ -1168,8 +1171,11 @@ sub explodePlaylist {
 					name  => $name,
 				);
 				next unless $u;
-				# 入队前发布队列元数据（歌名/时长/封面/码率估算）——队列行渲染靠它，零额外 API
-				$class->_publish_cover($u, ($t->{source} || $src), $t);
+				# 0.11.86（待办 C-7）：**合并成一次发布**。
+				# 从前是 `_publish_cover`（写 cover）+ `publishQueueMetadata`（写 title/secs/kbps）
+				# 两次 `setRemoteMetadata`，加上 +3s 的尾部补发再写一遍 ⇒ 300 首 ≈ **900 次写库**。
+				# 现在：能解析出封面就**一次写完**（cover+title+secs+kbps+quality），
+				# 指纹随之记下 ⇒ 尾部补发对这 300 行是零写入（实测见 t/publish-dedupe-test.pl）。
 				my $secs = _secs_of_interval($t->{interval});
 				my $est;
 				if ($secs && ref($t->{types}) eq 'ARRAY') {
@@ -1182,12 +1188,16 @@ sub explodePlaylist {
 					}
 					$est = int($biggest * 8 / 1000 / $secs) if $biggest;
 				}
+				my $cover = eval { _cover_url(($t->{source} || $src), $t) } // '';
 				$class->publishQueueMetadata($u, {
 					title   => $name,
 					secs    => $secs,
 					kbps    => $est,
+					cover   => $cover,
 					quality => $q,
 				});
+				# 解析不出封面时仍走 _publish_cover：kg 的推导与 kw 的异步 getPic 都在它里面
+				$class->_publish_cover($u, ($t->{source} || $src), $t) unless $cover;
 				push @urls, $u;
 			}
 			$log->warn("LxMusic: $kind explode handing " . scalar(@urls)
@@ -1256,6 +1266,13 @@ sub cache_metadata {
 
 # 渲染期发布队列/正在播放元数据（喜马拉雅 0.1.47 同款）：
 # 不发布则队列行只有裸 URL（无歌名/无封面）；列表数据已在手，零额外 API 调用。
+#
+# ⚠️ 0.11.86（待办 C-7）：**这里现在带内容指纹**（与两条补发路径共用 `%REPUBLISHED`）。
+# 现场：`explodePlaylist`（整榜入队 300 首）逐行发布一次 ⇒ 300 次 `setRemoteMetadata`（每次写库 +
+# 换来一条 playlist 通知），然后它排的**尾部补发**（+3s）又把这 300 行**原样再写一遍** ——
+# 同一个内容在 3 秒内写两遍，纯浪费（设备是 i386，写库是这条路径上最重的一步）。
+# 现在：内容没变 ⇒ 第二次（以及每次重渲染/重补发）一个字节都不写，只更新内存里的合并记录。
+# 返回值：1 = 真的写了 LMS；0 = 指纹命中（或没有可写字段）而跳过。
 sub publishQueueMetadata {
 	my ($class, $url, $info) = @_;
 	return 0 unless $url && ref($info) eq 'HASH';
@@ -1267,9 +1284,13 @@ sub publishQueueMetadata {
 	# 估算码率（types[].size ÷ 时长，Plugin::_trackItems 算出）：写进行属性，
 	# 队列行立刻能看到码率；播放后用真实探测值覆盖（_finish_resolve）
 	$meta{bitrate} = int($info->{kbps}) if $info->{kbps} && $info->{kbps} > 0;
-	return 0 unless scalar keys %meta;
 
-	Slim::Music::Info::setRemoteMetadata($url, \%meta);
+	# 指纹字段与 `republish_queued_rows` / `republish_known_queued` **逐字一致**
+	# （顺序也一致），否则"发过一次"与"补发时的判断"会各说各话。
+	my $sig = join("\x1f", map { defined $_ ? $_ : '' } @{$info}{qw(cover title secs kbps quality)});
+	my $dup = (($REPUBLISHED{$url} || '') eq $sig) ? 1 : 0;
+
+	# 内存态（%METADATA）**照旧合并**：即使不写 LMS，解析出来的字段也要留下
 	$class->cache_metadata($url, {
 		title   => $info->{title},
 		cover   => $info->{cover},
@@ -1277,6 +1298,13 @@ sub publishQueueMetadata {
 		kbps    => $info->{kbps},       # 0.11.31：补发时要能带上估算码率
 		quality => $info->{quality},
 	});
+
+	return 0 if $dup;
+	return 0 unless scalar keys %meta;
+
+	Slim::Music::Info::setRemoteMetadata($url, \%meta);
+	%REPUBLISHED = () if scalar(keys %REPUBLISHED) > 3000;
+	$REPUBLISHED{$url} = $sig;
 	return 1;
 }
 

@@ -733,7 +733,9 @@ async function main(std, os) {
 	//   → RESULT { ok, data:{ status, method, type, length, range, acceptRanges } }
 	// 先 HEAD；CDN 不允许 HEAD（403/405）时退 Range 0-0（只传 1 字节）。
 	// 目的：把 403/HTML 错误页挡在播放器之外——那是"选了 flac 却无声"的常见成因。
-	if (action === 'probe') {
+	// probe 模式：把"每次取链后的可播性探测"当成一个独立模式
+	// （CBM F.12：各模式抽成具名函数，main 末尾用派发表挑选）
+	function runProbeMode() {
 		let payload = {};
 		try { payload = JSON.parse(infoJson || '{}') || {} } catch (e) {}
 		if (payload && payload.info && typeof payload.info === 'object') payload = payload.info;
@@ -746,7 +748,8 @@ async function main(std, os) {
 	// ---------- 探测 worker（M0.10）：argv[1] = '-' ⇒ 不加载任何订阅源 ----------
 	// 校验探测（每次取链一条 HEAD）原本要现起一个 qjs 进程（~0.3s 里绝大部分是进程+脚本解析）。
 	// 单独一个"不加载源"的常驻进程服务 probe：与取链 worker 分开，长探测不会卡住取链。
-	if (action === 'serve' && sourcePath === '-') {
+	// CBM F.12：模式实现抽成 runProbeWorkerMode（main 末尾派发表调用）。
+	function runProbeWorkerMode() {
 		print('READY ' + JSON.stringify({ name: 'probe', version: '' }));
 		std.out.flush();
 		for (;;) {
@@ -781,7 +784,9 @@ async function main(std, os) {
 	// 而歌单下钻一次要问好几层（平台/排序/分类/列表/曲目），这笔固定开销被放大数倍。
 	// 常驻后 bundle 只解析一次（Helper 侧用 source=$SDK 起一个 worker，argv[1] 就是它）。
 	const isSdkWorker = (action === 'serve') && /sdk\.bundle\.js$/.test(String(sourcePath || ''));
-	if (SDK_ACTIONS[action] || isSdkWorker) {
+	// CBM F.12：SDK 模式的整段（~410 行）抽成 runSdkMode（main 末尾派发表调用）。
+	// 必须 async：常驻形态的 for(;;) 里 `await runSdk(...)` 逐行处理请求。
+	async function runSdkMode() {
 		let payload = {};
 		try { payload = JSON.parse(infoJson || '{}') || {} } catch (e) {}
 		if (payload && payload.info && typeof payload.info === 'object') payload = payload.info;
@@ -1143,6 +1148,21 @@ async function main(std, os) {
 						print('LOG kg lean failed, fallback to sdk: ' + String((e && e.message) || e));
 					}
 				}
+				// mg 快路径（0.11.86，待办 B-5，**实测**）：SDK 的 getListDetail 是
+				// `Promise.all([歌曲页, 歌单信息])`——歌曲页 81KB/约 0.4s，而那一跳歌单信息
+				// (`resource/playlist/v2.0`) 只有 2.2KB 却要 **886~1354ms**，且只提供
+				// name/img/desc/author/play_count（列表行里全都有 ⇒ 插件已随下钻链接带下来）。
+				// `lean:1` 时只打歌曲页，info 留空由插件用列表行的数据补（省掉最慢的那一跳）。
+				if (src === 'mg' && payload.lean) {
+					try {
+						const r = await sl.getListDetailList(id, page);
+						if (r && r.list) { r.info = {}; return r }
+						print('LOG mg lean: no list, fallback to sdk');
+					}
+					catch (e) {
+						print('LOG mg lean failed, fallback to sdk: ' + String((e && e.message) || e));
+					}
+				}
 				return await sl.getListDetail(id, page);
 			}
 			const mod = sdk[payload.source] && sdk[payload.source].leaderboard;
@@ -1193,10 +1213,14 @@ async function main(std, os) {
 			std.exit(1);
 		});
 		print('LOG sdk chain armed');
-		return;   // 主流程结束，qjs 排空微任务后 .then 打 RESULT
+		return;   // 模式结束，qjs 排空微任务后 .then 打 RESULT（派发表见到 return 即收手）
 	}
 
-	// ---------- 加载源脚本 ----------
+	// ---------- 加载源脚本 + 初始化（**只在源模式下执行**）----------
+	// ⚠️ CBM F.12：这段从前是 main 里的裸语句，紧跟 SDK 分支之后——SDK 模式在它之前
+	// 就已 exit/return，所以永远走不到；改成函数后必须由 runServeMode/runOnceMode
+	// **显式调用**，否则派发表还没来得及跑，这段就会先把 sdk.bundle.js 当源脚本加载。
+	async function prepareSource() {
 	let sourceCode;
 	try {
 		sourceCode = readTextFile(sourcePath);
@@ -1271,6 +1295,8 @@ async function main(std, os) {
 
 	print('LOG h0 calling handler, action=' + action
 		+ ' args=' + JSON.stringify({ source, action, info: infoArg }).slice(0, 300));
+	return { info, infoArg, source };
+	}
 	// ---------- 请求执行器（单次 fork 与常驻 worker 共用）----------
 	async function callHandler(act, argInfo, srcName) {
 		const h = handlers[EVENT_NAMES.request];
@@ -1321,7 +1347,9 @@ async function main(std, os) {
 	// ---------- 常驻 worker（M0.10）：源脚本加载 + 初始化只付一次，之后按行协议处理请求 ----------
 	// stdin 一行 = {"id":N,"action":"musicUrl","source":"kw","info":{...}}
 	// stdout 一行 = READY {...} | RESULT <id> {json} | LOG ...
-	if (action === 'serve') {
+	// CBM F.12：抽成 runServeMode（main 末尾派发表调用）。
+	async function runServeMode() {
+		await prepareSource();
 		const info0 = globalThis.lx.currentScriptInfo || {};
 		// 0.11.58：READY 带上源声明的能力表（此时 `drainUntilInited()` 已跑完 ⇒ __caps 就绪）
 		print('READY ' + JSON.stringify({ name: info0.name || '', version: info0.version || '', caps: __caps }));
@@ -1352,13 +1380,43 @@ async function main(std, os) {
 	}
 
 	// ---------- 单次模式（fork 每请求一进程）：与 serve 等价的执行流程，跑完即退 ----------
-	try {
-		const r = await callHandler(action, infoArg, source);
-		print('RESULT ' + JSON.stringify({ ok: true, data: r == null ? null : r }));
+	// CBM F.12：抽成 runOnceMode + 末尾派发表。
+	async function runOnceMode() {
+		const { infoArg, source } = await prepareSource();
+		try {
+			const r = await callHandler(action, infoArg, source);
+			print('RESULT ' + JSON.stringify({ ok: true, data: r == null ? null : r }));
+		}
+		catch (e) {
+			print('RESULT ' + fmtErr(e));
+		}
+		std.out.flush();
+		std.exit(0);
 	}
-	catch (e) {
-		print('RESULT ' + fmtErr(e));
+
+	// ---------- 模式派发表（CBM 审计 F.12）----------
+	// 从前这些判定/实现全挤在 main 里（1141 行单函数，复杂度 234），读一个模式要穿过另外三个。
+	// 现在 main 只负责"环境搭建（flush/log/文件/定时器/polyfill/lx 对象）+ 解析参数 + 这张表"。
+	//
+	// 顺序即优先级，**与重构前逐字一致**（每个模式自己 std.exit，或像 SDK 那样 return 后由
+	// 微任务链收尾）。`return` 放在 run 之后是关键：SDK 模式是 `return`（不 exit），
+	// 若继续往下走会误进 `action === 'serve'` 的源 worker 分支。
+	const MODES = [
+		{ name: 'probe',         when: () => action === 'probe',
+		  run:  () => runProbeMode() },
+		{ name: 'probe-serve',   when: () => action === 'serve' && sourcePath === '-',
+		  run:  () => runProbeWorkerMode() },
+		{ name: 'sdk',           when: () => SDK_ACTIONS[action] || isSdkWorker,
+		  run:  () => runSdkMode() },
+		{ name: 'source-serve',  when: () => action === 'serve',
+		  run:  () => runServeMode() },
+	];
+	for (const m of MODES) {
+		if (!m.when()) continue;
+		print('LOG mode=' + m.name);
+		await m.run();
+		return;
 	}
-	std.out.flush();
-	std.exit(0);
+
+	await runOnceMode();
 }

@@ -110,6 +110,65 @@ jobs:
           LX_TEST_QUIET_WARN=1 perl -I t -I t_build t/tier-label-test.pl 2>&1 | tee -a helper-test.log
           exit ${PIPESTATUS[0]}
 
+      # 0.11.86 (CBM audit F.13): the resident-worker lifecycle. `request ->
+      # _worker_submit -> _worker_poll(timeout) -> _worker_kill ->
+      # _worker_fail_all('retry:...') -> request` is a FOUR-element cycle; its
+      # termination rests on two invariants (the one-shot `forked` flag and the
+      # 10-minute WORKER_BAD stamp) plus "kill only deletes its own slot" (the
+      # 0.11.58 orphan-worker bug). Losing either one silently brings back the
+      # 0.11.54 "worker stopped" avalanche.
+      - name: Worker lifecycle regression (0.11.86)
+        run: |
+          cd plugin
+          set -o pipefail
+          LX_TEST_QUIET_WARN=1 perl -I t -I t_build t/worker-lifecycle-test.pl 2>&1 | tee -a helper-test.log
+          exit ${PIPESTATUS[0]}
+
+      # 0.11.86 (todo A-2): render-time COVER prewarm. List rows get the list-size
+      # cover (300) and the skin fetches those itself, but the queue / now-playing
+      # panel asks for the BIG variant (500 / kg `:big`) -- a different cache key,
+      # i.e. a second resolution (kw pic.web GET, kg get_res_privilege POST) right
+      # when the user hits play. warmCovers resolves the first N rows ahead of time.
+      # The suite pins the tier choice, the cap/dedupe rules, all three off-switches,
+      # "direct links need no prewarm", and that the prewarm key is byte-identical
+      # to the key the real proxy path uses (a mismatch = silent no-op).
+      - name: Cover prewarm regression (0.11.86)
+        run: |
+          cd plugin
+          set -o pipefail
+          LX_TEST_QUIET_WARN=1 perl -I t -I t_build t/cover-warm-test.pl 2>&1 | tee -a helper-test.log
+          exit ${PIPESTATUS[0]}
+
+      # 0.11.86 (todo B-4/B-5): songlist tree warming + the mg "lean detail" head blob.
+      # B-4: entering a platform now fires the next layer in parallel (tags + page 1 of
+      # the list) as `bg` requests that Helper drops when busy, writing into the SAME
+      # caches the foreground path reads. B-5: mg's detail makes two upstream hops and
+      # the second one (`resource/playlist/v2.0`, 2.2KB) costs 886~1354ms while only
+      # supplying name/img/author/count -- data the list row already has. The row now
+      # carries that blob down the drill-down link and mg skips that hop.
+      - name: Songlist warm + detail head regression (0.11.86)
+        run: |
+          cd plugin
+          set -o pipefail
+          LX_TEST_QUIET_WARN=1 perl -I t -I t_build t/pl-warm-test.pl 2>&1 | tee -a helper-test.log
+          exit ${PIPESTATUS[0]}
+          LX_TEST_QUIET_WARN=1 perl -I t -I t_build t/pl-detail-head-test.pl 2>&1 | tee -a helper-test.log
+          exit ${PIPESTATUS[0]}
+
+      # 0.11.86 (todo C-7): queue-metadata write dedupe. Enqueueing a 300-row board
+      # used to write ~900 times (cover write + title/secs write per row, then the +3s
+      # tail republish wrote all 300 again). The content fingerprint now lives inside
+      # publishQueueMetadata (shared with both republish paths) and the explode path
+      # publishes cover+title+secs+kbps in ONE call -> 300 writes, and the tail
+      # republish is a no-op. The suite also guards that a real change (bitrate /
+      # cover) still writes, and that skipped rows keep their in-memory record.
+      - name: Publish dedupe regression (0.11.86)
+        run: |
+          cd plugin
+          set -o pipefail
+          LX_TEST_QUIET_WARN=1 perl -I t -I t_build t/publish-dedupe-test.pl 2>&1 | tee -a helper-test.log
+          exit ${PIPESTATUS[0]}
+
       - name: CHECK Helper.pm
         run: cd plugin && perl -I t -I t_build -c t_build/Plugins/LxMusic/Helper.pm
 
