@@ -169,6 +169,22 @@ jobs:
           LX_TEST_QUIET_WARN=1 perl -I t -I t_build t/publish-dedupe-test.pl 2>&1 | tee -a helper-test.log
           exit ${PIPESTATUS[0]}
 
+      # 0.11.91: metadata persistence. Daphile restarts used to wipe every queue-row
+      # cover (our url->metadata map lived only in memory, and the republish paths are
+      # triggered by playlist changes, which a restart never emits). The map is now
+      # persisted (cover/title/secs/kbps/quality + audio attrs; NEVER the direct link,
+      # which dies in 84s..13min) and read back at startup. This suite pins the
+      # "bounded" requirement: TTL expiry, row cap, the 512KB size guard, queue rows
+      # being exempt from both, the on/off switch really writing nothing, corrupt
+      # files not crashing the plugin, and the getMetadataFor fallback to LMS's own
+      # `remote_image_<url>` cache.
+      - name: Metadata persistence regression (0.11.91)
+        run: |
+          cd plugin
+          set -o pipefail
+          LX_TEST_QUIET_WARN=1 perl -I t -I t_build t/meta-persist-test.pl 2>&1 | tee -a helper-test.log
+          exit ${PIPESTATUS[0]}
+
       - name: CHECK Helper.pm
         run: cd plugin && perl -I t -I t_build -c t_build/Plugins/LxMusic/Helper.pm
 

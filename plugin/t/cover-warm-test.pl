@@ -117,6 +117,15 @@ my $KG_HASH = 'A1B2C3D4E5F60718';   # kg 分支要求 >=16 位十六进制
 	$n = $H->warmCovers([ kw_row('11'), kg_row('1', 2, $KG_HASH) ]);
 	check('warm: coverWarmMax=0 -> 关', $n == 0 && @resolved == 0, "$n / " . scalar(@resolved));
 
+	# 0.11.94：**空串**也要当成"用默认 3"。旧写法 `$max = 3 unless defined $max;` 漏了 `''`
+	# （空串是 defined 的，而 `'' <= 0` 为真）⇒ 封面预热被静默关掉。设备实测
+	# `pref_coverWarmMax` 渲染成 `value=""` 就是这个现场。
+	set_pref('coverWarmMax', '');
+	reset_resolved();
+	$n = $H->warmCovers([ kw_row('21'), kw_row('22'), kw_row('23'), kw_row('24') ]);
+	check('★ warm: coverWarmMax=\'\'（空串）按默认 3 行预热，不被静默关掉',
+		$n == 3 && @resolved == 3, "$n / " . scalar(@resolved));
+
 	set_pref('coverWarmMax', 3); set_pref('coverProxy', 0);
 	reset_resolved();
 	$n = $H->warmCovers([ kw_row('11'), kg_row('1', 2, $KG_HASH) ]);

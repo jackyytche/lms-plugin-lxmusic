@@ -95,6 +95,12 @@ sub initPlugin {
 		# kw/kg 代理目标有意义（kw 一次 pic.web GET、kg 一次 get_res_privilege POST），
 		# 详见 Plugin::warmCovers 的说明。
 		coverWarmMax   => 3,
+		# ---- 0.11.91 元数据持久化（重启后队列封面/标签不再消失）----
+		# 把 url→封面/标题/时长/码率/档位/音频属性 落盘（**不落直链**：第三方直链 84 秒~13 分钟就失效）。
+		# 三条边界：开关 / 条数上限 / TTL；队列里的行永不按 TTL 丢、也优先于上限被保留。
+		metaCache      => 1,     # 总开关
+		metaCacheMax   => 800,   # 条数上限（20-5000）；编码后超过 512KB 会自动按半砍继续缩
+		metaCacheDays  => 30,    # 条目 TTL（1-365 天）
 	});
 
 	unless (Plugins::LxMusic::Helper->init) {
@@ -130,6 +136,11 @@ sub initPlugin {
 		tag  => 'lxmusic',
 		menu => 'apps',
 	);
+
+	# 0.11.91：读回持久化的元数据（封面/标签），并在 LMS 恢复完播放队列之后补发一次
+	# —— 这是"重启后队列里的歌没封面"的修法。失败不能影响插件启动（内部全程 eval）。
+	eval { Plugins::LxMusic::ProtocolHandler->meta_boot };
+	$log->warn('LxMusic: meta_boot died: ' . $@) if $@;
 
 	$log->info('LxMusic: ready');
 	return;
@@ -2525,7 +2536,10 @@ sub warmCovers {
 	my ($class, $list, $max) = @_;
 	return 0 if defined $prefs->get('warmEnable') && !$prefs->get('warmEnable');
 	$max = $prefs->get('coverWarmMax') if !defined $max;
-	$max = 3 unless defined $max;
+	# ⚠️ 0.11.94：**空串/非数字都要当成"用默认 3"**。旧写法 `$max = 3 unless defined $max;` 漏了
+	# `''`：空串是 defined 的，而 `'' <= 0` 为真 ⇒ **封面预热被静默关掉**（设备实测 `pref_coverWarmMax`
+	# 渲染成 `value=""` 就是这个现场）。
+	$max = 3 unless defined $max && $max =~ /^\d+$/;
 	return 0 if $max <= 0;
 	$max = 5 if $max > 5;
 	return 0 unless $list && ref($list) eq 'ARRAY';

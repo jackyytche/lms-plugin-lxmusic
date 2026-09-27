@@ -75,10 +75,12 @@ sub prefs {
 		boardsKw boardsKg boardsTx boardsWy boardsMg qualityFallback verifyUrl autoSkipOnError
 		workerEnable workerIdle preferStreamable
 		warmEnable warmMax resolveBudget sdkWorkers coverThumb coverThumbBig
+		coverWarmMax
+		metaCache metaCacheMax metaCacheDays
 	));
 }
 
-my @BOOL_PREFS = qw(coverProxy boardsKw boardsKg boardsTx boardsWy boardsMg qualityFallback verifyUrl autoSkipOnError workerEnable preferStreamable warmEnable);
+my @BOOL_PREFS = qw(coverProxy boardsKw boardsKg boardsTx boardsWy boardsMg qualityFallback verifyUrl autoSkipOnError workerEnable preferStreamable warmEnable metaCache);
 
 sub handler {
 	my ($class, $client, $params, $callback, $httpClient, $response) = @_;
@@ -148,6 +150,17 @@ sub handler {
 					join(_chars('；'), map { _chars($_) } @{ $r->{bad} }))
 					if @{ $r->{bad} };
 			}
+		}
+		# 0.11.91：缓存管理 → 一键清空元数据缓存（内存 + 磁盘文件）
+		elsif ($action eq 'clear_meta') {
+			my $r = eval {
+				require Plugins::LxMusic::ProtocolHandler;
+				Plugins::LxMusic::ProtocolHandler->meta_clear;
+			};
+			my $rows = (ref($r) eq 'HASH' && defined $r->{rows}) ? $r->{rows} : 0;
+			my $gone = (ref($r) eq 'HASH' && $r->{removed}) ? 1 : 0;
+			push @messages, _m('已清空元数据缓存（内存 ', $rows, ' 条，',
+				($gone ? _chars('磁盘文件已删除') : _chars('磁盘文件本来就不存在')), '）');
 		}
 	}
 
@@ -260,6 +273,31 @@ sub handler {
 			push @cap_line, _m($short, '=', join('/', @{ $caps->{$p} }));
 		}
 		$params->{lxCaps} = _ent(@cap_line ? join(_chars('；'), @cap_line) : '（还没有源能力表）');
+	}
+
+	# 0.11.91：元数据缓存（重启后队列封面/标签靠它）—— 统计供「缓存管理」分区显示
+	{
+		my $ms = eval {
+			require Plugins::LxMusic::ProtocolHandler;
+			Plugins::LxMusic::ProtocolHandler->meta_stats;
+		};
+		$ms = {} unless ref($ms) eq 'HASH';
+		my $bytes = $ms->{bytes} || 0;
+		my $size = $bytes >= 1024 ? sprintf('%.1f KB', $bytes / 1024) : _m($bytes, ' B');
+		my @mx;
+		push @mx, _m('内存 ', ($ms->{rows} || 0), ' 条 · 磁盘 ', $size);
+		push @mx, _m('队列 ', ($ms->{queued_known} || 0), '/', ($ms->{queued} || 0), ' 行有记录');
+		push @mx, _m('上限 ', ($ms->{max_rows} || 0), ' 条 / ', ($ms->{ttl_days} || 0), ' 天');
+		push @mx, ($ms->{enabled} ? _chars('开关：开') : _chars('开关：关'));
+		push @mx, ($ms->{dirty} ? _chars('有待落盘的改动') : _chars('已落盘'));
+		if ($ms->{saved_at}) {
+			my $ago = time() - $ms->{saved_at};
+			push @mx, _m('上次保存 ', ($ago < 90 ? _m($ago, ' 秒前') : _m(int($ago / 60), ' 分钟前')));
+		}
+		elsif (!($ms->{rows} || 0)) {
+			push @mx, _chars('本机还没有元数据记录');
+		}
+		$params->{lxMeta} = _ent(join(_chars('；'), @mx));
 	}
 
 	return $class->SUPER::handler($client, $params, $callback, $httpClient, $response);

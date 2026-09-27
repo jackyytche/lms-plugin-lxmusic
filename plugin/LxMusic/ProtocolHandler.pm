@@ -193,7 +193,9 @@ my $prefs = preferences('plugin.lxmusic');   # 设置页可调（resolveTtl）
 # 直链有 CDN 签名时效；TTL 由设置页控制（默认 600s）
 sub _resolveTtl {
 	my $n = $prefs->get('resolveTtl');
-	return (defined $n && $n >= 0 && $n <= 3600) ? int($n) : 600;
+	# ⚠️ 0.11.94：要求"纯数字"再判范围。旧写法 `defined $n && $n >= 0 && $n <= 3600` 对**空串**成立
+	# （`'' >= 0` 为真）⇒ `int('')` = **0** ⇒ 解析缓存条目出生即过期、每次都要重取链。
+	return (defined $n && $n =~ /^\d+$/ && $n <= 3600) ? int($n) : 600;
 }
 
 # 播放路径的"新鲜窗口"（秒）：条目出生时间在这个窗口内才敢直接拿去播放。
@@ -759,6 +761,8 @@ sub republish_known_queued {
 				next unless $u && $u =~ m{^lxm://};
 				push @qurls, $u;
 				my $m = $METADATA{$u} or next;
+				# 0.11.91：队列里的行 = 最强的"还在用"信号（防 TTL/上限把它清掉，也顺带刷新落盘时间）
+				_meta_touch($u);
 				next unless $m->{cover} || $m->{title};
 				# 指纹：内容没变 ⇒ 一个字节都不写（否则每写一次就换来一个新通知）
 				my $sig = join("\x1f", map { defined $_ ? $_ : '' }
@@ -1228,6 +1232,350 @@ sub _secs_of_interval {
 	return $s > 0 ? $s : undef;
 }
 
+# ---------- 0.11.91：元数据持久化（**重启后队列封面/曲目标签不再消失**）----------
+# 现场（用户 2026-09-27 报）：达菲一重启，播放队列里那些歌的**封面就没了**（队列本身还在）。
+# 机制：队列行的封面/标签是我们在渲染与建队时通过 `Slim::Music::Info::setRemoteMetadata`
+# **发布**进去的，而"我们知道的元数据"只活在 `%METADATA` 这个**内存**词法哈希里；补发只有两条触发
+# 路径（队列变更通知的兜底 + 我们自己排的确定性补发），**重启本身两条都不触发** ⇒ 重启后队列行
+# 退回裸 URL 的状态（无封面/无标签），直到用户重新渲染一次列表。
+#
+# 做法：把 url→元数据 落盘（只落**无时效**的字段），启动时读回，再在 LMS 恢复完队列后补发一次。
+#
+# ⚠️ 三条硬约束（都是踩过的坑，动之前先读）：
+#   ① **绝不落直链**（`direct`）也不落 `expires`：第三方直链寿命实测 **kg 84 秒 / wy 13 分钟**，
+#      落盘再复用就是"点了没声"（§5.11 的 0.11.23 现场）。这里只落封面/标题/时长/码率/档位/音频属性。
+#   ② **必须有界**：TTL + 条数上限 + 体积护栏，见 `_meta_select`（用户明确要求"防止无限膨胀"）。
+#   ③ **写盘不能阻塞 LMS 主循环**：只在脏时写 + 30s 节流 + 原子 rename；开机与停机各强制一次。
+my $META_FILE_NAME  = 'meta.json';
+my $META_VERSION    = 1;
+my $META_SAVE_EVERY = 30;           # 秒（节流）
+my $META_MAX_BYTES  = 512 * 1024;   # 体积护栏：编码后超过它就按半砍继续缩
+my $META_LAST_SAVE  = 0;
+my $META_SAVED_AT   = 0;            # 上一次成功落盘的时刻（设置页诊断用）
+my $META_DIRTY      = 0;
+my $META_LOADED     = 0;
+my $META_SAVE_TIMER = {};           # ⚠️ 自持宿主：用 $client 当宿主会被 LMS 在队列变更时 kill（0.11.32 现场）
+my %META_AT;                        # url => 最近一次被"用到"的时间（LRU 与 TTL 都用它）
+
+# prefs 读取带"缺省值 + 范围钳制"：设置页可能被填成任意值，不能让它把缓存撑爆
+sub _meta_pref {
+	my ($k, $dflt, $min, $max) = @_;
+	my $v = eval { $prefs->get($k) };
+	return $dflt unless defined $v && $v =~ /^\d+$/;
+	$v = int($v);
+	return $dflt if $v < $min || $v > $max;
+	return $v;
+}
+
+sub meta_enabled  { return _meta_pref('metaCache',     1,  0, 1) }
+sub meta_max_rows { return _meta_pref('metaCacheMax',  800, 20, 5000) }
+sub meta_ttl_days { return _meta_pref('metaCacheDays', 30,  1, 365) }
+
+sub _meta_file {
+	my ($class) = @_;
+	return eval { Plugins::LxMusic::Helper->data_file($META_FILE_NAME) };
+}
+
+# 记录"这条 url 刚被用到"，并按需排一次落盘
+sub _meta_touch {
+	my ($url) = @_;
+	return 0 unless $url;
+	$META_AT{$url} = time();
+	# 开关关掉时：只更新 LRU 时间，**不置脏、不排定时器、不落盘**（"关"就必须是真的关）
+	return 0 unless Plugins::LxMusic::ProtocolHandler->meta_enabled;
+	$META_DIRTY = 1;
+	Plugins::LxMusic::ProtocolHandler->_meta_schedule;
+	return 1;
+}
+
+# 当前所有播放器队列里的 lxm:// url（用于"队列里的行优先保留"）
+sub _queued_lxm_urls {
+	my %in;
+	eval {
+		for my $client (Slim::Player::Client::clients()) {
+			my $pl = eval { Slim::Player::Playlist::playList($client) };
+			next unless $pl && ref($pl) eq 'ARRAY';
+			for my $item (@$pl) {
+				my $u = blessed($item) ? eval { $item->url } : $item;
+				$in{$u} = 1 if $u && $u =~ m{^lxm://};
+			}
+		}
+	};
+	return \%in;
+}
+
+# 有界化：先按 TTL 丢，再按"队列优先 + 最近使用优先"砍到 $budget 条。
+# 返回 (选中集合的引用, 因 TTL 丢掉的条数, 因上限丢掉的条数)。
+# ⚠️ 是**方法**（首参是类名）——本文件里"无 $class 形参的工具函数被误当方法调用"踩过坑（0.11.76）。
+sub _meta_select {
+	my ($class, $rows, $protect, $budget, $ttl) = @_;
+	my $now = time();
+	my ($dt, $dc) = (0, 0);
+
+	# ① 先把"受保护集合"（队列里的行）定下来，并给它一个**硬上限**。
+	#    ⚠️⚠️ 0.11.92 设备实测踩到的坑：没有这个上限时，一个上千行的队列会把
+	#    "条数上限 + 体积护栏"**一起架空**（当时 1342 行全被判为"在队列里" ⇒ 一行都淘汰不掉、
+	#    落盘 1.37MB，护栏形同虚设）。这里只保最近的 $pmax 行，其余按普通行参与淘汰。
+	my $pmax = $budget > 800 ? 400 : int($budget / 2);
+	$pmax = 1 if $pmax < 1;
+	my %pin;
+	{
+		my @p = grep { $protect->{$_} && ref($rows->{$_}) eq 'HASH' } keys %$rows;
+		if (@p > $pmax) {
+			@p = sort { ($rows->{$b}{t} || 0) <=> ($rows->{$a}{t} || 0) } @p;
+			@p = @p[ 0 .. $pmax - 1 ];
+		}
+		%pin = map { $_ => 1 } @p;
+	}
+
+	my %keep;
+	for my $u (keys %$rows) {
+		my $r = $rows->{$u};
+		next unless ref($r) eq 'HASH';
+		my $t = int($r->{t} || 0);
+		# ⚠️ `$ttl <= 0` 表示"不按时间淘汰"（内存裁剪用它）；队列里的行**永不按 TTL 丢**
+		# ——否则一首在队列里躺久了就变成没封面。
+		if (!$pin{$u} && $ttl > 0 && $t > 0 && ($now - $t) > $ttl) { $dt++; next }
+		$keep{$u} = $r;
+	}
+
+	if (scalar(keys %keep) > $budget) {
+		# ② 受保护的先占位；其余**只留 (budget − #受保护) 条**最近使用的。
+		#    ⚠️ 0.11.92 第一版的算法在这里是错的：它"从 rest 里删掉 $room 个"，
+		#    于是 kept = total − budget + P（上限被 P 顶掉）；P ≥ total 时更是一行都删不掉。
+		#    正确做法是"从 rest 里**留下** $keep_rest 个"，而不是"删掉 $room 个"。
+		my $np = scalar(grep { $pin{$_} } keys %keep);
+		my $keep_rest = $budget - $np;
+		$keep_rest = 0 if $keep_rest < 0;
+		my @rest = sort { ($keep{$b}{t} || 0) <=> ($keep{$a}{t} || 0) }
+			grep { !$pin{$_} } keys %keep;
+		my $n = 0;
+		for my $u (@rest) {
+			$n++;
+			next if $n <= $keep_rest;      # 最近使用的前 $keep_rest 个留下
+			delete $keep{$u};
+			$dc++;
+		}
+	}
+	return (\%keep, $dt, $dc);
+}
+
+# 落盘（节流；$force=1 绕过节流，用于开机/停机/设置页"立即保存"）
+sub meta_save {
+	my ($class, $force) = @_;
+	return 0 unless $META_DIRTY;
+	# 开关关掉 ⇒ 完全不落盘（连 force 也不写），并清掉脏标记免得定时器一直空转重排。
+	# 已有文件保持原样（"一键清空"是另一个按钮的事）。
+	unless ($class->meta_enabled) { $META_DIRTY = 0; return 0 }
+	return 0 unless $force || (time() - $META_LAST_SAVE) >= $META_SAVE_EVERY;
+	my $f = $class->_meta_file;
+	unless ($f) { $log->warn('LxMusic meta: 取不到数据文件路径，跳过落盘'); return 0 }
+	$META_LAST_SAVE = time();
+
+	my $ttl = $class->meta_ttl_days * 86400;
+	my %rows;
+	for my $u (keys %METADATA) {
+		my $m = $METADATA{$u};
+		next unless ref($m) eq 'HASH';
+		next unless $m->{cover} || $m->{title};
+		my %r;
+		$r{title} = $m->{title} if defined $m->{title} && $m->{title} ne '';
+		$r{cover} = $m->{cover} if defined $m->{cover} && $m->{cover} ne '';
+		for my $k (qw(secs kbps samplerate samplesize channels)) {
+			$r{$k} = int($m->{$k}) if $m->{$k} && $m->{$k} > 0;
+		}
+		for my $k (qw(quality format)) {
+			$r{$k} = $m->{$k} if defined $m->{$k} && $m->{$k} ne '';
+		}
+		$r{t} = int($META_AT{$u} || time());
+		$rows{$u} = \%r;
+	}
+
+	my $protect = _queued_lxm_urls();
+	my $budget  = $class->meta_max_rows;
+	my ($json, $kept, $dt, $dc) = ('', 0, 0, 0);
+	# 体积护栏：编码后超限就对半砍条数重编（最多 5 轮），保证落盘文件不会失控
+	for my $round (1 .. 5) {
+		my ($sel, $d1, $d2) = $class->_meta_select(\%rows, $protect, $budget, $ttl);
+		$kept = scalar keys %$sel; $dt = $d1; $dc = $d2;
+		$json = eval { JSON::XS->new->utf8->canonical->encode({
+			v => $META_VERSION, saved => time(), rows => $sel,
+		}) };
+		unless (defined $json && length $json) {
+			$log->warn('LxMusic meta: 序列化失败: ' . ($@ || '?'));
+			return 0;
+		}
+		last if length($json) <= $META_MAX_BYTES || $budget <= 20;
+		$budget = int($budget / 2);
+	}
+
+	# 原子写：先临时文件再 rename（断电/被杀不会留下半个 JSON）
+	my $tmp = "$f.tmp";
+	my $ok = eval {
+		open(my $fh, '>', $tmp) or die "$tmp: $!";
+		print $fh $json;
+		close $fh or die "close: $!";
+		rename($tmp, $f) or die "rename: $!";
+		1;
+	};
+	unless ($ok) {
+		$log->warn("LxMusic meta: 写入失败 $f: $@");
+		return 0;
+	}
+	$META_DIRTY   = 0;
+	$META_SAVED_AT = time();
+	$log->info("LxMusic meta: saved $kept rows (" . length($json) . "B) to $f"
+		. ($dt || $dc ? " [dropped ${dt} expired, ${dc} over the cap]" : ''));
+	return 1;
+}
+
+# 读回（只读，不动已有的内存条目——启动早期调用，内存里通常是空的）
+sub meta_load {
+	my ($class) = @_;
+	return 0 if $META_LOADED;
+	$META_LOADED = 1;
+	my $f = $class->_meta_file;
+	return 0 unless $f && -f $f;
+	my $raw = '';
+	if (open(my $fh, '<', $f)) { local $/; $raw = <$fh> // ''; close $fh }
+	return 0 unless length $raw;
+	my $d = eval { JSON::XS->new->utf8->decode($raw) };
+	unless (ref($d) eq 'HASH' && ref($d->{rows}) eq 'HASH') {
+		$log->warn("LxMusic meta: $f 解析失败，忽略（$@）");
+		return 0;
+	}
+	my $ttl = $class->meta_ttl_days * 86400;
+	my $now = time();
+	my ($n, $expired, $bad) = (0, 0, 0);
+	for my $u (keys %{ $d->{rows} }) {
+		unless ($u =~ m{^lxm://}) { $bad++; next }
+		my $r = $d->{rows}{$u};
+		unless (ref($r) eq 'HASH') { $bad++; next }
+		my $t = int($r->{t} || 0);
+		if ($t > 0 && ($now - $t) > $ttl) { $expired++; next }
+		next if $METADATA{$u};
+		$METADATA{$u} = {
+			title      => (defined $r->{title} ? $r->{title} : ''),
+			cover      => (defined $r->{cover} ? $r->{cover} : ''),
+			error      => '',
+			secs       => int($r->{secs}       || 0),
+			kbps       => int($r->{kbps}       || 0),
+			format     => (defined $r->{format} ? $r->{format} : ''),
+			quality    => (defined $r->{quality} ? $r->{quality} : ''),
+			samplerate => int($r->{samplerate} || 0),
+			samplesize => int($r->{samplesize} || 0),
+			channels   => int($r->{channels}   || 0),
+		};
+		$META_AT{$u} = $t > 0 ? $t : $now;
+		$n++;
+	}
+	$log->warn("LxMusic meta: loaded $n rows from $f"
+		. ($expired ? " (skipped $expired expired)" : '')
+		. ($bad ? " (skipped $bad malformed)" : ''));
+	return $n;
+}
+
+# 一键清理（设置页）：内存与磁盘一起清
+sub meta_clear {
+	my ($class) = @_;
+	my $had = scalar keys %METADATA;
+	%METADATA = ();
+	%META_AT  = ();
+	$META_DIRTY = 0;
+	$META_LAST_SAVE = 0;
+	my $f = $class->_meta_file;
+	my $unlinked = 0;
+	if ($f && -f $f) { $unlinked = unlink($f) ? 1 : 0 }
+	Slim::Utils::Timers::killTimers($META_SAVE_TIMER, \&_meta_flush_fire);
+	$log->warn("LxMusic meta: cleared ($had rows in memory, file " . ($unlinked ? 'removed' : 'absent') . ')');
+	return { rows => $had, removed => $unlinked };
+}
+
+# 仅测试用：清内存与"已加载"标记，**不动磁盘文件**（真实的"一键清理"走 meta_clear）
+sub _meta_reset_memory {
+	%METADATA = ();
+	%META_AT  = ();
+	$META_LOADED = 0;
+	$META_DIRTY = 0;
+	$META_LAST_SAVE = 0;
+	return 1;
+}
+
+sub meta_stats {
+	my ($class) = @_;
+	my $f = $class->_meta_file;
+	my $bytes = ($f && -f $f) ? (-s $f) : 0;
+	my $q = _queued_lxm_urls();
+	my $known = 0;
+	$known++ for grep { $METADATA{$_} } keys %$q;
+	return {
+		rows        => scalar(keys %METADATA),
+		bytes       => int($bytes || 0),
+		saved_at    => $META_SAVED_AT,
+		dirty       => $META_DIRTY,
+		queued      => scalar(keys %$q),
+		queued_known => $known,
+		enabled     => $class->meta_enabled ? 1 : 0,
+		max_rows    => $class->meta_max_rows,
+		ttl_days    => $class->meta_ttl_days,
+		file        => ($f || ''),
+	};
+}
+
+sub _meta_flush_fire { Plugins::LxMusic::ProtocolHandler->meta_save(0); return }
+
+# 还有脏数据就再排一次（保证"最后一批改动"不会因为没人再触发而永远不落盘）
+sub _meta_schedule {
+	my ($class) = @_;
+	return 0 unless $META_DIRTY;
+	Slim::Utils::Timers::killTimers($META_SAVE_TIMER, \&_meta_flush_fire);
+	Slim::Utils::Timers::setTimer($META_SAVE_TIMER, time() + $META_SAVE_EVERY, \&_meta_flush_fire);
+	return 1;
+}
+
+# ---------- 启动恢复：读回元数据 + 补发一次 ----------
+# **主路径（可靠，已在现场验证过）**：LMS 重启后是**每个播放器重连时**才恢复队列的
+# （`Slim/Player/Client.pm:568` startup → `Slim/Player/Playlist.pm:1212` 发 `playlist addtracks`），
+# 这条命令会走 LMS 的 playlist 通知 ⇒ 本文件既有的订阅（`_repub_worthy` 不过滤 `addtracks`）
+# 就会排一次 +3s 尾部补发 ⇒ `republish_known_queued` 拿着刚 `meta_load` 回来的记录把封面上回去。
+# 封面还有一条**不需要补发**的兜底：`getMetadataFor` 末尾读 LMS 自己的 `remote_image_<url>`
+# 缓存（见那里的注释）——队列一渲染就有图。
+# **下面这条定时器链只是兜底**：万一某个 LMS 版本/皮肤路径不发那条通知，也会在几次延迟后自己补一次；
+# 一旦真的补发了（写了行）就立刻收手，不留后台负担。
+my $META_BOOT_OWNER = {};
+my @META_BOOT_AT    = (20, 60, 150);   # 秒；LMS 恢复队列 + 全库重扫可能要一会儿
+my $META_BOOT_N     = 0;
+
+sub meta_boot {
+	my ($class) = @_;
+	$class->meta_load;
+	$META_BOOT_N = 0;
+	$class->_meta_boot_next;
+	return 1;
+}
+
+sub _meta_boot_next {
+	my ($class) = @_;
+	return 0 if $META_BOOT_N >= @META_BOOT_AT;
+	my $delay = $META_BOOT_AT[ $META_BOOT_N++ ];
+	Slim::Utils::Timers::killTimers($META_BOOT_OWNER, \&_meta_boot_fire);
+	Slim::Utils::Timers::setTimer($META_BOOT_OWNER, time() + $delay, \&_meta_boot_fire);
+	return 1;
+}
+
+sub _meta_boot_fire { Plugins::LxMusic::ProtocolHandler->_meta_boot_tick; return }
+
+sub _meta_boot_tick {
+	my ($class) = @_;
+	my $wrote = eval { $class->republish_known_queued() };
+	if ($@) { $log->warn('LxMusic meta: boot republish died: ' . $@) }
+	if (!defined $wrote || $wrote <= 0) {
+		# 队列还没恢复出来（或在隔离/防重入里）：还有机会就再等一轮
+		$class->_meta_boot_next;
+	}
+	return 1;
+}
+
 # ---------- 元数据 ----------
 # （`my %METADATA;` 已上移到文件顶部——republish_known_queued 需要先声明）
 
@@ -1236,7 +1584,9 @@ sub cache_metadata {
 
 	# 0.11.31：上限从 200 提到 2000 —— 整榜 300 首要留下全部记录，
 	# 否则 playlist 通知触发的补发会找不到早期行的封面（被自己挤掉了）。
-	%METADATA = () if keys %METADATA > 2000;
+	# 0.11.91：到顶不再"整表清空"（那会把队列里的行一起打掉 ⇒ 补发无图可发），改成
+	# 裁剪到 1200：队列里的行优先保留，其余按最近使用时间淘汰。
+	$class->_meta_trim_memory(1200) if keys(%METADATA) > 2000;
 
 	# 0.11.32：**合并而不是覆盖**。整榜入队（explodePlaylist）的顺序是
 	#     _publish_cover($u,...)          # 先写入封面
@@ -1260,8 +1610,21 @@ sub cache_metadata {
 		channels   => $info->{channels}   || $old->{channels}   || 0,
 	);
 	$METADATA{$url} = \%new;
+	_meta_touch($url);       # 0.11.91：记 LRU 时间 + 排一次落盘（见本文件顶部的持久化段）
 
 	return 1;
+}
+
+# 0.11.91：内存态也不能"一刀切清空"（原来是 `%METADATA = ()`）—— 那会把**正在队列里**的行
+# 一起打掉，重启前的那一刻就再也没封面可补了。改成"队列优先 + 最近使用优先"裁剪。
+sub _meta_trim_memory {
+	my ($class, $max) = @_;
+	return 0 if keys(%METADATA) <= $max;
+	my $protect = _queued_lxm_urls();
+	my ($sel, $dt, $dc) = $class->_meta_select(\%METADATA, $protect, $max, 0);   # ttl=0 ⇒ 不按时间丢
+	%METADATA = %$sel;
+	for my $u (keys %META_AT) { delete $META_AT{$u} unless $METADATA{$u} }
+	return $dt + $dc;
 }
 
 # 渲染期发布队列/正在播放元数据（喜马拉雅 0.1.47 同款）：
@@ -1303,6 +1666,24 @@ sub publishQueueMetadata {
 	return 0 unless scalar keys %meta;
 
 	Slim::Music::Info::setRemoteMetadata($url, \%meta);
+
+	# 0.11.92：封面映射按**我们自己的 TTL** 再写一份到 LMS 的 `remote_image_<url>`。
+	# 起因：LMS 在 setRemoteMetadata 里写这条是**硬编码 30 天**（`Slim/Music/Info.pm:487`），
+	# 而设置页的 `metaCacheDays` 允许 1–365 天 —— 用户把它调到 >30 天，明确表达了"我想留更久"，
+	# 但 LMS 那一份会在第 30 天消失。
+	# ⚠️ 必须走 `Helper::lms_cache_set`：**裸数字**形式的 TTL 一旦 >2592000（30 天）就会被 LMS
+	# 当成**绝对时间戳**（1970 年附近）⇒ 一写就过期、永远读不回来（机制见
+	# `Helper::lms_cache_expiry` 的注释；注意带单位的字符串反而是安全的，只有裸数字有坑）。
+	# 默认值（30 天）时**一个字节都不多写**，完全不打扰 LMS 自己的默认路径。
+	if ($meta{cover} && $class->meta_ttl_days != 30) {
+		my $days = $class->meta_ttl_days;
+		my $ok = Plugins::LxMusic::Helper->lms_cache_set(
+			$class->_lms_image_cache, "remote_image_$url", $meta{cover}, $days * 86400,
+		);
+		# info 级：设备验收时用来证明"这条镜像写真的发生了"（默认 30 天时不会有这行）
+		$log->info("LxMusic: mirrored cover for $url with ${days}d TTL (ok=" . ($ok ? 1 : 0) . ')');
+	}
+
 	%REPUBLISHED = () if scalar(keys %REPUBLISHED) > 3000;
 	$REPUBLISHED{$url} = $sig;
 	return 1;
@@ -1332,7 +1713,39 @@ sub getMetadataFor {
 		return %meta ? \%meta : {};
 	}
 
+	# ---------- 0.11.91：重启后的封面兜底（**这是"重启就没封面"的最省事修法**）----------
+	# LMS 在 `Slim::Music::Info::setRemoteMetadata` 里、只要封面存在且 handler 的
+	# `shouldCacheImage` 返回真（本包第 112 行就是 `sub shouldCacheImage { 1 }`），就会顺手写一条
+	#     Slim::Utils::Cache->new->set("remote_image_$url", <cover>, '30 days')
+	# 落进 `cachedir/cache.db`（SQLite，活得过重启，过期由 LMS 自己的 purge 管）。
+	# 而队列/正在播放要封面时**只走这个 getMetadataFor**（Slim/Control/Queries.pm:5716-5741 的
+	# `$remoteMeta{cover}` → `K`=artwork_url）；内存没了、又没有这条兜底，LMS 就退到
+	# `-<内存地址>` 的 coverid，最终渲染成 `radio.png` —— 这就是用户看到的"重启后队列全没图"。
+	# 注意顺序：内存（最新）→ 我们自己的 meta.json（已由 meta_load 读回内存）→ LMS 这条缓存。
+	if ($url && $url =~ m{^lxm://}) {
+		my $cached = eval { $class->_lms_image_cache->get("remote_image_$url") };
+		if ($cached && !ref($cached) && $cached =~ m{^(?:https?://|/plugins/LxMusic/cover)}) {
+			# 回填内存 + 记 LRU（只在"内存里还没有这条封面"时做一次，避免每次渲染都刷脏）：
+			# 这样"重启后随便渲染一次队列"就把封面救回来，下一次 meta_save 还会把它写进
+			# 我们自己的文件（自愈）。
+			my $known = $METADATA{$url};
+			$class->cache_metadata($url, { cover => $cached })
+				unless $known && $known->{cover};
+			return { cover => $cached };
+		}
+	}
+
 	return {};
+}
+
+# LMS 自己的 SQLite 缓存对象（`cachedir/cache.db`）。惰性获取 + 记忆化：
+# `Slim::Utils::Cache->new` 本身按 namespace 记忆化，这里只是省掉每次渲染的一次方法调用与 eval。
+my $LMS_CACHE;
+sub _lms_image_cache {
+	my ($class) = @_;
+	return $LMS_CACHE if $LMS_CACHE;
+	$LMS_CACHE = eval { require Slim::Utils::Cache; Slim::Utils::Cache->new };
+	return $LMS_CACHE;
 }
 
 sub qualityLabel {

@@ -158,7 +158,11 @@ sub pluginVersion {
 #     我们用 HEAD 的 Content-Length ÷ 时长反推，避免"以为在听 flac 其实是 128k"
 my @QUALITY_LADDER = qw(flac24bit flac 320k 128k);   # PC: TRY_QUALITYS_LIST + 128k 兜底
 
-sub _pref { my ($k, $d) = @_; my $v = $prefs->get($k); return defined $v ? $v : $d }
+# ⚠️ 0.11.94：**空串要当成"没设"**。表单整表回放/老版本 pref 会留下 `''`，而 `''` 是 **defined** 的：
+# 旧写法 `defined $v ? $v : $d` 会把 `''` 原样返回 ⇒ 布尔项变"关"、数字项变 0。
+# 本函数 6 个调用点（qualityFallback/verifyUrl/preferStreamable/workerEnable/workerIdle/sdkWorkers）
+# **全都**指望"未设 = 用默认"，所以在这里一次修掉：空串 ⇒ 默认值。
+sub _pref { my ($k, $d) = @_; my $v = $prefs->get($k); return (defined $v && $v ne '') ? $v : $d }
 
 # 返回"该试哪些档位"（有序）——多源时外层按音质、内层按源，优先保音质
 sub qualityLadder {
@@ -502,13 +506,71 @@ sub _score_reset { %SRC_SCORE = (); return 1 }
 # 环境变量 `LX_STATE_FILE` 可覆盖（单测/排查用）。
 my $STATE_LAST = 0;         # 上次落盘时间（节流用）
 
-sub state_file {
+# 0.11.91：数据目录抽出来给"元数据缓存"共用（见 ProtocolHandler 的 meta_save/meta_load）。
+# 环境变量 `LX_DATA_DIR` 可整目录覆盖（单测/排查用，不要用 /tmp：tmpfs 会被清）。
+sub data_dir {
 	my ($class) = @_;
-	return $ENV{LX_STATE_FILE} if defined $ENV{LX_STATE_FILE} && length $ENV{LX_STATE_FILE};
+	if (defined $ENV{LX_DATA_DIR} && length $ENV{LX_DATA_DIR}) {
+		mkpath($ENV{LX_DATA_DIR}) unless -d $ENV{LX_DATA_DIR};
+		return $ENV{LX_DATA_DIR};
+	}
 	my $base = eval { Slim::Utils::Prefs::dir() } || File::Spec->tmpdir();
 	my $d = File::Spec->catdir($base, 'lxmusic');
 	mkpath($d) unless -d $d;
-	return File::Spec->catfile($d, 'state.json');
+	return $d;
+}
+
+sub data_file {
+	my ($class, $name) = @_;
+	return undef unless defined $name && length $name;
+	# ⚠️ 只允许纯文件名：防止调用方拼出 `../` 跑到数据目录外面
+	return undef if $name =~ m{[\\/]|\.\.};
+	return File::Spec->catfile($class->data_dir, $name);
+}
+
+sub state_file {
+	my ($class) = @_;
+	return $ENV{LX_STATE_FILE} if defined $ENV{LX_STATE_FILE} && length $ENV{LX_STATE_FILE};
+	return $class->data_file('state.json');
+}
+
+# ---------- 0.11.92：LMS 缓存的 TTL 守卫（**不要绕过它**）----------
+# ⚠️⚠️ 陷阱（`Slim/Utils/DbCache.pm:171-196` 的分支顺序，**只发生在"裸数字"这条路上**）：
+#     elsif ( $expiry =~ /^\s*[+-]?(?:\d+|\d*\.\d*)\s*$/ ) { $expiry = $1; }        # ← 裸数字：只赋值，不加 now
+#     elsif ( $expiry =~ /^\s*[+-]?…\s*(\w*)\s*$/ && $_Expiration_Units{$2} ) {    # ← 带单位字符串
+#         $expiry = time() + ( $_Expiration_Units{$2} ) * $1;                       #    这里**已经加了 now**
+#     }
+#     if ( $expiry <= 2592000 && $expiry > -1 ) { $expiry += time(); }              # ← 只给"仍 ≤30 天"的补 now
+#
+# 由此得到两条**必须记准**的结论（0.11.92 一度把前者写反过，别再搞错）：
+#   · **带单位的字符串是安全的**：`'31 days'` / `'5 weeks'` / `'2 months'` / `'1 year'` 都会走字符串分支，
+#     已经是 `time()+N`，不会二次加 now ⇒ 想要多长都可以（LMS 自己就用 `'30 days'`）。
+#   · **裸数字 > 2592000 才是陷阱**：例如把 `40*86400`(=3456000) 直接当 TTL 传进去 ⇒ 不走字符串分支、
+#     又因为 >2592000 而**不补 now** ⇒ 落库的 `t` = 3456000（1970-02-09）⇒ 条目**一写就过期、
+#     `get` 永远读不回来，且不报任何错**。
+#
+# 而"传秒数"恰恰是最自然的写法（我们的 pref 就是天数⇒秒数）。所以本项目规定：
+# **凡是往 LMS 缓存里写 TTL，一律走 `lms_cache_expiry`（它把 >30 天换算成绝对时间戳，两种写法都正确）。**
+#   · $seconds < 0   ⇒ 'never'（DbCache 存 t=-1，`get` 的 `$expiry >= 0` 判定使它永不过期）
+#   · 0              ⇒ 立刻过期
+#   · 1..2592000     ⇒ 原样返回（LMS 会加上 now）
+#   · > 2592000      ⇒ time()+$seconds（**必须**：直接传裸数字就是这个陷阱）
+sub lms_cache_expiry {
+	my ($class, $seconds) = @_;
+	return 'never' if defined $seconds && $seconds < 0;
+	$seconds = int($seconds || 0);
+	return 0 if $seconds <= 0;                       # 立即过期
+	return $seconds if $seconds <= 2592000;          # ≤30 天：交给 LMS 变成"相对现在"
+	return time() + $seconds;                        # >30 天：必须自己算绝对时间戳（见上面的陷阱）
+}
+
+# 写 LMS 缓存的唯一入口（`->set` 的 TTL 一律经 `lms_cache_expiry`）
+sub lms_cache_set {
+	my ($class, $cache, $key, $val, $seconds) = @_;
+	return 0 unless $cache && defined $key && length $key;
+	my $ok = eval { $cache->set($key, $val, $class->lms_cache_expiry($seconds)); 1 };
+	$log->warn('LxMusic: lms_cache_set failed for ' . $key . ': ' . ($@ || '?')) unless $ok;
+	return $ok ? 1 : 0;
 }
 
 sub state_load {
@@ -1207,6 +1269,9 @@ sub shutdown {
 	}
 	rmtree($TMPDIR);
 	$class->state_save(1);      # 0.11.64：停机前强制落盘（节流绕过）
+	# 0.11.91：元数据缓存也强制收尾一次（否则停机前 30 秒内的改动会丢）。
+	# 用 eval + 全限定名：Helper 不能 `use` ProtocolHandler（那会形成编译期循环依赖）。
+	eval { Plugins::LxMusic::ProtocolHandler->meta_save(1) };
 	return 1;
 }
 
