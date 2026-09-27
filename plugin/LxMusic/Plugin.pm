@@ -1700,11 +1700,28 @@ sub sdkSonglistDetailHandler {
 		return;
 	}
 
-	# 歌单详情的上游页宽同样不固定（kw 1000 / kg 10000 / tx 100000 / wy 1000…），先按 50 猜，
+	# 歌单详情的上游页宽同样不固定（kg 10000 / tx 100000 / wy 1000…），先按 50 猜，
 	# 拿到响应的 limit 再重算重取一次（同榜单 0.11.5 的教训）。
 	# ⚠️ 0.11.40：**重算后 page/skip 没变就别重取**——index=0（"点进歌单"的绝大多数情况）时
 	# 猜 50 与真页宽算出来的都是 page=1/skip=0，从前照样再打一次平台 API，白等一次往返。
-	my $upw   = 50;
+	#
+	# 0.11.87（待办 B-6）：**kw 改成"按窗取数"**（其余平台一切照旧：仍按 50 猜 + 校正）。
+	# 实测（`tmp/kw_detail_probe.py` 直接打上游 + `tmp/kw_detail_ab.py` 设备对照）：
+	#   · kw 的详情接口 nplserver **认 rn/pn**：rn=50&pn=1 给的是第 51-100 首（逐首不同），
+	#     字节随行数线性（50 首 153KB / 100 首 305KB / 205 首 621KB）；
+	#   · 而 vendored SDK 的 `limit_song = 1000` ⇒ **一次把整个歌单拉回来**（205 首 = 621356B）；
+	#   · 更亏的是"页宽猜 50、真页宽 1000"：index>0 时**先白打一次空页**再重取整单 ——
+	#     现场 idx=150 `pn=3&rn=1000`(616B/100ms) + `pn=0&rn=1000`(621356B/240ms)，
+	#     `shim_ms=1334`、整页 1863ms。
+	# ⇒ 把"这一窗要几行"显式告诉 shim（`rn`），并**直接用它当上游页宽首猜**：
+	#   一次就落在正确页上（没有空页那一跳），且只取窗口那么宽的页。
+	#   下界 20：window=1 是"点单行"的形态（多数由 `_feed_cache_cover` 命中，漏网时才真打上游），
+	#   取 20 行 ~60KB 比取 1 行稳；上界 300 与 `$window` 的夹取一致。
+	my $rn = $window;
+	$rn = 20  if $rn < 20;
+	$rn = 300 if $rn > 300;
+	my $kw_window = ($src eq 'kw') ? 1 : 0;
+	my $upw   = $kw_window ? $rn : 50;
 	my $page  = int($index / $upw) + 1;
 	my $skip  = $index % $upw;
 	my $retuned = 0;
@@ -1714,7 +1731,8 @@ sub sdkSonglistDetailHandler {
 	$fetch = sub {
 	Plugins::LxMusic::Helper->request(
 		action  => 'songlistdetail',
-		info    => { source => $src, id => $plid, page => $page, ($lean ? (lean => 1) : ()) },
+		info    => { source => $src, id => $plid, page => $page,
+			($lean ? (lean => 1) : ()), ($kw_window ? (rn => $rn) : ()) },
 		timeout => 30,
 		cb      => sub {
 			my ($res) = @_;
@@ -1785,8 +1803,8 @@ sub sdkSonglistDetailHandler {
 				]),
 			};
 			_feed_cache_put($ckey, $feed, $window);
-			$log->warn(sprintf('LxMusic pl-detail MISS src=%s id=%s idx=%d win=%d tracks=%d total=%d lean=%d shim_ms=%s ms=%d',
-				$src, $plid, $index, $window, scalar(@$tracks), int($total), $lean,
+			$log->warn(sprintf('LxMusic pl-detail MISS src=%s id=%s idx=%d win=%d upw=%d tracks=%d total=%d lean=%d shim_ms=%s ms=%d',
+				$src, $plid, $index, $window, $upw, scalar(@$tracks), int($total), $lean,
 				(defined $res->{ms} ? $res->{ms} : '?'), int((time() - $t0) * 1000)));
 			$cb->($feed);
 		},

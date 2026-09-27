@@ -51,6 +51,18 @@ my $JSON = JSON::XS->new->utf8->allow_nonref;
 my %JOBS;    # pid => job
 my @WAITQ;   # 超出并发闸的请求闭包队列（FIFO）
 
+# 0.11.87（待办 E-1）：**慢源 fork 的每源并发闸**。
+# 背景：`%WORKER_BAD` 让"超时过的源"改走 fork，而 fork **每请求一个 qjs**（i386 上约 1s 固定成本）。
+# 但同一个慢源可以在全局并发闸（`helperConcurrency`，默认 2）里**同时开两个 fork**：两个 qjs 一起
+# 打同一个慢上游，互相抢 CPU/带宽 ⇒ 两个都更容易超时，而超时又会刷新 `%WORKER_BAD` 的 10 分钟标记，
+# 于是这个源**自我锁定**在"慢→fork→更慢→再超时"的环里。
+# 语义：慢源（hostile）每源最多 **1 个在飞**；多出来的**排队**（不是拒绝——拒绝会让"只有这一个源
+# 可用"的用户直接失败），单源最多排 `$SRC_WAIT_MAX` 个，再多就明确报错（防雪崩）。
+# 放行点在 `_finish`（与全局闸同处），且被放行的闭包会**重走一遍全部准入判断** ⇒ 不精确匹配也安全。
+my %SRC_INFLIGHT;      # 源路径 => 在飞的 fork 请求数
+my @SRC_WAITQ;         # [源路径, 闭包] 每源闸的排队（FIFO）
+my $SRC_WAIT_MAX = 2;
+
 # 常驻 worker 状态（声明必须在最前：shutdown 定义在 worker 段之前，词法变量不会向后可见）
 my %WORKER;  # key => { pid, rd, wr, buf, ready, queue=>[], jobs=>{}, last, recent=>[], info, src, key }
 # 0.11.54：worker 超时过的**源路径** => 打标记时间（TTL 600s）。见 `request()` 里的说明：
@@ -85,6 +97,19 @@ sub _maxChildren {
 	my $n = $prefs->get('helperConcurrency');
 	$n = 2 unless defined $n && $n >= 1 && $n <= 8;
 	return int($n);
+}
+
+# 0.11.87（待办 E-1）：慢源 fork 的**准入策略**（纯函数，便于单测 —— 见 worker-lifecycle-test.pl）。
+#   'run'    —— 该源此刻没有在飞 ⇒ 放行
+#   'queue'  —— 已有 1 个在飞，且该源排队数 < $SRC_WAIT_MAX ⇒ 排队
+#   'reject' —— 队列也满了 ⇒ 明确报错（宁可让上层换候选，也不无限堆积）
+sub _hostile_admit {
+	my ($class, $src, $inflight, $queued) = @_;
+	$inflight = 0 unless defined $inflight;
+	$queued   = 0 unless defined $queued;
+	return 'run'   if $inflight < 1;
+	return 'queue' if $queued < $SRC_WAIT_MAX;
+	return 'reject';
 }
 
 # 桥级超时（秒）下发到子进程（shim 读 LX_BRIDGE_TIMEOUT）
@@ -1018,6 +1043,26 @@ sub request {
 		}
 	}
 
+	# 0.11.87（待办 E-1）：**慢源 fork 的每源并发闸**（说明见文件头 `%SRC_INFLIGHT`）。
+	# 放在全局闸之前：这样第二个"同源慢请求"排进**每源队列**，而不是去占全局闸的名额
+	# （否则两个慢 fork 会同时开跑，正是我们要避免的）。
+	# 只对"已判定 hostile 的源"生效；其余请求一切照旧。
+	my $hostile_src;
+	if ($action eq 'musicUrl' && $source && $source ne $SHIM && $source ne $SDK && _worker_hostile($source)) {
+		$hostile_src = $source;
+		my $nq      = grep { $_->[0] eq $source } @SRC_WAITQ;
+		my $verdict = __PACKAGE__->_hostile_admit($source, $SRC_INFLIGHT{$source} || 0, $nq);
+		if ($verdict ne 'run') {
+			if ($verdict eq 'queue') {
+				push @SRC_WAITQ, [ $source, sub { __PACKAGE__->request(%args) } ];
+				$log->warn("LxMusic Helper: hostile source busy, queued ($source, queue=$nq)");
+				return;
+			}
+			$log->warn("LxMusic Helper: hostile source queue full, rejected ($source)");
+			return $cb->(_err('source busy (hostile queue full)'));
+		}
+	}
+
 	# 并发闸（M0.3）：整单 m3u 入队时 LMS 会并发解析几十个 lxm://，全 fork 会打满设备 CPU
 	# 并拖垮上游（0.4.0 现场：全部 'timeout: no RESULT line'）。排队串行放行，max 2 并发。
 	# 0.11.58：后台请求**不排队**（排队 = 用户点歌时前面还压着一串预热）——直接丢弃。
@@ -1072,8 +1117,11 @@ sub request {
 		timeout => $timeout,
 		done    => 0,
 		src     => $source,     # 0.11.58：CAPS 行要按"哪个源"归档
+		# 0.11.87（E-1）：这个 job 占的是**哪个慢源的每源名额**（undef = 不占）
+		hostile_src => $hostile_src,
 	};
 	$JOBS{$pid} = $job;
+	$SRC_INFLIGHT{$hostile_src}++ if $hostile_src;
 
 	$log->warn("LxMusic Helper: job $pid ($action) started, timeout ${timeout}s");
 	Slim::Utils::Timers::setTimer($job, time() + 0.25, \&_poll);
@@ -1514,6 +1562,11 @@ sub _finish {
 	Slim::Utils::Timers::killTimers($job, \&_poll);
 	delete $JOBS{$job->{pid}};
 	waitpid($job->{pid}, 0) if $job->{pid};   # 已回收时返回 -1，无害
+	# 0.11.87（E-1）：早放每源闸（与全局闸同步：job 一结束名额就还回去，回调里再进也不吃亏）
+	if (my $hs = $job->{hostile_src}) {
+		$SRC_INFLIGHT{$hs}-- if ($SRC_INFLIGHT{$hs} || 0) > 0;
+		delete $SRC_INFLIGHT{$hs} unless $SRC_INFLIGHT{$hs};
+	}
 
 	my $buf = '';
 	if (open(my $fh, '<', $job->{out})) {
@@ -1570,6 +1623,16 @@ sub _finish {
 	while (@WAITQ && scalar(keys %JOBS) < _maxChildren()) {
 		my $next = shift @WAITQ;
 		$next->();
+	}
+
+	# 0.11.87（待办 E-1）：每源闸放行 —— 只放"该源此刻没有在飞"的排队项。
+	# 被放行的闭包会**重走一遍全部准入判断**（全局闸 + 每源闸），所以这里不需要精确匹配：
+	# 若它又被挡住（例如全局闸刚被占满），它会自己回到队里。
+	# ⚠️ 与全局闸一样，这段必须在**回调之后**（回调抛异常也不能把排队项永久堵死）。
+	for (my $i = 0; $i < @SRC_WAITQ; ) {
+		my ($s, $code) = @{ $SRC_WAITQ[$i] };
+		if (($SRC_INFLIGHT{$s} || 0) < 1) { splice(@SRC_WAITQ, $i, 1); $code->(); }
+		else { $i++ }
 	}
 	return;
 }

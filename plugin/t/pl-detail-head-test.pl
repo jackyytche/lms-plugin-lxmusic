@@ -100,6 +100,9 @@ sub run_detail {
 		push @req, \%a;
 		my %data = (list => [ map { { source => 'mg', songmid => "s$_", name => "歌$_", singer => 'A' } } 1 .. 5 ],
 			limit => 50, total => 111);
+		# 0.11.87（B-6）：真实上游**会回显我们请求的 rn**（实测 kw `rn=20/50/100/1000` 全部回显），
+		# 所以桩也照此回显 —— 这样"首猜页宽 == 响应的 limit ⇒ 不再重取"这条断言才有意义。
+		$data{limit} = $a{info}{rn} if $a{info}{rn};
 		$data{info} = { name => '上游名', author => '上游作者', img => 'https://up.example/c.jpg', count => 999 }
 			if $a{action} eq 'songlistdetail' && !$a{info}{lean};
 		$a{cb}->({ ok => 1, data => \%data, ms => 12 });
@@ -143,6 +146,52 @@ check('kw 不传 lean（只有 mg 走这个接口）', !($req[0]{info}{lean}), $
 @req = ();
 run_detail(src => 'mg', id => '555000222', head => $headB64);   # 同样换 id 避开缓存
 check('对照：同一份头部数据在 mg 上就是 lean=1', ($req[0]{info}{lean} // 0) == 1);
+
+# ---------- 5. kw 详情「按窗取数」（0.11.87，待办 B-6） ----------
+# 实测依据（`tmp/kw_detail_probe.py` 直打上游 + `tmp/kw_detail_ab.py` 设备对照）：
+#   · kw 详情接口 nplserver **认 rn/pn**（rn=50&pn=1 = 第 51-100 首，逐首不同；字节随行数线性）；
+#   · vendored SDK 的 `limit_song = 1000` ⇒ 一次把整单拉回来（205 首 = 621356B）；
+#   · "页宽猜 50、真页宽 1000" ⇒ index>0 时**先白打一次空页**（`pn=3&rn=1000` = 616B/100ms）再重取整单
+#     （现场 idx=150：shim_ms=1334 / 整页 1863ms）。
+# 本段钉死：kw 必须把"这一窗要几行"当 `rn` 传下去、**用它当上游页宽首猜**、并且**只打一次上游**。
+sub kw_req {
+	my (%a) = @_;
+	@req = ();
+	my @feed;
+	Plugins::LxMusic::Plugin::sdkSonglistDetailHandler(
+		undef, sub { push @feed, $_[0] }, { index => $a{index}, quantity => $a{qty} }, undef,
+		$a{src} || 'kw', $a{id}, $a{head});
+	return (\@req, \@feed);
+}
+
+my ($r1) = kw_req(index => 0, qty => 50, id => 'kw0001');
+check('kw window=50 ⇒ 请求带 rn=50（把"要几行"告诉上游）', (($r1->[0]{info}{rn} // 0) == 50),
+	$r1->[0]{info}{rn} // 'undef');
+check('kw window=50 ⇒ page=1', (($r1->[0]{info}{page} // 0) == 1), $r1->[0]{info}{page} // 'undef');
+check('kw：limit 与首猜页宽一致 ⇒ **只打一次上游**', @$r1 == 1, scalar @$r1);
+
+# ⚠️ 这条是修复的核心：index=150、window=50 ⇒ 页宽=rn=50 ⇒ page=4/skip=0，
+# 上游那一页（150-199）正好就是窗口 ⇒ 不该有第二次请求（从前会先打空页再重取整单）。
+my ($r2) = kw_req(index => 150, qty => 50, id => 'kw0002');
+check('kw idx=150 window=50 ⇒ page=4（rn 当页宽）', (($r2->[0]{info}{page} // 0) == 4), $r2->[0]{info}{page} // 'undef');
+check('kw idx=150 ⇒ 仍然**只打一次上游**（消掉了那次空页往返）', @$r2 == 1, scalar @$r2);
+
+# 窗口宽于旧默认 50 时，页宽必须跟着 rn 走（而不是仍按 50 猜出 page=3）
+my ($r3) = kw_req(index => 100, qty => 300, id => 'kw0003');
+check('kw window=300 idx=100 ⇒ rn=300', (($r3->[0]{info}{rn} // 0) == 300), $r3->[0]{info}{rn} // 'undef');
+check('kw window=300 idx=100 ⇒ page=1（页宽=300，不是 50 猜出的 3）',
+	(($r3->[0]{info}{page} // 0) == 1), $r3->[0]{info}{page} // 'undef');
+check('kw window=300 ⇒ 只打一次上游', @$r3 == 1, scalar @$r3);
+
+# window=1 = "点单行"的形态（多数被 _feed_cache_cover 命中）：下界 20 行，别抠到只取 1 行
+my ($r4) = kw_req(index => 7, qty => 1, id => 'kw0004');
+check('kw window=1 ⇒ rn 取**下界 20**（不抠成 1 行）', (($r4->[0]{info}{rn} // 0) == 20), $r4->[0]{info}{rn} // 'undef');
+check('kw window=1 ⇒ page 按 20 行算（idx=7 ⇒ 第 1 页）', (($r4->[0]{info}{page} // 0) == 1), $r4->[0]{info}{page} // 'undef');
+
+# 非 kw 平台必须**完全不受影响**：不带 rn、页宽仍按 50 猜（否则会动到 kg/tx/wy/mg 的既有行为）
+my ($r5) = kw_req(src => 'tx', index => 100, qty => 300, id => 'tx0001');
+check('非 kw（tx）⇒ info 里**没有** rn 键', !exists $r5->[0]{info}{rn}, join(',', sort keys %{ $r5->[0]{info} }));
+check('非 kw（tx）⇒ 页宽仍按 50 猜（idx=100 ⇒ page=3）', (($r5->[0]{info}{page} // 0) == 3), $r5->[0]{info}{page} // 'undef');
 
 print $failed ? "\n$failed FAILED\n" : "\nALL PASS\n";
 exit($failed ? 1 : 0);

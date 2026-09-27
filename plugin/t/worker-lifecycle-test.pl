@@ -230,5 +230,36 @@ sub fake_worker {
 		$src =~ /if \(\$retry && !\$job->\{forked\}\)/, 'forked one-shot guard missing');
 }
 
+# ---------------------------------------------------------------- 段 D：慢源 fork 的每源并发闸（0.11.87，待办 E-1）
+# 背景：`%WORKER_BAD` 让超时过的源改走 fork，而 fork 每请求一个 qjs（i386 上 ~1s 固定成本）；
+# 同一个慢源却能在全局闸（默认 2）里**同时开两个 fork** ⇒ 两个 qjs 抢同一个慢上游、双双更容易超时，
+# 而超时又刷新 `%WORKER_BAD` 的 10 分钟标记 = 该源自我锁定。
+# 行为层要真 fork + 真慢源才能构造，所以这里断言**准入策略（纯函数）** + 两条"接线"源码护栏。
+{
+	my $H = 'Plugins::LxMusic::Helper';
+	check('E-1: 该源没有在飞 ⇒ 放行',   $H->_hostile_admit('s', 0, 0) eq 'run');
+	check('E-1: 没有在飞时，队列再长也放行（in-flight 优先）', $H->_hostile_admit('s', 0, 5) eq 'run');
+	check('E-1: 已有 1 个在飞、队列空 ⇒ 排队', $H->_hostile_admit('s', 1, 0) eq 'queue');
+	check('E-1: 已有 1 个在飞、队列 1 ⇒ 排队', $H->_hostile_admit('s', 1, 1) eq 'queue');
+	check('E-1: 已有 1 个在飞、队列已满(2) ⇒ 拒绝（不再堆积）', $H->_hostile_admit('s', 1, 2) eq 'reject');
+	check('E-1: 缺参不炸（undef 当 0）', $H->_hostile_admit('s', undef, undef) eq 'run');
+
+	my $src = do {
+		local (@ARGV, $/) = (File::Spec->catfile($FindBin::Bin, '..', 'LxMusic', 'Helper.pm'));
+		<>
+	};
+	check('E-1: 每源闸排在全局闸**之前**（否则第二个慢请求会先占掉全局名额）',
+		(index($src, '_hostile_admit') >= 0)
+		&& (index($src, '_hostile_admit') < index($src, 'push @WAITQ, sub')), 'gate order wrong');
+	check('E-1: fork 真正起来时才占名额（不是排队时就占）',
+		$src =~ /\$SRC_INFLIGHT\{\$hostile_src\}\+\+ if \$hostile_src;/, 'inflight acquire missing');
+	check('E-1: _finish 早放名额（job 一结束就还回去）',
+		$src =~ /delete \$SRC_INFLIGHT\{\$hs\} unless \$SRC_INFLIGHT\{\$hs\};/, 'inflight release missing');
+	check('E-1: 放行点在回调**之后**（回调抛异常不能把排队项永久堵死）',
+		(index($src, 'delete $SRC_INFLIGHT{$hs}') < index($src, 'for (my $i = 0; $i < @SRC_WAITQ; )'))
+		&& (index($src, 'eval { $job->{cb}->({') < index($src, 'for (my $i = 0; $i < @SRC_WAITQ; )')),
+		'drain placed before callback');
+}
+
 print $failed ? "\nFAILED: $failed\n" : "\nALL PASS\n";
 exit($failed ? 1 : 0);

@@ -237,7 +237,14 @@ async function main(std, os) {
 	function httpSync(url, options) {
 		let cur = String(url);
 		for (let hop = 0; hop < 3; hop++) { // 对齐 lx 宿主 follow_max:3
-			const r = httpOnce(cur, options);
+			let r = httpOnce(cur, options);
+			// 0.11.87（待办 E-10）：**订阅源侧 5xx 重试一次**（与 SDK 侧同口径）。
+			// 现场：玉宁熙的中转 `171.80.3.149:3037/migu/url/h5v2.4` 对部分 contentId 偶发 500
+			// ⇒ 源脚本一次失败就整个候选失败，而它其实重试一次就成。只重试 5xx，只重试一次。
+			if (r.code >= 500) {
+				print('LOG http 5xx retry: ' + r.code + ' ' + String(cur).slice(0, 80));
+				r = httpOnce(cur, options);
+			}
 			if (r.code >= 300 && r.code < 400 && r.headers['location']) {
 				cur = absUrl(cur, r.headers['location']);
 				continue;
@@ -955,7 +962,15 @@ async function main(std, os) {
 				try {
 					let cur = String(url);
 					for (let hop = 0; hop < 3; hop++) {
-						const r = curlOnce(cur, opts || {}, outBin, outHdr, inBody);
+						let r = curlOnce(cur, opts || {}, outBin, outHdr, inBody);
+						// 0.11.87（待办 E-10）：**SDK 侧 5xx 重试一次**。
+						// 5xx 是"上游自己临时故障"的典型信号，而我们从前是"一次失败就换下一个候选/直接报错"，
+						// 等于把偶发当永久（现场：中转/边缘对部分 id 偶发 500）。
+						// 只重试 5xx：4xx 是"请求本身不对"，重试无意义；成本只有一跳。
+						if (r.statusCode >= 500) {
+							print('LOG binHttp 5xx retry: ' + r.statusCode + ' ' + String(cur).slice(0, 80));
+							r = curlOnce(cur, opts || {}, outBin, outHdr, inBody);
+						}
 						if (r.statusCode >= 300 && r.statusCode < 400 && r.headers['location']) {
 							const loc = r.headers['location'];
 							const origin = (cur.match(/^https?:\/\/[^/]+/i) || ['']);
@@ -1052,6 +1067,60 @@ async function main(std, os) {
 					name: meta.specialname || '', author: meta.nickname || '',
 					img: meta.imgurl ? String(meta.imgurl).replace('{size}', '240') : '',
 					count: total,
+				},
+			};
+		}
+
+		// ---- kw 歌单详情「按窗取数」快路径（0.11.87，待办 B-6）----
+		// 起因（`tmp/kw_detail_probe.py` 与 `tmp/kw_detail_ab.py` 实测）：
+		//   ① vendored `kw/songList.js` 的 `limit_song = 1000` ⇒ 详情**一次把整个歌单拉回来**：
+		//      205 首 = 621356B（设备 idx=150 现场：`pn=0&rn=1000` = 621356B/240ms）。
+		//   ② 插件从前按"上游页宽 50"猜页号，而真页宽 1000 ⇒ index>0 **先白打一次空页**
+		//      （实测 `pn=3&rn=1000` → 616B/100ms）再重取整单 ⇒ `shim_ms=1334`、整页 1863ms。
+		//   ③ 上游**认 rn/pn**：`rn=50&pn=1` 给的是第 51-100 首（逐首不同），字节随行数线性
+		//      （50 首 153KB / 100 首 305KB / 205 首 621KB）⇒ 只要"素要的那一窗"就能 4 倍省。
+		// 这里只接管 **digest-8 / 纯数字** 的曲目页；其余形态（digest-5 走 qukudata 取 info、
+		// digest-13 是专辑、`/bodian/` 走 BD 接口、带 URL 的 id）**一律回落 SDK 原路径**，行为不变。
+		// 解析仍用 SDK 自己的 `filterListDetail`（不重写 MINFO 正则）。
+		async function kwLeanDetail(rawId, page, rn) {
+			const sl = sdk.kw && sdk.kw.songList;
+			if (!sl || !sl.getListDetailUrl || !sl.filterListDetail) throw new Error('lean: kw songList unavailable');
+			let id = String(rawId == null ? '' : rawId);
+			if (/\/bodian\//.test(id)) throw new Error('lean: bodian id -> sdk');
+			if (/[?&:/]/.test(id)) {
+				const m = /^.+\/playlist(?:_detail)?\/(\d+)(?:\?.*|&.*$|#.*$|$)/.exec(id);
+				if (!m) throw new Error('lean: unparsable id url -> sdk');
+				id = m[1];
+			}
+			else if (/^digest-/.test(id)) {
+				const parts = id.split('__');
+				const digest = String(parts[0]).replace('digest-', '');
+				if (digest !== '8') throw new Error('lean: digest ' + digest + ' -> sdk');
+				id = String(parts[1]);
+			}
+			if (!/^\d+$/.test(id)) throw new Error('lean: non-numeric id -> sdk');
+			const rq = Number(rn);
+			const want = (rq >= 1 && rq <= 300) ? Math.floor(rq) : 100;
+			// ⚠️ 必须与 SDK 的 `getListDetailUrl` **逐字同形**（`encode=utf8` + `vipver`/`newver`）：
+			//    实测少了 `vipver/newver` 上游会回 `total` 但 `musiclist` 为空 —— 典型的"静默空列表"陷阱。
+			const url = 'http://nplserver.kuwo.cn/pl.svc?op=getlistinfo&pid=' + id
+				+ '&pn=' + (page - 1) + '&rn=' + want
+				+ '&encode=utf8&keyset=pl2012&identity=kuwo&pcmp4=1&vipver=MUSIC_9.0.5.0_W1&newver=1';
+			const r = await globalThis.__lxBinHttp.fetch(url, { timeout: 15000 });
+			if (r.statusCode !== 200) throw new Error('lean http ' + r.statusCode);
+			const body = JSON.parse(utf8Decode(r.bytes));
+			if (!body || body.result !== 'ok' || !Array.isArray(body.musiclist)) throw new Error('lean: bad body');
+			const total = Number(body.total) || 0;
+			return {
+				list: sl.filterListDetail(body.musiclist),
+				page,
+				limit: Number(body.rn) || want,
+				total,
+				source: 'kw',
+				info: {
+					name: body.title || '', img: body.pic || '', desc: body.info || '',
+					author: body.uname || '', count: total,
+					play_count: (typeof sl.formatPlayCount === 'function') ? sl.formatPlayCount(body.playnum) : '',
 				},
 			};
 		}
@@ -1161,6 +1230,16 @@ async function main(std, os) {
 					}
 					catch (e) {
 						print('LOG mg lean failed, fallback to sdk: ' + String((e && e.message) || e));
+					}
+				}
+				// kw 按窗取数（0.11.87，待办 B-6）：调用方给 `rn`（= 这一窗要几行）⇒ 只取那么宽的页。
+				// 不给 `rn`（整单展开/m3u/网页详情等"要全量"的入口）⇒ **回落 SDK 原路径**（行为不变）。
+				if (src === 'kw' && Number(payload.rn) > 0) {
+					try {
+						return await kwLeanDetail(id, page, payload.rn);
+					}
+					catch (e) {
+						print('LOG kw lean failed, fallback to sdk: ' + String((e && e.message) || e));
 					}
 				}
 				return await sl.getListDetail(id, page);
