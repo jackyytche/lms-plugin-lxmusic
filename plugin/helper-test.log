@@ -67,10 +67,10 @@ LOG-WARN: LxMusic resolve: try [srcA] type=flac
 LOG-WARN: LxMusic resolve: try [srcA] type=flac
 LOG-WARN: LxMusic resolve: try [srcB] type=flac
 LOG-WARN: LxMusic caps: [A.js] declares kw(128k/flac), wy(flac)
-LOG-WARN: LxMusic state: loaded 1 caps, 2 scored pairs from /tmp/AuY9QAFEbH/state.json
+LOG-WARN: LxMusic state: loaded 1 caps, 2 scored pairs from /tmp/1A9NQSxLfo/state.json
 LOG-WARN: LxMusic resolve: try [srcB] type=flac
 LOG-WARN: LxMusic resolve: try [srcA] type=flac
-LOG-WARN: LxMusic state: /tmp/AuY9QAFEbH/state.json 解析失败，忽略（unexpected end of string while parsing JSON string, at character offset 3 (before "his is not json") at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/JSON/XS.pm line 49.
+LOG-WARN: LxMusic state: /tmp/1A9NQSxLfo/state.json 解析失败，忽略（unexpected end of string while parsing JSON string, at character offset 3 (before "his is not json") at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/JSON/XS.pm line 49.
 ）
 LOG-WARN: LxMusic resolve: try [srcA] type=flac
 LOG-WARN: LxMusic resolve: try [srcB] type=flac
