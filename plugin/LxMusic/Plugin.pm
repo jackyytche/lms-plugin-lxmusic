@@ -1803,6 +1803,27 @@ sub sdkSonglistDetailHandler {
 				]),
 			};
 			_feed_cache_put($ckey, $feed, $window);
+			# 0.11.89（B-7）：**上游一次就把整单给了我们** ⇒ 顺手把**下一个窗口**本地切好。
+			# 实测（`tmp/pl_board_pagewidth_probe.py`，走 shim-sim 真打上游）：
+			#   tx 详情 p1 = 66 行 / **limit=100000** / p2 **与 p1 完全相同**（`getListDetail2` 的
+			#   `song_begin` 硬编码 0，根本不认 page）；wy limit=1000、kg limit=100 也是"一次给整单"。
+			# 后果：插件按 50 猜页宽与真页宽不符 ⇒ 用户点"下一页"时**重取一遍整单**
+			#   （tx 实测 131220B/545ms ×2）。这里把下一窗**纯本地切片**备好（0 上游流量），
+			#   于是下一页直接命中 feed 缓存。只对"limit ≥ total"（= 已经拿到全部）生效；
+			#   mg 是真翻页（limit=50 < total）、kw 现在按窗取数（limit=rn < total）⇒ 都不受影响。
+			if (defined $res->{data}{limit} && ($total || 0) > 0
+				&& $res->{data}{limit} >= $total && $total > ($index + $window))
+			{
+				my $nidx  = $index + $window;
+				my $nskip = ($upw && $upw > 0) ? ($nidx % $upw) : 0;
+				my @nlist = @$all;
+				@nlist = @nlist[ $nskip .. $#nlist ] if $nskip && @nlist > $nskip;
+				@nlist = @nlist[ 0 .. $window - 1 ] if @nlist > $window;
+				my $nfeed = { %$feed, items => _trackItems(\@nlist, undef, undef, $nidx), offset => $nidx };
+				_feed_cache_put(join('|', 'pd', $src, $plid, $nidx), $nfeed, $window);
+				$log->warn(sprintf('LxMusic pl-detail PRE-NEXT src=%s id=%s idx=%d -> %d rows=%d (upstream gave whole list)',
+					$src, $plid, $index, $nidx, scalar(@nlist)));
+			}
 			$log->warn(sprintf('LxMusic pl-detail MISS src=%s id=%s idx=%d win=%d upw=%d tracks=%d total=%d lean=%d shim_ms=%s ms=%d',
 				$src, $plid, $index, $window, $upw, scalar(@$tracks), int($total), $lean,
 				(defined $res->{ms} ? $res->{ms} : '?'), int((time() - $t0) * 1000)));

@@ -116,5 +116,59 @@ sub check {
 	check('installSource rejects junk',    !defined Plugins::LxMusic::Helper->installSource('junk.js', 'var x=1;'));
 }
 
+# ---------------------------------------------------------------- 直链判据：厂商加密容器 + 无魔数收紧（0.11.89）
+# 现场（第二十三轮，用户报"kw 榜单高码率经常无声"）：`酷我音乐·手机版` 给无损曲目的是
+# `.mgg`/`.mflac`（厂商加密容器，前 4 字节不是任何音频魔数、CT=application/octet-stream），
+# 旧判据"没有魔数时退回 Content-Type 白名单"把 octet-stream 也算通过 ⇒ 打散字节被当可播交付 ⇒ 位置恒 0。
+{
+	my $H = 'Plugins::LxMusic::Helper';
+	check('enc: .mflac 判为加密容器', $H->streamEncrypted('http://a/b/Q0M1.mflac?bitrate$4000') ? 1 : 0);
+	check('enc: .mgg 判为加密容器',   $H->streamEncrypted('http://a/b/q.mgg') ? 1 : 0);
+	check('enc: 明文 .flac 不算',      $H->streamEncrypted('https://a/b/F0000.flac') ? 0 : 1);
+	check('enc: 无后缀不算',           $H->streamEncrypted('http://a/b/trackmedia/ABC') ? 0 : 1);
+
+	# probeUrl 判据（把 request 换成喂假嗅探结果的桩；本节在文件末尾，不影响上面各节）
+	my @feed;
+	{
+		no warnings 'redefine';
+		no strict 'refs';
+		*Plugins::LxMusic::Helper::request = sub {
+			my ($class, %a) = @_;
+			my $d = shift @feed;
+			$a{cb}->({ ok => 1, data => $d });
+			return 1;
+		};
+	}
+	my $probe = sub {
+		my ($url, %d) = @_;
+		@feed = ( \%d );
+		my $got;
+		Plugins::LxMusic::Helper->probeUrl($url, sub { $got = shift });
+		return $got;
+	};
+
+	my $r = $probe->('http://a/b/x.flac', status => 206, magic => 'flac', type => 'audio/x-flac');
+	check('probe: 认到魔数 ⇒ 通过', $r && $r->{ok} ? 1 : 0, ($r && $r->{error}) // '');
+
+	$r = $probe->('http://a/b/x.mflac', status => 206, magic => '', type => 'application/octet-stream', bytes => 2048);
+	check('probe: 加密容器 ⇒ 拒绝（哪怕 206）', ($r && !$r->{ok} && $r->{encrypted}) ? 1 : 0,
+		($r && $r->{error}) // '');
+	check('probe: 加密容器的错误里点明原因', ($r && ($r->{error} // '') =~ /vendor-encrypted/) ? 1 : 0,
+		($r && $r->{error}) // '');
+
+	$r = $probe->('http://a/b/relay', status => 206, magic => '', type => 'application/octet-stream', bytes => 2048);
+	check('probe: 无魔数 + octet-stream ⇒ 拒绝（0.11.89 收紧）', ($r && !$r->{ok} && $r->{weak}) ? 1 : 0,
+		($r && $r->{error}) // '');
+
+	$r = $probe->('http://a/b/relay', status => 206, magic => '', type => '');
+	check('probe: 无魔数 + 无 CT ⇒ 拒绝', ($r && !$r->{ok}) ? 1 : 0, ($r && $r->{error}) // '');
+
+	$r = $probe->('http://a/b/relay', status => 206, magic => '', type => 'audio/mpeg');
+	check('probe: 无魔数但 CT=audio/* ⇒ 放行（留活口）', ($r && $r->{ok}) ? 1 : 0, ($r && $r->{error}) // '');
+
+	$r = $probe->('http://a/b/y.mp3', status => 500, magic => 'id3', type => 'audio/mpeg');
+	check('probe: 5xx ⇒ 拒绝（魔数也不能救）', ($r && !$r->{ok}) ? 1 : 0, ($r && $r->{error}) // '');
+}
+
 print $failed ? "\nFAILED: $failed\n" : "\nALL PASS\n";
 exit($failed ? 1 : 0);

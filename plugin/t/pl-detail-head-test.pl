@@ -103,6 +103,9 @@ sub run_detail {
 		# 0.11.87（B-6）：真实上游**会回显我们请求的 rn**（实测 kw `rn=20/50/100/1000` 全部回显），
 		# 所以桩也照此回显 —— 这样"首猜页宽 == 响应的 limit ⇒ 不再重取"这条断言才有意义。
 		$data{limit} = $a{info}{rn} if $a{info}{rn};
+		# 0.11.89（B-7）：tx 这类平台**一次就把整单给我们**（实测 limit=100000、p2 与 p1 完全相同）
+		$data{limit} = 100000 if ($a{info}{source} // '') eq 'tx';
+		$data{total} = 66     if ($a{info}{source} // '') eq 'tx';
 		$data{info} = { name => '上游名', author => '上游作者', img => 'https://up.example/c.jpg', count => 999 }
 			if $a{action} eq 'songlistdetail' && !$a{info}{lean};
 		$a{cb}->({ ok => 1, data => \%data, ms => 12 });
@@ -192,6 +195,30 @@ check('kw window=1 ⇒ page 按 20 行算（idx=7 ⇒ 第 1 页）', (($r4->[0]{
 my ($r5) = kw_req(src => 'tx', index => 100, qty => 300, id => 'tx0001');
 check('非 kw（tx）⇒ info 里**没有** rn 键', !exists $r5->[0]{info}{rn}, join(',', sort keys %{ $r5->[0]{info} }));
 check('非 kw（tx）⇒ 页宽仍按 50 猜（idx=100 ⇒ page=3）', (($r5->[0]{info}{page} // 0) == 3), $r5->[0]{info}{page} // 'undef');
+
+# ---------- 6. 上游"一次给整单"时，顺手本地预切下一窗（0.11.89，待办 B-7） ----------
+# 实测（`tmp/pl_board_pagewidth_probe.py`）：tx 详情 limit=100000 且**第 2 页与第 1 页完全相同**
+# （SDK 的 `song_begin` 硬编码 0）⇒ 插件从前点"下一页"会把整单**再取一遍**（131KB/545ms ×2）。
+# 这里钉死：limit ≥ total 时，同一个 handler 的下一个窗口必须是**缓存命中**（0 次新请求）。
+{
+	@req = ();
+	my ($rr, $ff) = kw_req(src => 'tx', index => 0, qty => 50, id => 'tx9001');
+	check('pre-next: 第一窗仍打一次上游', @$rr == 1, scalar @$rr);
+	check('pre-next: 第一窗有条目（桩 5 行 + 哨兵行）',
+		ref($ff->[0]{items}) eq 'ARRAY' && @{ $ff->[0]{items} } >= 5, scalar @{ $ff->[0]{items} || [] });
+
+	my ($rr2, $ff2) = kw_req(src => 'tx', index => 50, qty => 50, id => 'tx9001');
+	check('pre-next: 第二窗**零新增上游请求**（本地预切命中）', @$rr2 == 0, scalar @$rr2);
+	check('pre-next: 第二窗仍产出条目（不是空页）',
+		ref($ff2->[0]{items}) eq 'ARRAY' && @{ $ff2->[0]{items} } >= 5, scalar @{ $ff2->[0]{items} || [] });
+	check('pre-next: 第二窗的 offset 是 50', ($ff2->[0]{offset} // -1) == 50, $ff2->[0]{offset} // 'undef');
+
+	# 对照：mg 是**真翻页**（limit=50 < total）⇒ 第二窗必须照旧打上游（不许被"预切"偷掉）
+	my ($r3) = kw_req(src => 'mg', index => 0,  qty => 50, id => 'mg9002');
+	check('pre-next: 对照 mg 第一窗打上游', @$r3 == 1, scalar @$r3);
+	my ($r4) = kw_req(src => 'mg', index => 50, qty => 50, id => 'mg9002');
+	check('pre-next: 真翻页平台（mg，limit<total）第二窗仍打上游', @$r4 == 1, scalar @$r4);
+}
 
 print $failed ? "\n$failed FAILED\n" : "\nALL PASS\n";
 exit($failed ? 1 : 0);

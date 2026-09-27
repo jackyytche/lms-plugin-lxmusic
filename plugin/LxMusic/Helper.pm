@@ -284,6 +284,28 @@ sub coverThumb {
 	}
 	return $url;
 }
+# 0.11.89：**厂商加密容器**（第二十三轮现场，用户报"kw 榜单高码率经常无声"的真根因）。
+#   现场证据（两条都**裸播、绕过插件**，同一首歌的两种链）：
+#     · `酷我音乐·手机版` 给的是 `…/trackmedia/Q0M…`.mflac / `.mgg` —— 前 4 字节**不是任何音频魔数**
+#       （实测 `\x08*,\x0b` / `\x15yYr`）、`Content-Type: application/octet-stream`
+#       ⇒ LMS 判不出格式：`mode=stop`、位置恒 0、行上显示 `APPLICATION/OCTET-STREAM`（**彻底无声**）。
+#     · `念心音源` 给同一首的是 `…/trackmedia/F0000….flac`（明文）⇒ 位置 1.15→21.3s 正常、`FLC 24bit/48k`。
+#   为什么会误判：旧判据"没有魔数时退回 Content-Type 白名单"把 **octet-stream** 也算通过 ⇒
+#   打散的字节被当可播交付。这类文件只有厂商 App 能解，我们**没有解密密钥** ⇒ 必须直接拒绝，
+#   让阶梯换源（念心给明文）或降档——**有损也比无声强**。
+my %ENC_EXT = map { $_ => 1 } qw(
+	mgg mgg1 mflac mflac0 mflac1 mflac2 mmp4
+	qmc0 qmc2 qmc3 qmcflac qmcogg qmcv1 qmcv2
+);
+
+# 该直链是否是"厂商加密容器"（按后缀判；查不到后缀就返回 0）
+sub streamEncrypted {
+	my ($class, $url) = @_;
+	return 0 unless defined $url && length $url;
+	my ($ext) = $url =~ m{\.([A-Za-z0-9]{2,7})(?:[?#]|$)};
+	return ($ext && $ENC_EXT{ lc $ext }) ? 1 : 0;
+}
+
 # 直链可播性探测（走 shim 的 probe：curl -I，不允许 HEAD 时退 Range 0-0）
 sub probeUrl {
 	my ($class, $url, $cb, $prio) = @_;
@@ -298,10 +320,15 @@ sub probeUrl {
 			my $code = $d->{status} || 0;
 			my $type = lc($d->{type} // '');
 			my $magic = $d->{magic} // '';
+			# 0.11.89：加密容器先判死（见 `streamEncrypted` 的现场证据）。
+			my $enc = $class->streamEncrypted($url);
 			# 判定以 shim 的实体嗅探为主（魔数认得就放行）；没有魔数时退回 Content-Type 白名单，
 			# 但 text/*（HTML 错误页）一律拒绝 —— 这类"HEAD 200 但 GET 是空壳"的直链会静默无声。
-			my $ok = $res->{ok} && $code >= 200 && $code < 300
-				&& ($magic ne '' || $type eq '' || $type =~ m{^(?:audio/|video/|application/(?:octet-stream|x-))});
+			# ⚠️ 0.11.89 收紧：**没有魔数时只认 `audio/*` / `video/*`** ——
+			# `application/octet-stream`（以及完全没有 CT）不再算通过：kw 的 `.mflac`/`.mgg`
+			# 正是"octet-stream + 无魔数"，旧白名单把它放进来了（用户听到的就是"位置在走但没声"或彻底无声）。
+			my $ok = !$enc && $res->{ok} && $code >= 200 && $code < 300
+				&& ($magic ne '' ? 1 : ($type =~ m{^(?:audio/|video/)} ? 1 : 0));
 			$cb->({
 				ok     => $ok ? 1 : 0,
 				status => $code,
@@ -310,6 +337,8 @@ sub probeUrl {
 				method => $d->{method},
 				magic  => $magic,
 				bytes  => $d->{bytes},
+				encrypted => $enc,
+				weak   => ($magic eq '' && !$enc) ? 1 : 0,
 				# 0.11.52：FLAC 位深（探测时从 STREAMINFO 读出来的）——用于"真实档位"标签
 				bits   => ($d->{bits} || 0),
 				# 0.11.84（A0）：同一次嗅探里的采样率/声道数 —— 发布给 LMS 的 remoteMeta，
@@ -320,7 +349,9 @@ sub probeUrl {
 				# 免得把一条会 302 的聚合中转链交给 LMS 的开流路径（现场会挂死，见 shim 注释）。
 				effective => ($d->{url_effective} && $d->{url_effective} ne $url)
 					? $d->{url_effective} : '',
-				error  => $ok ? undef : (($res->{error} // ($code ? "HTTP $code" : 'no response'))
+				error  => $ok ? undef : (($enc
+					? 'vendor-encrypted container (needs the vendor app; no key here)'
+					: ($res->{error} // ($code ? "HTTP $code" : 'no response')))
 					. ($type ne '' ? " type=$type" : '')
 					. ($magic ne '' ? " magic=$magic" : '')
 					. (defined $d->{bytes} ? " bytes=$d->{bytes}" : '')),
@@ -812,6 +843,18 @@ sub resolveTrack {
 						push @tries, { source => $src->{name}, quality => $q, why => $why, %tm };
 						_src_failed(_src_key($src, $plat, $q), ($src->{name} // '?') . "\@$q");   # 0.11.57 熔断计数
 						_score_note(_score_key($src, $plat), 0, $tm{ms});   # 0.11.63 排序用
+						return $settle->();
+					}
+					# 0.11.89：**厂商加密容器当场判死**（第二十三轮：用户报的"kw 榜单高码率经常无声"）。
+					# 放在这里而不是只放 probeUrl 里，是为了 `verifyUrl=0`（关校验）时也拦得住。
+					# 计入熔断与评分：这个源在这个平台这个档位上就是给不了能播的链，别反复撞。
+					if ($class->streamEncrypted($url)) {
+						push @tries, { source => $src->{name}, quality => $q,
+							why => 'vendor-encrypted container (unplayable)', %tm };
+						$log->warn('LxMusic resolve: [' . ($src->{name} // '?') . "] $q 直链是厂商加密容器，拒绝："
+							. substr($url, 0, 90));
+						_src_failed(_src_key($src, $plat, $q), ($src->{name} // '?') . "\@$q");
+						_score_note(_score_key($src, $plat), 0, $tm{ms});
 						return $settle->();
 					}
 					my $friendly = $class->streamFriendly($url) ? 1 : 0;

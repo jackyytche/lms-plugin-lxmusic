@@ -401,5 +401,26 @@ sub new_run_budget {
 	delete $ENV{LX_STATE_FILE};
 }
 
+# ---------- N. 厂商加密容器：不交付，换到能播的（0.11.89，用户报的"kw 榜单无损经常无声"） ----------
+# 现场（裸播对照，绕过插件）：`.mflac`（酷我手机版）→ mode=stop/位置 0；同曲明文 `.flac`（念心）→ 正常。
+{
+	my $H = 'Plugins::LxMusic::Helper';
+	check('enc: streamEncrypted 认 .mgg / .mflac',
+		$H->streamEncrypted('http://a/b.mgg') == 1 && $H->streamEncrypted('http://a/b/Q0M1.mflac?bitrate$4') == 1);
+	check('enc: 明文 .flac 与无后缀都不算加密',
+		$H->streamEncrypted('http://a/b/c.flac') == 0 && $H->streamEncrypted('http://a/b/trackmedia/ABC') == 0
+		&& $H->streamEncrypted(undef) == 0);
+
+	my $got = new_run();
+	$cb{A}->({ ok => 1, data => 'http://cdn.example/Q0M1.mflac?bitrate$4000', why => 'worker' });
+	check('enc: 加密容器候选不被交付（等其它候选）', @$got == 0, scalar @$got);
+	$cb{B}->({ ok => 1, data => 'http://cdn.example/plain.flac', why => 'worker' });
+	check('enc: 换到明文 .flac 才交付',
+		@$got == 1 && $got->[0]{ok} && ($got->[0]{url} // '') =~ /plain\.flac$/,
+		@$got ? ($got->[0]{url} // $got->[0]{error}) : 'none');
+	my @enc = grep { ($_->{why} // '') =~ /vendor-encrypted/ } @{ ($got->[0]{tries} || []) };
+	check('enc: tries 里留了"厂商加密容器"的拒绝原因', @enc == 1, scalar @enc);
+}
+
 print $failed ? "\n$failed FAILED\n" : "\nALL PASS\n";
 exit($failed ? 1 : 0);
