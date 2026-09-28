@@ -67,10 +67,10 @@ LOG-WARN: LxMusic resolve: try [srcA] type=flac
 LOG-WARN: LxMusic resolve: try [srcA] type=flac
 LOG-WARN: LxMusic resolve: try [srcB] type=flac
 LOG-WARN: LxMusic caps: [A.js] declares kw(128k/flac), wy(flac)
-LOG-WARN: LxMusic state: loaded 1 caps, 2 scored pairs from /tmp/GWEc3cyD1Z/state.json
+LOG-WARN: LxMusic state: loaded 1 caps, 2 scored pairs from /tmp/51boPwAK1h/state.json
 LOG-WARN: LxMusic resolve: try [srcB] type=flac
 LOG-WARN: LxMusic resolve: try [srcA] type=flac
-LOG-WARN: LxMusic state: /tmp/GWEc3cyD1Z/state.json 解析失败，忽略（unexpected end of string while parsing JSON string, at character offset 3 (before "his is not json") at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/JSON/XS.pm line 49.
+LOG-WARN: LxMusic state: /tmp/51boPwAK1h/state.json 解析失败，忽略（unexpected end of string while parsing JSON string, at character offset 3 (before "his is not json") at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/JSON/XS.pm line 49.
 ）
 LOG-WARN: LxMusic resolve: try [srcA] type=flac
 LOG-WARN: LxMusic resolve: try [srcB] type=flac
@@ -250,6 +250,19 @@ ok - total 虚高：不重复追加（仍是 100 行）
 ok - total 虚高：第二页发现全重复后收手（共 2 次）
 ok - retune 后仍出满 100 行（去重表已随 acc 一起清空）
 ok - retune 后不是"获取失败"提示行
+ok - [0.11.96] TOP500 形态：窗口 2500 必须出满 500 行（不再被夹到 300）
+ok - [0.11.96] TOP500 形态：500 行两两不同（不是重复追加）
+ok - [0.11.96] TOP500 形态：正好问上游 5 页（100/页 ×5 = 500）
+ok - [0.11.96] TOP500 形态：页码依次 1..5
+ok - [0.11.96] TOP500 形态：feed 的 total 仍是上游值 500
+ok - [0.11.96] TOP500 形态：末行编号 500（绝对序号跨页连续）
+ok - [0.11.96] 有界：上游 5000 首时最多出 1000 行
+ok - [0.11.96] 有界：正好 10 页，不多白打第 11 页
+ok - [0.11.96] retune 路：页宽 50 时也要出满 1000 行（页数上限已同步放宽）
+ok - [0.11.96] 护栏：handler 窗口夹取为 1000（不再是 300）
+ok - [0.11.96] 护栏：handler 页数上限为 24（不再是 8）
+ok - [0.11.96] 护栏：explodePlaylist 的 $CAP = 1000（与 handler 同口径）
+ok - [0.11.96] 护栏：explodePlaylist 的 $MAXPAGE 已放到 24
 
 ALL OK
 Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 1213.
@@ -401,8 +414,8 @@ Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plu
 	(Maybe you meant system() when you said exec()?)
 Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 1337.
 	(Maybe you meant system() when you said exec()?)
-Name "Slim::Player::Client::CLIENTS" used only once: possible typo at t/meta-persist-test.pl line 450.
 Name "Slim::Player::Playlist::PLAYLIST" used only once: possible typo at t/meta-persist-test.pl line 455.
+Name "Slim::Player::Client::CLIENTS" used only once: possible typo at t/meta-persist-test.pl line 450.
 ok - 空缓存 force 保存不写文件（没脏数据就不该落盘）
 ok - 有脏数据时 force 保存返回真
 ok - 落盘文件存在
