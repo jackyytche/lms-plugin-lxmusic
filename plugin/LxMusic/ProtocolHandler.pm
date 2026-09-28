@@ -1093,7 +1093,7 @@ sub new {
 }
 
 # 整榜/整歌单/单曲三语义（0.11.1 榜单页头引入 lxm://b/；0.11.13 加 lxm://l/ 给歌单）：
-#   lxm://b/<src>/<bangid> -> 展开为全榜 lxm:// 曲目 URL（上限 100，防超榜拖慢入队）
+#   lxm://b/<src>/<bangid> -> 展开为全榜 lxm:// 曲目 URL（上限见下方 $CAP，防超榜拖慢入队）
 #   lxm://l/<src>/<plid>   -> 展开为整个歌单的 lxm:// 曲目 URL（同上限）
 # 喜马拉雅 xmly://album/<id> 同款机制：LMS 对带 explodePlaylist 的协议做
 # playlist play/add 时，先向协议要全量 URL 列表再 playtracks/addtracks
@@ -1111,8 +1111,15 @@ sub explodePlaylist {
 		# page1/2/3 首行各不相同）⇒ 从前只取第一页，整榜被截成 1/3。
 		# tx 则相反：上游 total=100、翻 3 页都是同一批 ⇒ 分页循环自然停在 1 页，不会多打请求。
 		# 上限沿用既有的 300（与歌单详情窗口/m3u 一致），最多 4 页，且**页失败即用已有的收尾**。
-		my $CAP = 300;
-		my $MAXPAGE = 4;
+		# 0.11.96：**300 → 1000**（与 `Plugin::sdkBoardTracksHandler` 的 fan-out 上限同口径，
+		# 两条路的截断点必须成组放开 —— 见 §5.11.127）。
+		# 现场（用户 2026-09-27）：kg TOP500（上游 total=500）点页头「播放全部」只进 300 行。
+		# 实测两条路都给 300 且 **unique songmid=300、multiplier=1.0** ⇒ 不是 0.11.83 的重复 bug，
+		# 是真截断（feed 那条撞 Plugin.pm 的 300，这条撞这里的 $CAP=300）。
+		# ⚠️ 注意 $MAXPAGE 也要跟着放：旧值 4 在页宽 100 时只有 400 行，本就在 $CAP=300 之下、
+		# 靠 $CAP 才是 300；若只放开 $CAP 而不动 $MAXPAGE，这里会变成 400 行的新截断点。
+		my $CAP = 1000;
+		my $MAXPAGE = 24;
 		my (@list, $page, $seen, $done);
 		my $finished = 0;      # ⚠️ 不能用 `$done->{ran}`：$done 是 CODE ref，当 hashref 用会直接抛
 		                       # "Not a HASH reference"（0.11.67 第一版现场：整榜入队 0 行、静默失败）

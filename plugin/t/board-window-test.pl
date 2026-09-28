@@ -50,6 +50,7 @@ my $P = Slim::Utils::Prefs::preferences('plugin.lxmusic');
 $P->set(boardsMg => 1);
 $P->set(boardsKw => 1);
 $P->set(boardsTx => 1);
+$P->set(boardsKg => 1);   # 0.11.96：TOP500 那组用例走 kg
 
 my $failed = 0;
 sub check {
@@ -224,6 +225,98 @@ sub mids_of  { return map { $_->{url} } items_of(shift) }
 	check('retune 后仍出满 100 行（去重表已随 acc 一起清空）', scalar(@it) == 100, scalar(@it));
 	check('retune 后不是"获取失败"提示行', !(@it && ($it[0]{type} // '') eq 'text'),
 		@it ? ($it[0]{type} // '?') : '-');
+}
+
+# ---------- 9. 0.11.96：窗口上限 300 → 1000（修「TOP500 播放全部只进 300 首」）----------
+# 现场（用户 2026-09-27）：入口「kg榜单 > TOP500」列表显示 10 页 500 首，
+# 点页头「播放全部」后队列**只有 6 页 300 首**。设备实测（tmp/board_playall_play_mode_probe.py
+# kg 8888 --ui 3.0）两条路都给 **300 行、unique songmid=300、multiplier=1.0**
+# ⇒ 不是 0.11.83 那种"重复追加"，是**真被夹断**（页头按钮的 quantity 由 LMS 给，
+# 设备实测 maxPlaylistLength=2500，被 handler 顶部的 clamp 夹成 300）。
+# 这一组就是那个 bug 的**反例钉**：窗口给得比 300 大时必须真的取满。
+{
+	my $feed = run_board(
+		upstream => make_upstream(src => 'kg', total => 500, perpage => 100, prefix => 'kg'),
+		quantity => 2500, src => 'kg');        # 设备实测 LMS 在 playall 时传的就是这个量级
+	my @it = items_of($feed);
+	my %u;
+	$u{ $_->{url} // '' }++ for @it;
+	check('[0.11.96] TOP500 形态：窗口 2500 必须出满 500 行（不再被夹到 300）',
+		scalar(@it) == 500, scalar(@it));
+	check('[0.11.96] TOP500 形态：500 行两两不同（不是重复追加）',
+		scalar(keys %u) == 500, scalar(keys %u));
+	check('[0.11.96] TOP500 形态：正好问上游 5 页（100/页 ×5 = 500）',
+		scalar(@CALLS) == 5, scalar(@CALLS));
+	check('[0.11.96] TOP500 形态：页码依次 1..5',
+		join(',', map { $_->{page} } @CALLS) eq '1,2,3,4,5',
+		join(',', map { $_->{page} } @CALLS));
+	check('[0.11.96] TOP500 形态：feed 的 total 仍是上游值 500',
+		($feed->{total} || 0) == 500, $feed->{total} // '?');
+	check('[0.11.96] TOP500 形态：末行编号 500（绝对序号跨页连续）',
+		index($it[-1]{name} // '', '500') >= 0, $it[-1]{name} // '?');
+}
+
+# ---------- 10. 新上限仍**有界**：上游远超 1000 时不许无限扇出，且不多打一次 ----------
+#    多打的那一次是"取到 1000 后 FOR 循环还会再问一页"的经典 off-by-one。
+{
+	my $feed = run_board(
+		upstream => make_upstream(src => 'kg', total => 5000, perpage => 100, prefix => 'kg'),
+		quantity => 2500, src => 'kg');
+	my @it = items_of($feed);
+	check('[0.11.96] 有界：上游 5000 首时最多出 1000 行', scalar(@it) == 1000, scalar(@it));
+	check('[0.11.96] 有界：正好 10 页，不多白打第 11 页',
+		scalar(@CALLS) == 10, scalar(@CALLS));
+}
+
+# ---------- 11. 页宽重算那条路的页数上限也要放宽（否则 1000 会被 8 页夹成 800）----------
+#    kg 默认页宽是 100；让上游报 limit=50 ⇒ 触发 retune，且 50 是既非 100 也非默认的值。
+#    期望：仍然出满 1000 行（不是 8 页 ×50 = 400）。
+{
+	my %row_of;
+	my $dynamic = sub {
+		my ($action, $info) = @_;
+		my $page = $info->{page} || 1;
+		my $per  = 50;
+		my $start = ($page - 1) * $per;
+		my $n = 5000 - $start;
+		$n = $per if $n > $per;
+		$n = 0 if $n < 0;
+		my @list = map {
+			{ songmid => sprintf('kg-%d', $start + $_), name => 'n' . ($start + $_),
+			  singer => 'S', source => 'kg', interval => '03:30' }
+		} (0 .. ($n > 0 ? $n - 1 : -1));
+		return { ok => 1, data => { list => \@list, total => 5000, limit => $per,
+			info => { name => '榜单', img => '' } } };
+	};
+	@CALLS = ();
+	$UPSTREAM = $dynamic;
+	my $feed;
+	Plugins::LxMusic::Plugin::sdkBoardTracksHandler(
+		undef, sub { $feed = $_[0] }, { quantity => 2500, index => 0 }, 'tracks', 'kg', '8888', '');
+	my @it = items_of($feed);
+	check('[0.11.96] retune 路：页宽 50 时也要出满 1000 行（页数上限已同步放宽）',
+		scalar(@it) == 1000, scalar(@it));
+}
+
+# ---------- 12. 源码级护栏：两条路的截断点必须**成组**放开 ----------
+#    （本项目既有惯例：行为层不好构造的用源码级断言钉住写法）
+{
+	my $root = File::Spec->rel2abs(File::Spec->catdir($FindBin::Bin, '..'));
+	my $plug = do { local (@ARGV, $/) = (File::Spec->catfile($root, 'LxMusic', 'Plugin.pm')); <> };
+	my $ph   = do { local (@ARGV, $/) = (File::Spec->catfile($root, 'LxMusic', 'ProtocolHandler.pm')); <> };
+	check('[0.11.96] 护栏：handler 窗口夹取为 1000（不再是 300）',
+		defined $plug && $plug =~ /\$window\s*=\s*1000\s+if\s+\$window\s*>\s*1000/,
+		'找不到 $window = 1000 if $window > 1000');
+	check('[0.11.96] 护栏：handler 页数上限为 24（不再是 8）',
+		defined $plug && $plug !~ /\$max_pages\s*=\s*8\s+if\s+\$max_pages\s*>\s*8/
+			&& $plug =~ /\$max_pages\s*=\s*24\s+if\s+\$max_pages\s*>\s*24/,
+		'页数上限没跟着放开');
+	check('[0.11.96] 护栏：explodePlaylist 的 $CAP = 1000（与 handler 同口径）',
+		defined $ph && $ph =~ /my\s+\$CAP\s*=\s*1000;/,
+		'explodePlaylist 的 CAP 没放开');
+	check('[0.11.96] 护栏：explodePlaylist 的 $MAXPAGE 已放到 24',
+		defined $ph && $ph =~ /my\s+\$MAXPAGE\s*=\s*24;/,
+		'explodePlaylist 的 MAXPAGE 没放开（页宽 100 时会是 400 行的新截断点）');
 }
 
 print "\n" . ($failed ? "FAILED ($failed)\n" : "ALL OK\n");

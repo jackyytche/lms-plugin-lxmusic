@@ -425,7 +425,22 @@ sub sdkBoardTracksHandler {
 
 	my $window = $args->{quantity} || 50;
 	$window = 1   if $window < 1;
-	$window = 300 if $window > 300;     # fan-out 上限（300 首 = 至多 6 个上游页）
+	# 0.11.96：fan-out 上限 300 → **1000**。
+	# 现场（用户 2026-09-27）：入口「kg榜单 > TOP500」= 上游 total **500**（10 页），
+	# 点页头「播放全部」后队列**只有 6 页 300 首**。实测证据（tmp/board_playall_play_mode_probe.py）
+	# 两条路径**都**给 300 行、且 unique songmid=300、multiplier=1.0（⇒ 不是 0.11.83 的重复 bug，
+	# 是**真被截断**）：
+	#   · 页头按钮（枚举本 feed）：LMS 传的 quantity = `maxPlaylistLength`（设备实测 **2500**），
+	#     被这里的 300 夹掉 ⇒ 只攒够 3 个上游页就停（kg 页宽 100）；
+	#   · `lxm://b/kg/8888`（explodePlaylist）：撞的是那条路的 $CAP=300（同样已放开）。
+	# 为什么是 1000：这是**插件实现自选的上限**，不是任何平台/LMS 的硬限（LMS 自己的
+	# maxPlaylistLength 默认 500 / 高内存 2500，设备实测 2500）。取 1000 的理由：
+	# ① 覆盖本次 500 与 LMS 的低内存默认 500；② 与 `_trackItems` 里既有的 `last if $n >= 1000`
+	# 安全上限**同一口径**（单次渲染最多 1000 行 ⇒ 不会出现"窗口给了 1000 但渲染只出 1000 之外"）；
+	# ③ 10 页/源 × 最慢 ~1s ≈ 10s，与既有的 `timeout => 45` 相符。
+	# 注意：**真正的行数上界仍是上游 total**（下面 `$enough` 的 `$known` 那条），
+	# 这里只是"不许我们比上游更早截断"。
+	$window = 1000 if $window > 1000;
 	my $index      = $args->{index} || 0;
 
 	# ⚠️ 上游页宽不是固定的 50：各源 SDK 的 getList 自带 limit —— kw=100、kg=100、
@@ -439,7 +454,13 @@ sub sdkBoardTracksHandler {
 	my $upw        = $UPW_DEFAULT{$src} || 50;
 	my $first_page = int($index / $upw) + 1;
 	my $skip       = $index % $upw;
-	my $max_pages  = 8;
+	my $max_pages  = 24;   # ⚠️ 0.11.96：这是**页数**上限（原为 8），在"页宽重算"后会被重设为
+	                       # int((skip+window)/upw)+2 并**再夹一次**到同一个值。
+	                       # 为什么必须跟着窗口放大：窗口 300 时 8 页 × 页宽 100 已够；
+	                       # 窗口提到 1000 后，若页数上限不动，它就变成**新的静默截断点**
+	                       # （8 页 × 100 = 800 行 < 1000）。故按"窗口 1000 + 最小现实页宽 50"
+	                       # 取 1000/50+2 ≈ 22，留余量取 24。
+	                       # 见 §5.11.127：上限必须**成组**放开，修一半等于没修。
 	my $retuned    = 0;    # 是否已按响应 limit 校正过页宽
 	my $probed     = 0;    # 是否已为学 limit 探过第 1 页
 
@@ -447,7 +468,8 @@ sub sdkBoardTracksHandler {
 	# 才切——窗口比上游页宽时绝不吐空行（0.11.3 前身曾把窗口夹到 50 导致缺位空行）----
 	#
 	# ⚠️ 0.11.83 修「列表说 N 首、点播放全部却进 3N 首」：页头按钮走的是
-	# **枚举本 feed 的全部条目**（LMS 用一个大 quantity 问一次，我们夹到 300），
+	# **枚举本 feed 的全部条目**（LMS 用一个大 quantity 问一次；口径见下面 §5.11.127 的更正，
+	# 0.11.96 已把夹取上限从 300 放到 1000），
 	# 于是窗口常大于该榜真实长度。而有些平台的上游 **根本不认 page**
 	# （mg 的 `querycontentbyId.do?columnId=…&needAll=0` 恒回同一页；wy 一次给整榜），
 	# 于是"补页凑窗口"会把同一页反复追加：
@@ -488,7 +510,9 @@ sub sdkBoardTracksHandler {
 							$first_page = int($index / $upw) + 1;
 							$skip       = $index % $upw;
 							$max_pages  = int(($skip + $window) / $upw) + 2;
-							$max_pages  = 8 if $max_pages > 8;
+							# 0.11.96：与上面 `my $max_pages` 同一个上限（原来夹到 8
+							# ⇒ 窗口 1000/页宽 100 = 12 页会被截成 8 页 = 800 行）。
+							$max_pages  = 24 if $max_pages > 24;
 							$page          = $first_page;
 							$pages_fetched = 0;
 							@$acc    = ();
