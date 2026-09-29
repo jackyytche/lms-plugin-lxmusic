@@ -198,6 +198,19 @@ jobs:
           LX_TEST_QUIET_WARN=1 perl -I t -I t_build t/url-query-ascii-test.pl 2>&1 | tee -a helper-test.log
           exit ${PIPESTATUS[0]}
 
+      - name: Delivery tier gate regression (0.11.98)
+        # 起因：请求 flac24bit 却播成 mp3 128kbps。候选按「档位外层」排，但旧代码把
+        # "拿到一个可播 URL" 当成 "这一档满足了"（唯一质量闸是 <64kbps），于是任一源
+        # 在 flac24bit 档回一个可播的 128k mp3，就在第 1 档交付、阶梯永不往下走。
+        # 现在用真实交付物反推档位，低于「阶梯次一档」就拒绝该次交付、继续下一候选。
+        # 本步钉死：flac24bit+128kmp3 被拒并走到 flac；flac24bit+flac16bit 接受；
+        # 320k+128k 接受；flac+320k 接受；末档不设地板；非梯档(ogg)放行；拒绝不卡窗口。
+        run: |
+          cd plugin
+          set -o pipefail
+          LX_TEST_QUIET_WARN=1 perl -I t -I t_build t/tier-gate-test.pl 2>&1 | tee -a helper-test.log
+          exit ${PIPESTATUS[0]}
+
       - name: CHECK Helper.pm
         run: cd plugin && perl -I t -I t_build -c t_build/Plugins/LxMusic/Helper.pm
 

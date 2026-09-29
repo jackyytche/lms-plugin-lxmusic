@@ -666,6 +666,9 @@ sub resolveTrack {
 	my @tripped;
 	my @nocap;      # 被能力表裁掉的源（只报一次，便于现场判断"是源不支持这个平台"）
 	my @noqual;     # 被能力表裁掉的 (源, 档位)
+	# 0.11.98：当前候选的"结算"回调（在派发器里按候选赋值）。$finish 因交付档位过低而
+	# **拒绝**时要用它腾出并行窗口并补位；交付成功时无需调用（$done 已置位）。
+	my $cand_settle;
 	my $build = sub {
 		my ($useCaps) = @_;
 		my (@c, @t);
@@ -686,6 +689,10 @@ sub resolveTrack {
 				push @tier, [ $q, $s ];
 			}
 			# 0.11.63：**档位内**按（源 × 平台）分数排序（音质优先级不变：档位仍是外层循环）
+			# 0.11.98：**空档位直接跳过**。能力表会把"没声明该档"的源裁掉，裁完可能一个都不剩；
+			# 这种档位再排进去就是**整档空转**（对每个平台都派一遍、注定全被拒），
+			# 与"交付档位闸"叠加后浪费更明显（实测：tx 请求 flac24bit 时该档 0/2 源能给）。
+			next unless @tier;
 			push @c, $class->_score_sort($plat, @tier);
 		}
 		return (\@c, \@t);
@@ -745,6 +752,54 @@ sub resolveTrack {
 	my $finish = sub {
 		my ($src, $q, $url, $tm, $friendly, $verified, $kbps, $magic, $len, $bits) = @_;
 		return if $done;                 # 并行窗口下只交付一次
+		my $fmt = $class->lmsFormat($magic, $url);
+
+		# ── 0.11.98 交付档位闸（方案 a）──────────────────────────────────────────
+		# 起因（用户 2026-09-29 现场）：「请求 flac24bit，播出来却是 mp3 128kbps」。
+		# 根因：候选按**档位为外层**排（$build，flac24bit → flac → 320k → 128k），
+		#   但旧代码把"拿到一个可播 URL"就当成"这一档满足了" —— $finish 里唯一的
+		#   质量闸是 `$kbps < 64`（挡试听片段）。于是只要**任一**源在 flac24bit 档回了
+		#   一个可播的 128k mp3（源声明了 24bit 却拿不到，后端退回最低档），
+		#   就在第 1 档 `$done=1` 交付 ⇒ **阶梯永远走不到 flac 那一层**，
+		#   而那一层本来有源能给真无损（实测星海给 1000.5kbps flac）。
+		# 修法：用**真实交付物**反推档位（_actualTier，与面板标签同源），若低于「请求档位
+		#   在阶梯上的次一档」，就**拒绝这次交付**并放行给下一个候选（不置 $done）。
+		#   闸门取"次一档"而不是"等于请求档"：flac24bit 请求允许落到 flac
+		#   （阶梯本来就是 flac24bit→flac→320k→128k），但**不允许直接掉到 128k mp3**。
+		#   非梯档（ogg/aac/ape/wav…，%TIER_RANK 里没有）一律放行，不误伤。
+		# ⚠️ 先确保 ProtocolHandler 已加载（单元环境里可能只 require 了 Helper）。
+		# 循环依赖安全：ProtocolHandler 的 require 也可以从别处先完成。
+		require Plugins::LxMusic::ProtocolHandler
+			unless Plugins::LxMusic::ProtocolHandler->can('tier_rank');
+		my $want_rank = Plugins::LxMusic::ProtocolHandler::tier_rank($q) // 0;
+		if ($want_rank && _pref('tierGuard', 1)) {
+			my @l = $class->qualityLadder($q, $track, $a{declaredQualitys});
+			my $floor = (@l > 1)
+				? (Plugins::LxMusic::ProtocolHandler::tier_rank($l[1]) // 0) : 0;
+			# ⚠️ `_actualTier` 是 **ProtocolHandler 的方法**，签名
+			#   ($class, $fmt, $kbps, $bits, $declared)。
+			# 少传 $class 会让参数整体左移一位（$fmt 收到档位字符串、$bits 收到 types 数组），
+			# 结果恒等于"码率数字" ⇒ 排名恒为 0 ⇒ 闸门永不拒绝。本闸第一版就这么错的。
+			# 注意 `$class` 在这里是 **Helper**，不能用它去调 ProtocolHandler 的方法。
+			my $got = Plugins::LxMusic::ProtocolHandler->_actualTier(
+				$fmt, $kbps, $bits,
+				(ref($track->{types}) eq 'ARRAY' ? $track->{types} : undef));
+			my $got_rank = Plugins::LxMusic::ProtocolHandler::tier_rank($got) // 0;
+			if ($floor && $got_rank && $got_rank < $floor) {
+				push @tries, { source => $src->{name}, quality => $q, why => 'tier-too-low',
+					delivered => $got, %$tm };
+				$log->warn('LxMusic resolve: [' . ($src->{name} // '?') . "] $q rejected: "
+					. "delivered " . ($got // '?') . ($kbps ? " ~${kbps}kbps" : '')
+					. " is below the ladder floor " . $l[1]);
+				_src_failed(_src_key($src, $plat, $q), ($src->{name} // '?') . "\@$q 交付档过低");
+				_score_note(_score_key($src, $plat), 0, $tm->{ms});
+				# ⚠️ 必须结算：拒绝也是一次"候选结束"，要腾出并行窗口并补位，
+				# 否则窗口会被被拒候选占满、阶梯再也推进不了（会一直等到整体预算超时）。
+				$cand_settle->() if $cand_settle;
+				return;                  # 不交付；让下一个候选（或下一档）来
+			}
+		}
+
 		$done = 1;
 		_src_ok(_src_key($src, $plat, $q));   # 0.11.57：成功即清零该三元组的失败计数
 		# 0.11.63：记下"这个源在这个平台上成功且多快" ⇒ 影响后续派发顺序
@@ -754,7 +809,6 @@ sub resolveTrack {
 			$log->warn("LxMusic resolve: SUSPECT short/preview file ([" . ($src->{name} // '?')
 				. "] type=$q -> ~${kbps}kbps) — 可能是试听片段或残缺文件");
 		}
-		my $fmt = $class->lmsFormat($magic, $url);
 		# 时长：曲目元数据里的 interval（搜索结果/榜单条目都有）；LMS 的
 		# Protocols::HTTP::canSeek 要求 bitrate **和** duration 都已知才允许拖动
 		my $secs = _secsOf($track);
@@ -870,6 +924,7 @@ sub resolveTrack {
 				$inflight--;
 				$dispatch->();
 			};
+			$cand_settle = $settle;         # 0.11.98：$finish 拒绝交付档位时要用它结算
 
 			$log->warn("LxMusic resolve: try [" . $src->{name} . "] type=$q");
 			# 计时用 HiRes：页面上的 1.04s 级精度就靠它；这里记「宿主墙钟」与「源内 handler 耗时」

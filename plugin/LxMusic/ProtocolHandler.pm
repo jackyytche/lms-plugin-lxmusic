@@ -1820,6 +1820,22 @@ my %TIER_RANK;
 # **`hires` 永远没有排名**（perl 还会每轮报 "uninitialized value $TIER_ORDER[7]"）。
 { my $i = 0; for my $t (@TIER_ORDER) { $TIER_RANK{$t} = ++$i } }
 
+# 0.11.98：档位名 → 排名（供 Helper 的"交付档位闸"比较用；非梯档返回 undef）。
+# 调用方必须容错 `// 0`（undef 表示"这不是梯档"，如 ogg/aac/ape/wav ⇒ 不参与比较）。
+sub tierRank {
+	my ($class, $tier) = @_;
+	return undef unless defined $tier && length $tier;
+	return $TIER_RANK{$tier};
+}
+
+# 同一套语义的**函数形式**（与上面的方法形式并存）：Helper 的档位闸直呼这个，
+# 避免"单元环境下没有 bless 的 $class"这类调用形态差异（0.11.98）。
+sub tier_rank {
+	my ($tier) = @_;
+	return undef unless defined $tier && length $tier;
+	return $TIER_RANK{$tier};
+}
+
 sub _actualTier {
 	my ($class, $fmt, $kbps, $bits, $declared) = @_;
 	my $f = lc($fmt // '');
