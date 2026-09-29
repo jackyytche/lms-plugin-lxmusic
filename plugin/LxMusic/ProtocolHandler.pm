@@ -1,7 +1,10 @@
 # Plugins/LxMusic/ProtocolHandler — lxm:// 协议
 # ============================================================
 # 播放时把 lxm:// 伪 URL 解析为真实音频直链：
-#   lxm://m/<base64url(musicInfo JSON)>?s=<platform>&t=<quality>&n=<title>
+#   lxm://m/<base64url(musicInfo JSON)>?s=<platform>&t=<quality>
+# ⚠️ 0.11.97：query 里**只有 ASCII**。显示名不再放 `&n=<title>`，改为塞进
+#    musicInfo JSON 的 `_title`（b64 内）—— 中文留在 query 里会把 LMS 打崩，
+#    见 buildUrl 的长注释。老 URL 的 `n=` 仍兼容（parseUrl 兜底读）。
 # 取链走 Plugins::LxMusic::Helper（qjs + 订阅源脚本，musicUrl action），
 # 直链交给 LMS 流播：http 直链走 Slim::Player::Protocols::HTTP，
 # https 直链走 Slim::Player::Protocols::HTTPS（TLS，见下面的基类选择）。
@@ -120,17 +123,34 @@ sub buildUrl {
 	my $type  = $a{type}  || '320k';
 	my $name  = $a{name}  || '';
 
-	# name 可能是 raw UTF-8 字节串（.pm 字面量）：uri_escape_utf8 对未打旗标的
-	# 字节串按 latin1 逐字节升级 → mojibake。统一解码成字符旗标串（已解码则透传）。
+	# name 可能是 raw UTF-8 字节串（.pm 字面量）：未打旗标的字节串在 JSON 编码时
+	# 会被逐字节升级 → mojibake。统一解码成字符旗标串（已解码则透传）。
 	if (defined $name && $name ne '' && !utf8::is_utf8($name)) {
 		$name = Encode::decode('UTF-8', $name);
 	}
 
-	my $json = $JSON->encode($music);
+	# ⚠️ 0.11.97：显示名**不再放进 URL 的 query**（原形态 `&n=<title>`）。
+	#
+	# 【根因·设备 A/B 实测】query 里的中文会把 LMS 打崩：
+	#   `?n=王菲 - 如愿` ⇒ `playlist add` 后 LMS 的 JSONRPC 连接被直接关闭
+	#   （`Remote end closed connection without response`）、队列 0 行、无声；
+	#   把 `n=` 整段去掉 ⇒ `mode=play`、播放位置正常推进。
+	#   两边 b64 的 musicInfo 逐项一致 ⇒ 与音频/解析无关，**就是 URL 里的中文**。
+	#
+	#   机理：`n=` 经 uri_escape_utf8 出来是 `%E7%8E%8B%E8%8F%B2…`（本身是 ASCII、
+	#   是安全的），但这条 URL 走 XMLBrowser 的 `anyurl?p2=` 时会被**解回真中文**
+	#   再交给 LMS；LMS 把它交给 `Slim::Schema->updateOrCreate` / `URI->new` 时，
+	#   字符旗标串（wide character）就把那条请求打崩。同族现象：UPnPBridge 的
+	#   `Wide character in subroutine entry`（那条还会连带打死 JSONRPC）。
+	#
+	# 【修法】URL query 只留 ASCII（`?s=…&t=…`）；显示名塞进 musicInfo 的 `_title`，
+	#   整块走 base64url ⇒ 最终 URL 里一个非 ASCII 字节都没有。`_title` 下划线开头：
+	#   上游 musicInfo 无此键，不会与平台字段相撞。解析侧见 parseUrl（读回并删掉该键）。
+	my $music2 = { %$music, _title => $name };
+	my $json = $JSON->encode($music2);
 	my $b64  = encode_base64url($json);
 	my $q    = 's=' . uri_escape_utf8($src)
-		. '&t=' . uri_escape_utf8($type)
-		. '&n=' . uri_escape_utf8($name);
+		. '&t=' . uri_escape_utf8($type);
 
 	return "lxm://m/$b64?$q";
 }
@@ -169,11 +189,22 @@ sub parseUrl {
 	my $music = eval { $JSON->decode($json) } or return undef;
 	ref($music) eq 'HASH' or return undef;
 
+	# 0.11.97：显示名随 musicInfo 的 `_title` 走（URL query 里不再放中文，见 buildUrl）。
+	# 取出并**删掉**：它只是我们搭的顺风车，不该混进 music 对象流向下游
+	# （resolve/cache_metadata 等会把它当成上游字段）。
+	my $title = delete $music->{_title};
+	if (defined $title && !utf8::is_utf8($title)) {
+		$title = Encode::decode('UTF-8', $title, Encode::FB_DEFAULT());
+	}
+
+	# 兼容老 URL：`n=` 仍被读取（历史上存进队列/歌单的 URL 带这个参数）。
+	my $name = (defined $title && $title ne '') ? $title : ($q{n} || '');
+
 	return {
 		music => $music,
 		src   => ($q{s} || 'kw'),
 		type  => ($q{t} || '320k'),
-		name  => ($q{n} || ''),
+		name  => $name,
 	};
 }
 

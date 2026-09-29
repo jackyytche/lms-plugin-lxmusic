@@ -185,6 +185,19 @@ jobs:
           LX_TEST_QUIET_WARN=1 perl -I t -I t_build t/meta-persist-test.pl 2>&1 | tee -a helper-test.log
           exit ${PIPESTATUS[0]}
 
+      - name: URL query ASCII regression (0.11.97)
+        # 中文 `n=` 会把 LMS 打崩（JSONRPC 连接被关闭、队列 0 行、行内播放按钮没反应）：
+        # `n=` 经 uri_escape_utf8 本身是 ASCII，但走 XMLBrowser `anyurl?p2=` 时会被
+        # 解回真中文，LMS 交给 updateOrCreate/URI->new 时 wide character 打崩请求。
+        # 现在显示名走 musicInfo 的 `_title`（base64url 内），query 只留 s=/t=。
+        # 本步钉死：带中文标题时 URL 整串纯 ASCII、query 无 n=、parseUrl 能读回、
+        # 老 URL 的 n= 仍兼容。
+        run: |
+          cd plugin
+          set -o pipefail
+          LX_TEST_QUIET_WARN=1 perl -I t -I t_build t/url-query-ascii-test.pl 2>&1 | tee -a helper-test.log
+          exit ${PIPESTATUS[0]}
+
       - name: CHECK Helper.pm
         run: cd plugin && perl -I t -I t_build -c t_build/Plugins/LxMusic/Helper.pm
 
