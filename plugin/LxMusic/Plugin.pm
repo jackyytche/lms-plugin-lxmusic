@@ -2642,8 +2642,12 @@ sub _webPreview {
 		src      => $src,
 		type     => ($prefs->get('quality') || '320k'),
 		# 0.11.60：工具页也给整体预算（页面能等，但别无限等——mg 那条实测 19.6s 才失败）
-		timeout  => 14,
-		budget   => 20,
+		# 0.11.106：per-request 超时 **14 → 20**，与**播放路径**的默认一致。
+		# 起因：14s 比播放路径更紧 ⇒ 工具页会把"播放时其实能成"的慢源判成 `timeout: exceeded 14s`
+		# （现场：玉宁熙已回 200 + 90KB，用了 13.6s），**诊断结论因此系统性偏悲观**。
+		# 注意：这只让诊断更贴近真实播放；"超时是否该熔断"已由 0.11.106 在 Helper 里单独修掉。
+		timeout  => 20,
+		budget   => 25,
 		cb       => sub {
 			my ($res) = @_;
 			my $elapsed = sprintf('%.2f', time() - $started);
@@ -2656,6 +2660,10 @@ sub _webPreview {
 				$t .= sprintf('(verify %dms)', $_->{verify}) if defined $_->{verify};
 				$t .= ' friendly=0' if $_->{ok} && defined $_->{friendly} && !$_->{friendly};
 				$t .= ' [' . $_->{path} . ']' if $_->{path};
+				# 0.11.105：把该次尝试**实际拿到的 URL** 也渲染出来（诊断盲区）。
+				# 起因：设备 vs 宿主"同一源同一首，宿主 FLAC / 设备 404"那条查不下去，
+				# 因为 tries 里没有 URL，只能靠日志；现在工具页直接看得到。
+				$t .= ' → ' . $_->{url} if $_->{url};
 				encode_entities($t);
 			} @{ $res->{tries} || [] });
 			my $html;

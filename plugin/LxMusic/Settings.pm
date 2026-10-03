@@ -269,9 +269,15 @@ sub handler {
 			$byPath2{$p} = $rec->{name} if $p;
 		}
 		my @cap_line;
+		# 0.11.105：能力表**带上档位**（`caps_state` 只有平台名，是排查盲区）。
+		my $detail = eval { Plugins::LxMusic::Helper->caps_detail } || {};
 		for my $p (sort keys %$caps) {
 			my $short = $byPath2{$p} // ($p =~ m{([^/]+)$})[0] // $p;
-			push @cap_line, _m($short, '=', join('/', @{ $caps->{$p} }));
+			my @parts = map {
+				my $qs = $detail->{$p}{$_} || [];
+				@$qs ? "$_(" . join(',', @$qs) . ')' : $_;
+			} @{ $caps->{$p} };
+			push @cap_line, _m($short, '=', join('/', @parts));
 		}
 		$params->{lxCaps} = _ent(@cap_line ? join(_chars('；'), @cap_line) : '（还没有源能力表）');
 	}

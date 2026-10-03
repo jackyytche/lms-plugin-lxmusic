@@ -528,6 +528,21 @@ sub _score_sort {
 sub score_state { return { map { $_ => { %{ $SRC_SCORE{$_} } } } keys %SRC_SCORE } }
 sub _score_reset { %SRC_SCORE = (); return 1 }
 
+# 0.11.105：能力表的**带档位**只读视图（诊断用）。
+# 起因（第三十五轮排查 mg"全是 128k"）：`caps_state` 只返回**平台名**，
+# 设置页诊断因此看不到"某源在某平台上到底声明了哪些档位" ⇒ 无法判断某源是否被**按档位裁掉**。
+# 返回：{ <源文件路径> => { <平台> => [ 档位… ] } }
+sub caps_detail {
+	my %out;
+	for my $p (keys %CAPS) {
+		for my $plat (keys %{ $CAPS{$p} }) {
+			my $qs = $CAPS{$p}{$plat}{qualitys} || {};
+			$out{$p}{$plat} = [ sort keys %$qs ];
+		}
+	}
+	return \%out;
+}
+
 # ---------- 0.11.64：能力表 +（源×平台）分数**持久化** ----------
 # 为什么必须持久：两者原本都是内存态 ⇒ LMS 一重启，"能力表裁剪"和"学到的派发顺序"全丢，
 # 每个（源 × 平台）的**第一首**又要按冷顺序走一遍（0.11.63 实测那一次 mg 要 13.04s）。
@@ -799,6 +814,8 @@ sub resolveTrack {
 	# 全程对外语义不变（tries/source/quality/deferred 都照旧记录）。
 	my $K        = 2;
 	my $inflight = 0;
+	# 0.11.107：**同一个源同时只允许一个候选在飞**（见派发器里的说明）。
+	my %busy_src;
 	my $done     = 0;
 	my $dispatch;
 
@@ -842,7 +859,7 @@ sub resolveTrack {
 			my $got_rank = Plugins::LxMusic::ProtocolHandler::tier_rank($got) // 0;
 			if ($floor && $got_rank && $got_rank < $floor) {
 				push @tries, { source => $src->{name}, quality => $q, why => 'tier-too-low',
-					delivered => $got, %$tm };
+					delivered => $got, url => substr($url, 0, 160), %$tm };
 				$log->warn('LxMusic resolve: [' . ($src->{name} // '?') . "] $q rejected: "
 					. "delivered " . ($got // '?') . ($kbps ? " ~${kbps}kbps" : '')
 					. " is below the ladder floor " . $l[1]);
@@ -877,7 +894,7 @@ sub resolveTrack {
 		my $secs = _secsOf($track);
 		push @tries, { source => $src->{name}, quality => $q, ok => 1, verified => $verified,
 			kbps => $kbps, suspect => $suspect, magic => $magic, format => $fmt,
-			friendly => $friendly, %$tm };
+			friendly => $friendly, url => substr($url, 0, 160), %$tm };
 		$log->warn("LxMusic resolve OK: [" . $src->{name} . "] type=$q verified=$verified"
 			. (defined $kbps ? " ~${kbps}kbps" : '') . ($suspect ? ' (SUSPECT)' : '')
 			. " total=" . ($tm->{ms} // '?') . 'ms path=' . ($tm->{path} // '?')
@@ -938,7 +955,8 @@ sub resolveTrack {
 				$tm->{ch} = $pi->{channels} || 0;
 				return $finish->($src, $q, $deliver, $tm, $friendly, 1, $kbps, $pi->{magic}, $pi->{length}, $pi->{bits});
 			}
-			push @tries, { source => $src->{name}, quality => $q, why => 'verify: ' . ($pi->{error} // '?'), %$tm };
+			push @tries, { source => $src->{name}, quality => $q, why => 'verify: ' . ($pi->{error} // '?'),
+				url => substr($url, 0, 160), %$tm };
 			$log->warn("LxMusic resolve: verify rejected [" . $src->{name} . "] $q: " . ($pi->{error} // '?'));
 			# ⚠️⚠️ 0.11.103：**验链失败不再计入熔断/评分**。
 			# 理由与 `tier-too-low` 完全一样：熔断键是 `源|平台|档位`，**没有曲目维度**；
@@ -976,8 +994,20 @@ sub resolveTrack {
 		return if $done;
 
 		while ($inflight < $K) {
-			my $cand = shift @cand;
-			last unless $cand;
+			# ⚠️ 0.11.107：**同一个源同时只允许一个候选在飞**。
+			# 起因（0.11.106 设备实测）：窗口会把同一个源在**多个档**同时派出去（阶梯里它有多个候选），
+			# 而慢源走 E-1 准入闸（每源并发 1 + 队列 2）⇒ 后到的档被**我们自己的闸**拒成
+			# `local-fault: source busy (hostile queue full)`。现场：`玉宁熙@flac24bit` 在飞时，
+			# 它**唯一能成功**的 `@flac` 被自己拒掉 ⇒ 有真无损也拿不到。
+			# 现在：按阶梯顺序找**第一个该源空闲**的候选；找不到就退出循环，等某个候选结算时再补位。
+			my $pick;
+			for my $i (0 .. $#cand) {
+				next if $busy_src{ $cand[$i][1]{id} // '' };
+				$pick = $i;
+				last;
+			}
+			last unless defined $pick;
+			my $cand = splice(@cand, $pick, 1);
 
 			my ($q, $src) = @$cand;
 			my $path = Plugins::LxMusic::Sources->pathFor($src->{id});
@@ -987,11 +1017,13 @@ sub resolveTrack {
 			}
 
 			$inflight++;
+			$busy_src{ $src->{id} // '' }++;
 			my $settled = 0;
 			my $settle = sub {              # 每个候选只结算一次，并立刻补位
 				return if $settled;
 				$settled = 1;
 				$inflight--;
+				$busy_src{ $src->{id} // '' }--;
 				$dispatch->();
 			};
 			$cand_settle = $settle;         # 0.11.98：$finish 拒绝交付档位时要用它结算
@@ -1037,12 +1069,30 @@ sub resolveTrack {
 						# 引擎缺口（engine-unsupported）同理——那是我们没实现，不是源不行。
 						my $local_fault = (($res->{why} // '') eq 'local')
 							|| ($why =~ /engine-unsupported|ENGINE_UNSUPPORTED/);
+						# ⚠️⚠️ 0.11.106：**超时是"慢"，不是"坏"，不许封平台**。
+						# 现场（第三十五轮，0.11.105 的新诊断第一次把这件事照出来）：
+						#   `lx-玉宁熙-Pro@flac24bit: timeout: worker request exceeded 14s
+						#    {resp: code=200 len=90770 …} 13656ms [timeout]`
+						# —— 源**已经回了 200 + 90KB JSON**，只是设备（i386）上跑它的混淆逻辑超过 14s。
+						# 旧规则把这条算进 `%SRC_BAD` ⇒ 连续 2 次超时 ⇒ 唯一能给 mg 无损的源被**封 600s**
+						# ⇒ 用户看到"整平台都是 128k mp3"。而"慢"我们**已经有**专门机制：
+						# `%WORKER_BAD`（worker 超时会把它转 fork 路径）+ E-1 每源并发 1 + 队列 2，
+						# 再加一层平台级封禁纯属**重复惩罚**，且代价是永久丢掉无损档。
+						# 处置：超时**照常记 tries、照常计分**（排序会把它往后排），但**不进熔断**。
+						my $soft_slow = ($why =~ /timeout|exceeded|timed out/i) ? 1 : 0;
 						push @tries, {
 							source => $src->{name}, quality => $q, %tm,
-							why => ($local_fault ? "local-fault: $why" : $why),
+							# 0.11.105：连**失败时源返回的东西**也带上（诊断盲区）——
+							# 有的源会回一个 URL 但我们判它不可播；不记下来就永远只能猜。
+							(defined $res->{data} && !ref($res->{data})
+								? (url => substr($res->{data}, 0, 160)) : ()),
+							why => ($local_fault ? "local-fault: $why"
+								: $soft_slow ? "slow-timeout: $why" : $why),
 						};
 						unless ($local_fault) {
-							_src_failed(_src_key($src, $plat, $q), ($src->{name} // '?') . "\@$q");   # 0.11.57 熔断计数
+							# 慢照样计分（让它排到后面），但只有**真坏**才熔断
+							_src_failed(_src_key($src, $plat, $q), ($src->{name} // '?') . "\@$q")
+								unless $soft_slow;                                              # 0.11.57/0.11.106
 							_score_note(_score_key($src, $plat), 0, $tm{ms});   # 0.11.63 排序用
 						}
 						return $settle->();

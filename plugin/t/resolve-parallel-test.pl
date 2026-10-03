@@ -178,6 +178,13 @@ sub new_run_budget {
 	check('caps: 档位不支持时该源被裁掉', !grep { $_ eq 'B' } @src_of_launch,
 		'launched=' . join(',', @src_of_launch));
 
+	# 0.11.105：能力表的**档位视图**（诊断用）。`caps_state` 只给平台名，
+	# 排查 mg"全是 128k"时看不到"某源在该平台声明了哪些档位"（盲区）。
+	my $det = Plugins::LxMusic::Helper->caps_detail;
+	my @qs = @{ ($det->{$path{B}}{wy} || []) };
+	check('caps_detail: 给出该平台声明的档位（诊断用）',
+		join(',', @qs) eq '128k,320k', 'wy=' . join(',', @qs));
+
 	Plugins::LxMusic::Helper::_caps_reset();
 }
 

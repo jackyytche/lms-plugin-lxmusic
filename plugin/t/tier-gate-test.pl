@@ -55,7 +55,8 @@ sub check {
 }
 
 # ---------- 桩：request / probeUrl / Sources ----------
-my (@launched, %cb, %path, @got, %cb_info, %enabled_ids, %local_reject, %probe_reject);
+my (@launched, %cb, %path, @got, %cb_info, %enabled_ids, %local_reject, %probe_reject, %timeout_reject,
+	%inflight_src, $max_same);
 # ⚠️ 0.11.102：回调**按 (源|档位) 存**，不是按源 —— 并行窗口会把同一个源在不同档**同时**派发出去，
 # 旧写法 `%cb{$id}` 会被后一次派发覆盖 ⇒ 只 fire 最后一次那个档的交付，
 # "半开重试是否真的发生"就测不出来（判别性用例 10c 第一版就这么假失败）。
@@ -74,8 +75,18 @@ my %deliver_of;      # 源 id => 该源这次"交付"的 URL（由 probeUrl 按�
 			return $a{cb}->({ ok => 0, data => undef, why => 'local', logs => [], alerts => [],
 				error => 'source busy (hostile queue full)' });
 		}
+		# 0.11.106：模拟**超时**（源慢，不是坏）——验证"超时不封平台"
+		if ($timeout_reject{"$id|$q"}) {
+			return $a{cb}->({ ok => 0, data => undef, why => 'worker', logs => [], alerts => [],
+				error => 'timeout: worker request exceeded 20s' });
+		}
 		push @launched, { id => $id, info => $a{info} };
-		$cb{"$id|$q"} = $a{cb};
+		# 0.11.107：统计**同一源同时在飞**的最大数（必须 ≤1：我们自己的准入闸每源并发 1，
+		# 并行派同一源的多个档只会被自己拒成 `local-fault: source busy`）。
+		$inflight_src{$id}++;
+		$max_same = $inflight_src{$id} if $inflight_src{$id} > $max_same;
+		my $orig = $a{cb};
+		$cb{"$id|$q"} = sub { $inflight_src{$id}--; $orig->(@_) };
 		$cb_info{"$id|$q"} = $a{info};      # 0.11.102：判别"这次交付发生在哪一档"
 		return 1;
 	};
@@ -151,6 +162,9 @@ sub run {
 	}
 	# 0.11.103：本机准入拒绝注入（`"源|档位" => 1`）
 	%local_reject = %{ $opt{local_reject} || {} };
+	%timeout_reject = %{ $opt{timeout_reject} || {} };   # 0.11.106：超时注入
+	%inflight_src = ();                                  # 0.11.107：同源并发统计
+	$max_same = 0;
 	Plugins::LxMusic::Helper->resolveTrack(
 		music => $track, src => 'mg', type => $opt{want},
 		cb    => sub { push @got, $_[0] },
@@ -449,6 +463,56 @@ sub run {
 		(scalar(grep { ($_->{why} // '') =~ /^verify:/ } @{ ($got[0] || {})->{tries} || [] })) ? 1 : 0,
 		join(' | ', map { $_->{why} // '?' } @{ ($got[0] || {})->{tries} || [] }));
 	%probe_reject = ();
+	delete $enabled_ids{list};
+}
+
+# ---------- 13. 0.11.105：tries 里必须带**实际 URL**（诊断盲区） ----------
+# 起因：设备 vs 宿主"同一源同一首：宿主 FLAC / 设备 404"这条查不下去，因为工具页的 tries
+# 只有"源@档位: why/ms"，没有 URL；只能靠日志（而日志切片又不可靠）。现在必须带 URL。
+{
+	%path = (A => $srcA, B => $srcB);
+	$enabled_ids{list} = [ 'A', 'B' ];
+	run(want => 'flac24bit', deliver => { A => 'flac-24' });
+	my @urls = map { $_->{url} // '' } @{ ($got[0] || {})->{tries} || [] };
+	check('13a 成功交付的 tries 条目带 url（工具页可显示实际拿到的链）',
+		(scalar(grep { m{/flac-24/} } @urls)) ? 1 : 0, join(' | ', @urls));
+	delete $enabled_ids{list};
+}
+
+# ---------- 14. 0.11.106：**超时是"慢"，不是"坏"**，不许封平台 ----------
+# 现场（0.11.105 的新诊断照出来的第一件事）：`lx-玉宁熙-Pro@flac24bit: timeout: worker request
+# exceeded 14s {resp: code=200 len=90770 …} 13656ms` —— 源已回 200+90KB，只是设备上跑它超过 14s。
+# 旧规则两次超时就把它封 600s ⇒ 唯一能给 mg 无损的源消失 ⇒ "整平台全是 128k"。
+# 判据：不熔断；仍记 `slow-timeout:`；阶梯继续（由别的源/档位交付）。
+{
+	%path = (A => $srcA, B => $srcB);
+	$enabled_ids{list} = [ 'A', 'B' ];
+	run(want => 'flac', deliver => { B => 'flac-16' }, timeout_reject => { 'A|flac' => 1 });
+	my $bs14 = Plugins::LxMusic::Helper::_breaker_state();
+	check('14a 超时不触发熔断（bad 为空）', !(scalar keys %{ $bs14->{bad} }),
+		'bad=' . join(',', keys %{ $bs14->{bad} }));
+	check('14b 超时不计入失败计数（fail 为空）', !(scalar keys %{ $bs14->{fail} }),
+		'fail=' . join(',', keys %{ $bs14->{fail} }));
+	check('14c 超时仍记 slow-timeout（可诊断、不伪装成源坏）',
+		(scalar(grep { ($_->{why} // '') =~ /^slow-timeout:/ } @{ ($got[0] || {})->{tries} || [] })) ? 1 : 0,
+		join(' | ', map { $_->{why} // '?' } @{ ($got[0] || {})->{tries} || [] }));
+	check('14d 超时不阻塞阶梯（由 B 交付）',
+		@got == 1 && $got[0]{ok} && (($got[0]{quality} // '') eq 'flac'),
+		@got ? ($got[0]{quality} // '?') : 'none');
+	%timeout_reject = ();
+	delete $enabled_ids{list};
+}
+
+# ---------- 15. 0.11.107：同一个源不许同时派多个候选 ----------
+# 起因（0.11.106 设备实测）：窗口把同一源在多个档同时派出，而慢源走"每源并发 1"的准入闸
+# ⇒ 后到的档被**我们自己的闸**拒成 `local-fault: source busy`（现场：玉宁熙唯一能成功的
+# `@flac` 被它自己的 `@flac24bit` 挤掉）。判据：任何时刻同一源在飞数 ≤ 1。
+{
+	%path = (A => $srcA);
+	$enabled_ids{list} = [ 'A' ];        # 只有一个源 ⇒ 它在阶梯里必然有多个候选
+	run(want => 'flac24bit', deliver => { A => 'flac-24' });
+	check('15a 同源同时只派一个候选（不再自己把自己拒成 busy）', $max_same == 1,
+		"max_same=$max_same launched=" . scalar(@launched));
 	delete $enabled_ids{list};
 }
 
