@@ -700,38 +700,63 @@ sub resolveTrack {
 	my $cand_settle;
 	my $build = sub {
 		my ($useCaps) = @_;
-		my (@c, @t);
+		my (@c, @t, %empty_trip, %by_tier);
 		for my $q (@ladder) {
-			my @tier;
+			my (@tier, @trip_here, $pruned_here);
 			for my $s (@$sources) {
 				my $k = _src_key($s, $plat, $q);
-				if (_src_tripped($k)) { push @t, ($s->{name} // '?') . "\@$q"; next; }
+				if (_src_tripped($k)) { push @trip_here, $s; push @t, ($s->{name} // '?') . "\@$q"; next; }
 				if ($useCaps) {
 					my $path = Plugins::LxMusic::Sources->pathFor($s->{id});
 					if (defined $path) {
 						my $sup = $class->_caps_platform($path, $plat);
-						if (defined $sup && !$sup) { push @nocap, ($s->{name} // '?'); next; }
+						if (defined $sup && !$sup) { push @nocap, ($s->{name} // '?'); $pruned_here = 1; next; }
 						my $qs = $class->_caps_qualitys($path, $plat);
-						if ($qs && !$qs->{$q}) { push @noqual, ($s->{name} // '?') . "\@$q"; next; }
+						if ($qs && !$qs->{$q}) { push @noqual, ($s->{name} // '?') . "\@$q"; $pruned_here = 1; next; }
 					}
 				}
 				push @tier, [ $q, $s ];
 			}
+			# 0.11.102：把"**整档只因熔断而空**"单独记下来（`@tier` 空 + 有被熔断的源 + 没有被能力表裁掉）。
+			#   现场（用户 2026-10-03 报"一次降档后所有曲目都降档"，mg 榜单>热歌榜实测）：
+			#   第一首走完整阶梯（8s，tries 里有 flac24bit/flac），**之后每首只剩 `@320k` 一档**（1s）
+			#   —— 高档被熔断整档剔除，而熔断键是 `源|平台|档位`、TTL 600s、**跨曲目共享**。
+			$empty_trip{$q} = \@trip_here if (!@tier && @trip_here && !$pruned_here);
 			# 0.11.63：**档位内**按（源 × 平台）分数排序（音质优先级不变：档位仍是外层循环）
 			# 0.11.98：**空档位直接跳过**。能力表会把"没声明该档"的源裁掉，裁完可能一个都不剩；
 			# 这种档位再排进去就是**整档空转**（对每个平台都派一遍、注定全被拒），
 			# 与"交付档位闸"叠加后浪费更明显（实测：tx 请求 flac24bit 时该档 0/2 源能给）。
 			next unless @tier;
-			push @c, $class->_score_sort($plat, @tier);
+			my @sorted = $class->_score_sort($plat, @tier);
+			$by_tier{$q} = \@sorted;
+			push @c, @sorted;
 		}
-		return (\@c, \@t);
+		return (\@c, \@t, \%empty_trip, \%by_tier);
 	};
 	# 0.11.58：**先按源声明的能力表裁剪**（PC 端 preload 的做法）。若裁剪后一个候选都不剩
 	# （源没声明该平台 / 声明与实际不符 / 完全没有能力表），退回不做能力裁剪的旧行为——
 	# 「宁可慢，也不能因为一张表点了没声」。
-	my ($c1, $t1) = $build->(1);
+	my ($c1, $t1, $et1) = $build->(1);
 	if (@$c1 || !(@nocap || @noqual)) {
 		@cand = @$c1; @tripped = @$t1;
+		# 0.11.102：**半开重试**（每个 resolve 最多一次）。若阶梯里**最高**那个"整档只因熔断而空"
+		# 的档位存在，就把该档按分数最好的那个源放回候选**最前面**，让它再试一次。
+		# 目的：熔断不能再把高档永久性地从阶梯里抹掉（那正是"一次降档 → 之后全部降档"的机制）。
+		# 代价被限死：每轮最多多 1 次候选尝试；失败会照旧 `_src_failed` 续期熔断。
+		if (keys %$et1) {
+			for my $q (@ladder) {            # 阶梯是高→低，先处理最高的那个
+				next unless $et1->{$q};
+				my @ranked = $class->_score_sort($plat, map { [ $q, $_ ] } @{ $et1->{$q} });
+				my ($best) = @ranked;
+				if ($best) {
+					unshift @cand, [ $q, $best->[1] ];
+					$log->warn('LxMusic resolve: half-open retry for [' . ($best->[1]{name} // '?')
+						. "] at $q (whole tier was breaker-tripped on " . ($plat || '?')
+						. ' — one attempt per resolve so one bad track cannot lock the platform)');
+				}
+				last;
+			}
+		}
 	}
 	else {
 		my ($c2, $t2) = $build->(0);
@@ -821,8 +846,16 @@ sub resolveTrack {
 				$log->warn('LxMusic resolve: [' . ($src->{name} // '?') . "] $q rejected: "
 					. "delivered " . ($got // '?') . ($kbps ? " ~${kbps}kbps" : '')
 					. " is below the ladder floor " . $l[1]);
-				_src_failed(_src_key($src, $plat, $q), ($src->{name} // '?') . "\@$q 交付档过低");
-				_score_note(_score_key($src, $plat), 0, $tm->{ms});
+				# ⚠️⚠️ 0.11.102：**"交付档位过低"不再计入熔断、也不再计入可用性评分**。
+				# 用户现场（2026-10-03）：「音质一旦发生降档（比如 128k mp3），所有曲目都自动降档成 mp3」
+				# —— mg 榜单>热歌榜实测：第一首走完整阶梯（tries 里有 flac24bit/flac），**之后每首
+				# 只剩 `@320k` 一档**（1s 就返回 128k）。机制：熔断键是 `源|平台|档位`、TTL 600s、
+				# **跨曲目共享**，而这里把"这个源唱不了这一个曲目的这一档"（源侧能力/本曲资源问题）
+				# 记成了"这个源在该平台该档坏了" ⇒ 连续 2 次就把整档从阶梯里抹掉，**全平台所有曲目**
+				# 一起降档，10 分钟后才恢复（且一恢复又会被同样打掉）。
+				# 现在：低交付只记 `@tries` + 告警（可诊断），熔断只留给**真实传输失败**
+				# （404/超时/验链失败/加密容器）；另外 `$build` 里加了"整档只因熔断而空 ⇒ 半开重试一次"，
+				# 保证单曲失败永远不能把高档永久锁死。
 				# ⚠️ 必须结算：拒绝也是一次"候选结束"，要腾出并行窗口并补位，
 				# 否则窗口会被被拒候选占满、阶梯再也推进不了（会一直等到整体预算超时）。
 				$cand_settle->() if $cand_settle;

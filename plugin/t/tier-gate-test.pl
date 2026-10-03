@@ -55,7 +55,10 @@ sub check {
 }
 
 # ---------- 桩：request / probeUrl / Sources ----------
-my (@launched, %cb, %path, @got);
+my (@launched, %cb, %path, @got, %cb_info, %enabled_ids);
+# ⚠️ 0.11.102：回调**按 (源|档位) 存**，不是按源 —— 并行窗口会把同一个源在不同档**同时**派发出去，
+# 旧写法 `%cb{$id}` 会被后一次派发覆盖 ⇒ 只 fire 最后一次那个档的交付，
+# "半开重试是否真的发生"就测不出来（判别性用例 10c 第一版就这么假失败）。
 my %deliver_of;      # 源 id => 该源这次"交付"的 URL（由 probeUrl 按后缀推档位）
 
 {
@@ -64,8 +67,10 @@ my %deliver_of;      # 源 id => 该源这次"交付"的 URL（由 probeUrl 按�
 	*Plugins::LxMusic::Helper::request = sub {
 		my ($class, %a) = @_;
 		my ($id) = grep { $path{$_} eq $a{source} } keys %path;
+		my $q = ($a{info} || {})->{type} // '?';
 		push @launched, { id => $id, info => $a{info} };
-		$cb{$id} = $a{cb};
+		$cb{"$id|$q"} = $a{cb};
+		$cb_info{"$id|$q"} = $a{info};      # 0.11.102：判别"这次交付发生在哪一档"
 		return 1;
 	};
 	# probeUrl 按 URL 里的档位标记给出"真实交付"的魔数/长度/位深，用来驱动 _actualTier。
@@ -91,7 +96,11 @@ my %deliver_of;      # 源 id => 该源这次"交付"的 URL（由 probeUrl 按�
 			bits => ($d->{bits} || 0), samplerate => ($d->{sr} || 44100), channels => 2 });
 	};
 	*Plugins::LxMusic::Sources::enabled = sub {
-		return [ { id => 'A', name => 'srcA' }, { id => 'B', name => 'srcB' } ];
+		# ⚠️ 0.11.102：`%path` 只影响 `pathFor`，**不影响"哪些源是启用的"**。旧桩恒返回 A+B，
+		# 于是 `%path=(A=>…)` 那种"只留一个源"的写法里 B 仍会作为候选（到派发时才因 file missing 被丢），
+		# 结果"某档是否**整档**被熔断"就永远算不出来（10c 第一版据此假失败）。
+		my @ids = @{ $enabled_ids{list} || [ 'A', 'B' ] };
+		return [ map { { id => $_, name => 'src' . $_ } } @ids ];
 	};
 	*Plugins::LxMusic::Sources::pathFor = sub { my ($class, $id) = @_; return $path{$id} };
 }
@@ -122,37 +131,62 @@ sub run {
 	Plugins::LxMusic::Helper::_breaker_reset();
 	Plugins::LxMusic::Helper::_score_reset();
 	Slim::Utils::Timers::resetForTest();
+	# 0.11.102：预先人为熔断若干"源|平台|档位"三元组（每键连记 2 次失败即上闸），
+	# 用来验证"整档只因熔断而空 ⇒ 半开重试一次"这条防锁死逻辑。
+	for my $k (@{ $opt{pretrip} || [] }) {
+		Plugins::LxMusic::Helper::_src_failed($k, $k);
+		Plugins::LxMusic::Helper::_src_failed($k, $k);
+	}
 	Plugins::LxMusic::Helper->resolveTrack(
 		music => $track, src => 'mg', type => $opt{want},
 		cb    => sub { push @got, $_[0] },
 	);
 	return unless $opt{deliver};
-	# 反复扫描：新出现的候选就交付（按 $opt{deliver} 指定的后缀），直到没有新回调
+	# 反复扫描：新出现的候选就交付（按 $opt{deliver} 指定的后缀），直到没有新回调。
+	# ⚠️ 0.11.102：**必须按派发顺序 fire**，不能用 `keys %cb`（哈希顺序不定）。
+	#   并行窗口会把同一个源在多个档同时派出去，谁先 fire 谁就决定交付档位 ⇒
+	#   哈希顺序会让"半开重试到底交付在哪一档"变成随机结果（10c 实测时好时坏）。
 	my %fired;
 	for my $round (1 .. 12) {
 		last if @got;                       # 已交付（成功）就停
-		my @todo = grep { !$fired{$_} } keys %cb;
+		my @todo;
+		for my $e (@launched) {
+			my $k = ($e->{id} // '?') . '|' . (($e->{info} || {})->{type} // '?');
+			next if $fired{$k};
+			push @todo, [ $k, $e ];
+		}
 		last unless @todo;
-		for my $id (@todo) {
-			$fired{$id} = 1;
-			my $u = $opt{deliver}{$id} or next;
+		for my $t (@todo) {
+			my ($k, $e) = @$t;
+			$fired{$k} = 1;
+			my ($sid, $tier) = split /\|/, $k, 2;
+			# 0.11.102：`deliver_tier{档位}{源}` 优先 —— 用来做"同一源在不同档交付不同东西"的判别性用例
+			# （否则 `deliver{A}` 一个值在任何档都命中，掩盖"半开重试到底有没有发生"）。
+			my $u = ($opt{deliver_tier} && $opt{deliver_tier}{ $tier // '' }
+					&& $opt{deliver_tier}{ $tier // '' }{$sid})
+				|| ($opt{deliver} ? $opt{deliver}{$sid} : undef) or next;
 			# 档位标记放进路径段，后缀保持**真音频后缀**（见 probeUrl 的说明）
 			my $ext = $u =~ /ogg/ ? 'ogg' : ($u =~ /flac/ ? 'flac' : 'mp3');
-			$cb{$id}->({ ok => 1, data => "http://cdn.example/$u/$id.$ext", why => 'worker' });
+			$cb{$k}->({ ok => 1, data => "http://cdn.example/$u/$sid.$ext", why => 'worker' });
 		}
 	}
 }
 
-# ---------- 1. flac24bit 请求拿到 128k mp3 ⇒ 必须被拒，并继续派发 ----------
+# ---------- 1. flac24bit 请求拿到 128k mp3 ⇒ 高档必须被拒，只在允许的地板档放行 ----------
 {
 	%path = (A => $srcA);                    # 只留一个源：A 唯一能交付的就是 128k mp3
 	run(want => 'flac24bit', deliver => { A => 'mp3-128' });
-	check('1a flac24bit + 128k mp3: 该次交付被拒（未交付）', @got == 0,
-		'got=' . scalar(@got));
-	# 被拒后必须继续派发（窗口没被卡死）：应看到 flac 档的候选被启动
-	my @tiers = map { $_->{info}{type} } @launched;
-	check('1b 拒绝后继续派发到下一档（flac）', (grep { $_ eq 'flac' } @tiers),
-		'tiers=' . join(',', @tiers));
+	# ⚠️ 0.11.102：本用例的口径改了。旧写法断言"完全未交付"，那是**测试桩**的产物
+	#   （旧桩按"源"只 fire 一次 ⇒ 被拒后同源的低档候选再也不会交付）。
+	#   真实语义（也是设计意图）：高档拒掉这个 128k，**阶梯继续往下**，
+	#   到 320k 档时地板是 128k ⇒ 允许放行。所以正确的断言是：
+	#   ① 记下了 `tier-too-low`（证明高档真的拒了）；② 交付发生在地板允许的 320k 档。
+	my @low = grep { ($_->{why} // '') eq 'tier-too-low' } @{ ($got[0] || {})->{tries} || [] };
+	check('1a flac24bit 请求：128k mp3 在高档被拒（tries 记 tier-too-low）',
+		@low >= 1, 'tier-too-low=' . scalar(@low));
+	check('1b 只在 320k 档放行（交付档位 = 320k，不是 flac24bit/flac）',
+		@got == 1 && $got[0]{ok} && (($got[0]{quality} // '') eq '320k'),
+		@got ? ($got[0]{quality} // '?') : 'none');
 	%path = (A => $srcA, B => $srcB);
 }
 
@@ -297,11 +331,16 @@ sub run {
 	check('9a hires 请求 + 24bit/44.1k ⇒ 接受（地板 flac24bit）', @got == 1 && $got[0]{ok},
 		'got=' . scalar(@got));
 
-	# 9b 请求 hires、交付 128k mp3 ⇒ **拒绝**，并继续往下派发
+	# 9b 请求 hires、交付 128k mp3 ⇒ 高档全部拒掉，只在 320k 档（地板 128k）放行
 	run(want => 'hires', deliver => { A => 'mp3-128' });
-	check('9b hires 请求 + 128k mp3 ⇒ 拒绝', @got == 0, 'got=' . scalar(@got));
+	my @low9 = grep { ($_->{why} // '') eq 'tier-too-low' } @{ ($got[0] || {})->{tries} || [] };
+	check('9b hires 请求 + 128k mp3 ⇒ 高档被拒（tier-too-low）', @low9 >= 1,
+		'tier-too-low=' . scalar(@low9));
+	check('9b2 只在 320k 档放行', @got == 1 && (($got[0]{quality} // '') eq '320k'),
+		@got ? ($got[0]{quality} // '?') : 'none');
 	my @tiers9 = map { $_->{info}{type} } @launched;
-	check('9c 拒绝后继续派发到下一档（flac24bit）', (grep { $_ eq 'flac24bit' } @tiers9),
+	check('9c 被拒后继续派发（见过 flac24bit 与 flac 两档）',
+		(grep { $_ eq 'flac24bit' } @tiers9) && (grep { $_ eq 'flac' } @tiers9),
 		'tiers=' . join(',', @tiers9));
 
 	# 9d 请求 hires、交付 96k/24bit ⇒ 接受，且反推档位就是 hires
@@ -321,6 +360,36 @@ sub run {
 	check('9g 曲目只声明 flac ⇒ 阶梯不含 hires', !(grep { $_ eq 'hires' } @lad2), join(',', @lad2));
 
 	%path = (A => $srcA, B => $srcB);
+}
+
+# ---------- 10. 0.11.102：降档不得变成"平台级锁死"（用户 2026-10-03 现场） ----------
+# 现场：mg 榜单>热歌榜，第一首走完整阶梯（8s，tries 里有 flac24bit/flac），**之后每首只剩
+# `@320k` 一档**（1s 就返回 128k）。根因 = 交付档位闸把"交付过低"记进熔断，而熔断键是
+# `源|平台|档位`、TTL 600s、跨曲目共享 ⇒ 一首歌降档 → 10 分钟内全平台所有曲目的高档消失。
+{
+	%path = (A => $srcA);
+	$enabled_ids{list} = ['A'];      # 只留 A：这样"某档只剩被熔断的源"才是**整档**（见桩注释）
+	run(want => 'flac24bit', deliver => { A => 'mp3-128' });
+	my $bs = Plugins::LxMusic::Helper::_breaker_state();
+	check('10a 交付档过低不触发熔断（bad 为空）', !(scalar keys %{ $bs->{bad} }),
+		'bad=' . join(',', keys %{ $bs->{bad} }));
+	check('10b 交付档过低不计入失败计数（fail 为空）', !(scalar keys %{ $bs->{fail} }),
+		'fail=' . join(',', keys %{ $bs->{fail} }));
+
+	# 10c 就算某档**整档被熔断**，本轮也要半开重试一次（防"一次降档→永远降档"）。
+	#     判别点 = **交付发生在哪一档**：半开重试成功 ⇒ 交付档位是 `flac24bit`；
+	#     若没半开（旧行为），A 只会在 flac 档被派发 ⇒ 交付档位是 `flac`。
+	#     （第一版按 URL 判断，不具判别力：同一个交付串在 flac 档也会命中 `/flac-24/`。）
+	run(want => 'flac24bit', deliver => { A => 'flac-24' }, pretrip => ['A|mg|flac24bit']);
+	check('10c 整档被熔断时仍半开重试该档（交付档位 = flac24bit）',
+		@got == 1 && $got[0]{ok} && (($got[0]{quality} // '') eq 'flac24bit'),
+		@got ? ($got[0]{quality} // '?') : 'none');
+	my @tiers10 = map { $_->{info}{type} } @launched;
+	check('10d 半开重试确实派发了 flac24bit 档',
+		(scalar(grep { $_ eq 'flac24bit' } @tiers10)) ? 1 : 0,
+		'tiers=' . join(',', @tiers10));
+	%path = (A => $srcA, B => $srcB);
+	delete $enabled_ids{list};       # 恢复"两个源都在"的默认桩状态
 }
 
 print $failed ? "\nFAILED ($failed)\n" : "\nALL PASS\n";
