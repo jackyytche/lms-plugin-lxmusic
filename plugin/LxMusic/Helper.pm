@@ -940,8 +940,15 @@ sub resolveTrack {
 			}
 			push @tries, { source => $src->{name}, quality => $q, why => 'verify: ' . ($pi->{error} // '?'), %$tm };
 			$log->warn("LxMusic resolve: verify rejected [" . $src->{name} . "] $q: " . ($pi->{error} // '?'));
-			_src_failed(_src_key($src, $plat, $q), ($src->{name} // '?') . "\@$q");   # 0.11.57 熔断计数
-			_score_note(_score_key($src, $plat), 0, $tm->{ms});   # 0.11.63：校验被拒也算这个源在这平台上不靠谱
+			# ⚠️⚠️ 0.11.103：**验链失败不再计入熔断/评分**。
+			# 理由与 `tier-too-low` 完全一样：熔断键是 `源|平台|档位`，**没有曲目维度**；
+			# 而"这个源为这一首生成的链 404 了/是空体"是**按曲目**的事实，却把 600s 的平台级封禁
+			# 也一起施加给了别的曲目。现场（用户 2026-10-03 "mg 全是低码率"）：唯一还能给 mg 无损的
+			# 玉宁熙，其链接**偶发 404**（同一首同一档几分钟后再试就 `ok 354ms` 给出真 FLAC），
+			# 两次偶发就把它在 mg 上封 600s ⇒ 用户看到"整平台全是 128k"。
+			# 现在：记 tries + warn（可诊断），但**不封、不动评分**。
+			# 只把**真实传输失败**（超时/worker 停/连不上/加密容器）留给熔断——
+			# 那才是"这个源在这个平台坏了"，与具体哪一首无关。
 			$settle->();
 		}, $prio);
 		return;
@@ -1020,9 +1027,24 @@ sub resolveTrack {
 								. "] needs an engine feature we do not have yet: $need");
 							$why = "engine-unsupported:$need (plugin engine gap, not the source's fault) | $why";
 						}
-						push @tries, { source => $src->{name}, quality => $q, why => $why, %tm };
-						_src_failed(_src_key($src, $plat, $q), ($src->{name} // '?') . "\@$q");   # 0.11.57 熔断计数
-						_score_note(_score_key($src, $plat), 0, $tm{ms});   # 0.11.63 排序用
+						# ⚠️⚠️ 0.11.103：**"本机原因"不许计入熔断/评分**。
+						# `_err()` 的返回带 `why => 'local'`（例：`source busy (hostile queue full)` ——
+						# 那是**我们自己的准入闸**：慢源被 `%WORKER_BAD` 转 fork + 每源并发 1，
+						# 而并行窗口把同一个源在多个档同时派出去，第 3 个请求必然被"队列满"拒掉）。
+						# 旧代码把这个**我们自己造成的**拒绝记成"源失败" ⇒ 连续 2 次就把该源在该平台该档
+						# 熔断 600s ⇒ **一个只是慢、但可能给无损的源被我们锁死**（现场：玉宁熙从 mg 的
+						# `tries` 里整段消失，而同一首它在宿主侧独立实测能给 1000.5kbps FLAC）。
+						# 引擎缺口（engine-unsupported）同理——那是我们没实现，不是源不行。
+						my $local_fault = (($res->{why} // '') eq 'local')
+							|| ($why =~ /engine-unsupported|ENGINE_UNSUPPORTED/);
+						push @tries, {
+							source => $src->{name}, quality => $q, %tm,
+							why => ($local_fault ? "local-fault: $why" : $why),
+						};
+						unless ($local_fault) {
+							_src_failed(_src_key($src, $plat, $q), ($src->{name} // '?') . "\@$q");   # 0.11.57 熔断计数
+							_score_note(_score_key($src, $plat), 0, $tm{ms});   # 0.11.63 排序用
+						}
 						return $settle->();
 					}
 					# 0.11.89：**厂商加密容器当场判死**（第二十三轮：用户报的"kw 榜单高码率经常无声"）。

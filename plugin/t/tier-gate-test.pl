@@ -55,7 +55,7 @@ sub check {
 }
 
 # ---------- 桩：request / probeUrl / Sources ----------
-my (@launched, %cb, %path, @got, %cb_info, %enabled_ids);
+my (@launched, %cb, %path, @got, %cb_info, %enabled_ids, %local_reject, %probe_reject);
 # ⚠️ 0.11.102：回调**按 (源|档位) 存**，不是按源 —— 并行窗口会把同一个源在不同档**同时**派发出去，
 # 旧写法 `%cb{$id}` 会被后一次派发覆盖 ⇒ 只 fire 最后一次那个档的交付，
 # "半开重试是否真的发生"就测不出来（判别性用例 10c 第一版就这么假失败）。
@@ -68,6 +68,12 @@ my %deliver_of;      # 源 id => 该源这次"交付"的 URL（由 probeUrl 按�
 		my ($class, %a) = @_;
 		my ($id) = grep { $path{$_} eq $a{source} } keys %path;
 		my $q = ($a{info} || {})->{type} // '?';
+		# 0.11.103：模拟**本机准入闸**的立即拒绝（`_err('source busy (hostile queue full)')`
+		# 的形态：ok=0 + why='local'），用来验证"本机原因不得计入熔断/评分"。
+		if ($local_reject{"$id|$q"}) {
+			return $a{cb}->({ ok => 0, data => undef, why => 'local', logs => [], alerts => [],
+				error => 'source busy (hostile queue full)' });
+		}
 		push @launched, { id => $id, info => $a{info} };
 		$cb{"$id|$q"} = $a{cb};
 		$cb_info{"$id|$q"} = $a{info};      # 0.11.102：判别"这次交付发生在哪一档"
@@ -81,6 +87,12 @@ my %deliver_of;      # 源 id => 该源这次"交付"的 URL（由 probeUrl 按�
 	*Plugins::LxMusic::Helper::probeUrl = sub {
 		my ($class, $url, $pcb) = @_;
 		my $secs = 267;
+		# 0.11.103：注入"坏链"（能拿到 URL、但探测判死）——用来验证验链失败不封平台。
+		# URL 形如 `http://cdn.example/<交付标记>/<源id>.flac` ⇒ 按**源 id**（末段）判。
+		my ($rid) = $url =~ m{/([^/]+)\.(?:mp3|flac|ogg)$};
+		if ($rid && $probe_reject{$rid}) {
+			return $pcb->({ ok => 0, error => 'HTTP 404' });
+		}
 		my %m = (
 			'mp3-128' => { magic => 'mp3',  len => int(128 * 1000 / 8 * $secs) },
 			'mp3-320' => { magic => 'mp3',  len => int(320 * 1000 / 8 * $secs) },
@@ -137,6 +149,8 @@ sub run {
 		Plugins::LxMusic::Helper::_src_failed($k, $k);
 		Plugins::LxMusic::Helper::_src_failed($k, $k);
 	}
+	# 0.11.103：本机准入拒绝注入（`"源|档位" => 1`）
+	%local_reject = %{ $opt{local_reject} || {} };
 	Plugins::LxMusic::Helper->resolveTrack(
 		music => $track, src => 'mg', type => $opt{want},
 		cb    => sub { push @got, $_[0] },
@@ -390,6 +404,52 @@ sub run {
 		'tiers=' . join(',', @tiers10));
 	%path = (A => $srcA, B => $srcB);
 	delete $enabled_ids{list};       # 恢复"两个源都在"的默认桩状态
+}
+
+# ---------- 11. 0.11.103：**本机原因**（准入拒绝/引擎缺口）不得被当成"源的失败" ----------
+# 现场：慢源被 `%WORKER_BAD` 转 fork + 每源并发 1，而并行窗口把同一个源在多个档同时派出去，
+# 第 3 个请求必然被"队列满"拒绝 —— 那是**我们自己的闸**，旧代码却记成 `_src_failed`
+# ⇒ 连续 2 次就把"只是慢、但可能给无损"的源熔断 600s（玉宁熙从 mg 的 tries 里整段消失，
+# 而同一首它在宿主侧独立实测能给 1000.5kbps FLAC）。
+{
+	%path = (A => $srcA, B => $srcB);
+	$enabled_ids{list} = [ 'A', 'B' ];
+	run(want => 'flac', deliver => { B => 'flac-16' }, local_reject => { 'A|flac' => 1 });
+	my $bs11 = Plugins::LxMusic::Helper::_breaker_state();
+	check('11a 本机准入拒绝不触发熔断（bad 为空）', !(scalar keys %{ $bs11->{bad} }),
+		'bad=' . join(',', keys %{ $bs11->{bad} }));
+	check('11b 本机准入拒绝不计入失败计数（fail 为空）', !(scalar keys %{ $bs11->{fail} }),
+		'fail=' . join(',', keys %{ $bs11->{fail} }));
+	check('11c 本机拒绝不阻塞阶梯（由 B 交付）',
+		@got == 1 && $got[0]{ok} && (($got[0]{quality} // '') eq 'flac'),
+		@got ? ($got[0]{quality} // '?') : 'none');
+	check('11d tries 里记成 local-fault（可诊断，不伪装成源错）',
+		(scalar(grep { ($_->{why} // '') =~ /^local-fault:/ } @{ ($got[0] || {})->{tries} || [] })) ? 1 : 0,
+		join(' | ', map { $_->{why} // '?' } @{ ($got[0] || {})->{tries} || [] }));
+	%local_reject = ();
+	delete $enabled_ids{list};
+}
+
+# ---------- 12. 0.11.103：验链失败（坏链）同样不得平台级封禁 ----------
+# 现场：玉宁熙给 mg 生成的链**偶发 404**（同一首同一档几分钟后再试就成功），旧代码两次 404
+# 就把它在 mg 上封 600s ⇒ 用户看到"整平台全是 128k"。坏链是**按曲目**的事实，
+# 而熔断键 `源|平台|档位` 没有曲目维度 ⇒ 不该用它来封平台。
+{
+	%path = (A => $srcA, B => $srcB);
+	$enabled_ids{list} = [ 'A', 'B' ];
+	# A 在**每一档**都回坏链（探测 404），B 正常交付 ⇒ 断言 A 不被封、且由 B 交付
+	%probe_reject = ('A' => 1);
+	run(want => 'flac', deliver => { A => 'flac-16', B => 'flac-16' });
+	my $bs12 = Plugins::LxMusic::Helper::_breaker_state();
+	check('12a 验链失败不触发熔断（bad 为空）', !(scalar keys %{ $bs12->{bad} }),
+		'bad=' . join(',', keys %{ $bs12->{bad} }));
+	check('12b 验链失败不计入失败计数（fail 为空）', !(scalar keys %{ $bs12->{fail} }),
+		'fail=' . join(',', keys %{ $bs12->{fail} }));
+	check('12c tries 里仍能看到 verify: 记录（可诊断）',
+		(scalar(grep { ($_->{why} // '') =~ /^verify:/ } @{ ($got[0] || {})->{tries} || [] })) ? 1 : 0,
+		join(' | ', map { $_->{why} // '?' } @{ ($got[0] || {})->{tries} || [] }));
+	%probe_reject = ();
+	delete $enabled_ids{list};
 }
 
 print $failed ? "\nFAILED ($failed)\n" : "\nALL PASS\n";
