@@ -506,13 +506,25 @@ set_pref('metaCacheDays', 30);
 		open(my $t2, '<', $setpm) or die "open $setpm: $!";
 		my $sp = <$t2> // ''; close $t2;
 		my ($list) = $sp =~ /sub\s+prefs\s*\{.*?qw\((.*?)\)/s;
-		my %reg = map { $_ => 1 } split /\s+/, ($list // '');
+		# ⚠️ `split /\s+/` 对**以换行开头**的 qw 列表会吐出一个空串元素 ⇒ 反向护栏必须 `grep { length }`
+		# （第一版没滤，结果报 "no control: " 这种看起来像 bug 的空名单）。
+		my %reg = map { $_ => 1 } grep { length } split /\s+/, ($list // '');
 		my %seen;
 		my @dead;
 		while ($th =~ /name="pref_([A-Za-z0-9_]+)"/g) { $seen{$1} = 1 }
 		push @dead, $_ for grep { !$reg{$_} } sort keys %seen;
 		check('★ 结构护栏：模板里的每个 pref_* 控件都在 Settings::prefs() 里注册（没有"死控件"）',
 			!@dead ? 1 : 0, 'unregistered: ' . join(',', @dead));
+
+		# ★ 0.11.101：**反向**护栏 —— `prefs()` 名单里注册了的项，模板里必须有对应控件。
+		#   动机是 0.11.98 轮的一次自伤：有人往 basic.html **手加**了 `pref_tierGuard` 控件，却没同步
+		#   `tmp/mk_settings_template.py`（模板由它生成）；0.11.101 重新生成模板时那个开关就被悄悄冲掉，
+		#   直到设备上读设置页才发现（而且"整表回放"还顺手把它存成了 off）。
+		#   反向护栏 + `precheck.ps1` 里新增的 `mk_settings_template.py --check` 两道一起兜。
+		#   实测两者本来就对称（27/27），所以这条不是"新增约束"，而是**把已知状态钉死**。
+		my @nocontrol = grep { !$seen{$_} } sort keys %reg;
+		check('★ 结构护栏（反向）：prefs() 里注册的每一项都有对应的 pref_* 控件',
+			!@nocontrol ? 1 : 0, 'no control: ' . join(',', @nocontrol));
 	}
 
 	# warmCovers 的"空串 ⇒ 默认 3"在 cover-warm-test.pl 里测（那里有 kw/kg 行的桩与 _coverResolve 打桩）

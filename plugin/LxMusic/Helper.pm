@@ -199,6 +199,11 @@ sub qualityLadder {
 	my %have = (ref($track->{types}) eq 'ARRAY')
 		? map { ($_->{type} => 1) } grep { ref $_ eq 'HASH' && $_->{type} } @{ $track->{types} }
 		: ();
+	# 0.11.100：`hires` 是**源侧**档位（各平台 vendored SDK 的 types[] 从不产出它，PC 端也没有这一档），
+	# 所以"曲目声明有 flac24bit"就该**允许试一次** hires —— 源可能真给 ≥96kHz。
+	# 反之**不成立**（决策 D2）：源只声明 flac24bit **不算**能满足 hires，那由能力表在"源"维度裁。
+	# ⚠️ 只在 `%have` 非空时补键，否则会把"没有 types ⇒ 不裁剪"变成"只认 hires"。
+	$have{hires} = 1 if %have && $have{flac24bit};
 	# 源声明支持的档位（运行时探测；未知则不裁剪）
 	my %decl = ($declared && ref $declared eq 'ARRAY') ? map { ($_ => 1) } @$declared : ();
 

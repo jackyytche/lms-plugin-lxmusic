@@ -726,19 +726,21 @@ sub _trackItems {
 
 		# 队列行的码率估算（0.11.11）：SDK 的 types[].size 给了各档位文件体积，
 		# 体积 ÷ 时长 = 估算码率。播放后再由真实探测值覆盖（_finish_resolve）。
-		# kw 的 types 没有 size ⇒ 估不出来（播放后仍有真值），不硬造。
+		# 0.11.100：**只认"行档位自己那一档"的声明体积**（`$exact`）。旧写法 `$exact || $biggest`
+		# 在行档位没被声明时退用"最大的一档"（通常是 flac24bit）⇒ 标签写 flac/320k、码率却按
+		# 24bit 体积算，同一行两个字段自相矛盾。量不到就不写（宁可空着，也不编）。
+		# 另注：这只是"声明体积 ÷ 时长"的**估算**；解析收尾会把真实探测值写回，
+		# 真实值缺失时**清掉**它（见 ProtocolHandler::cache_metadata 的 kbps 语义）。
 		my $est_kbps;
 		if ($secs && ref($t->{types}) eq 'ARRAY') {
-			my ($exact, $biggest);
+			my $exact;
 			for my $ty (@{ $t->{types} }) {
 				next unless ref $ty eq 'HASH';
 				my $b = _bytesOf($ty->{size});
 				next unless $b;
-				$exact   = $b if defined $ty->{type} && $ty->{type} eq $rowq;
-				$biggest = $b if !defined $biggest || $b > $biggest;
+				$exact = $b if defined $ty->{type} && $ty->{type} eq $rowq;
 			}
-			my $bytes = $exact || $biggest;
-			$est_kbps = int($bytes * 8 / 1000 / $secs) if $bytes;
+			$est_kbps = int($exact * 8 / 1000 / $secs) if $exact;
 		}
 
 		# 渲染期发布队列元数据（喜马拉雅 0.1.47 同款）：队列行才有歌名/时长/码率

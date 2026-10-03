@@ -68,13 +68,14 @@
 	<div class="settingSection">
 		<div class="settingGroup">
 			<div class="prefHead">&#x97F3;&#x8D28;</div>
-			<div class="prefDesc hiddenDesc">&#x4E0A;&#x9650;&#x6863;&#x4F4D;&#xFF1B;&#x6E90;&#x6CA1;&#x6709;&#x8BE5;&#x6863;&#x4F4D;&#x65F6;&#x6309;&#x300C;&#x8BE5;&#x66F2;&#x76EE;&#x5B9E;&#x9645;&#x6863;&#x4F4D; &#xD7; &#x6E90;&#x652F;&#x6301;&#x7684;&#x6863;&#x4F4D;&#x300D;&#x81EA;&#x52A8;&#x964D;&#x6863;&#xFF08;&#x5BF9;&#x9F50; PC &#x7AEF; getPlayQuality&#xFF1A;&#x53EA;&#x964D;&#x4E0D;&#x5347;&#xFF0C;&#x6700;&#x4F4E; 128k&#xFF09;</div>
+			<div class="prefDesc hiddenDesc">&#x4E0A;&#x9650;&#x6863;&#x4F4D;&#xFF1B;&#x6E90;&#x6CA1;&#x6709;&#x8BE5;&#x6863;&#x4F4D;&#x65F6;&#x6309;&#x300C;&#x8BE5;&#x66F2;&#x76EE;&#x5B9E;&#x9645;&#x6863;&#x4F4D; &#xD7; &#x6E90;&#x652F;&#x6301;&#x7684;&#x6863;&#x4F4D;&#x300D;&#x81EA;&#x52A8;&#x964D;&#x6863;&#xFF08;&#x5BF9;&#x9F50; PC &#x7AEF; getPlayQuality&#xFF1A;&#x53EA;&#x964D;&#x4E0D;&#x5347;&#xFF0C;&#x6700;&#x4F4E; 128k&#xFF09;&#x3002;Hi-Res &#x662F;**&#x5B9E;&#x6D4B;&#x6863;&#x4F4D;**&#xFF1A;&#x53EA;&#x6709;&#x6D41;&#x7684;&#x91C7;&#x6837;&#x7387;&#x2265;88.2kHz &#x4E14;&#x4F4D;&#x6DF1;&#x2265;24bit &#x624D;&#x4F1A;&#x6807;&#x6210; Hi-Res&#xFF1B;&#x8BA2;&#x9605;&#x6E90;&#x4E0D;&#x58F0;&#x660E; hires &#x65F6;&#x4E0D;&#x4F1A;&#x88AB;&#x5F53;&#x6210; Hi-Res</div>
 			<div class="prefs">
 				<select name="pref_quality" class="stdedit">
 					<option value="128k"[% IF prefs.pref_quality == '128k' %] selected[% END %]>128 kbps&#xFF08;&#x6700;&#x4F4E;&#xFF0C;&#x517C;&#x5BB9;&#x6027;&#x6700;&#x597D;&#xFF09;</option>
 					<option value="320k"[% IF prefs.pref_quality == '320k' %] selected[% END %]>320 kbps&#xFF08;&#x63A8;&#x8350;&#xFF09;</option>
 					<option value="flac"[% IF prefs.pref_quality == 'flac' %] selected[% END %]>FLAC &#x65E0;&#x635F;</option>
-					<option value="flac24bit"[% IF prefs.pref_quality == 'flac24bit' %] selected[% END %]>FLAC 24bit</option>
+					<option value="flac24bit"[% IF prefs.pref_quality == 'flac24bit' %] selected[% END %]>FLAC 24bit&#xFF08;44.1/48kHz &#x7684; 24bit &#x4E5F;&#x7B97;&#x8FD9;&#x4E00;&#x6863;&#xFF09;</option>
+					<option value="hires"[% IF prefs.pref_quality == 'hires' %] selected[% END %]>Hi-Res&#xFF08;&#x5C3D;&#x91CF;&#x8981; &#x2265;96kHz/24bit&#xFF1B;&#x53EA;&#x6709;&#x58F0;&#x660E; hires &#x7684;&#x6E90;&#x51FA;&#x94FE;&#xFF0C;&#x62FF;&#x4E0D;&#x5230;&#x5C31;&#x6309;&#x4E0B;&#x4E00;&#x6863;&#x4EA4;&#x4ED8;&#xFF09;</option>
 				</select>
 				<div style="margin-top:6px"><label><input type="checkbox" name="pref_qualityFallback" value="1" [% IF prefs.pref_qualityFallback %] checked[% END %] /> &#x6E90;&#x6CA1;&#x6709;&#x6240;&#x9009;&#x6863;&#x4F4D;&#x65F6;&#x81EA;&#x52A8;&#x964D;&#x5230;&#x6B21;&#x4E00;&#x6863;&#xFF08;&#x5173;&#x6389;&#x5219;&#x53EA;&#x8BD5;&#x6240;&#x9009;&#x6863;&#x4F4D;&#xFF0C;&#x5931;&#x8D25;&#x5373;&#x62A5;&#x9519;&#xFF09;</label></div>
 				<div style="margin-top:4px"><label><input type="checkbox" name="pref_verifyUrl" value="1" [% IF prefs.pref_verifyUrl %] checked[% END %] /> &#x53D6;&#x94FE;&#x540E;&#x7528; HTTP HEAD &#x6821;&#x9A8C;&#x53EF;&#x64AD;&#xFF08;&#x6321;&#x6389; 403/HTML &#x9519;&#x8BEF;&#x9875;&#xFF0C;&#x907F;&#x514D;&#x201C;&#x9009;&#x4E86; flac &#x5374;&#x6CA1;&#x58F0;&#x201D;&#xFF09;</label></div>

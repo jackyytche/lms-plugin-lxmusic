@@ -81,12 +81,14 @@ my %deliver_of;      # 源 id => 该源这次"交付"的 URL（由 probeUrl 按�
 			'mp3-320' => { magic => 'mp3',  len => int(320 * 1000 / 8 * $secs) },
 			'flac-16' => { magic => 'flac', len => int(1000 * 1000 / 8 * $secs), bits => 16 },
 			'flac-24' => { magic => 'flac', len => int(1800 * 1000 / 8 * $secs), bits => 24 },
+			# 0.11.100：真 Hi-Res 格（24bit + 96kHz）——`_actualTier` 只有两项都量到才给 hires
+			'flac-24-96' => { magic => 'flac', len => int(2900 * 1000 / 8 * $secs), bits => 24, sr => 96000 },
 			'ogg'     => { magic => 'ogg',  len => int(171 * 1000 / 8 * $secs) },
 		);
 		my ($key) = grep { $url =~ m{/\Q$_\E/} } keys %m;
 		my $d = $m{$key} || { magic => 'mp3', len => 0 };
 		$pcb->({ ok => 1, status => 206, magic => $d->{magic}, length => $d->{len},
-			bits => ($d->{bits} || 0), samplerate => 44100, channels => 2 });
+			bits => ($d->{bits} || 0), samplerate => ($d->{sr} || 44100), channels => 2 });
 	};
 	*Plugins::LxMusic::Sources::enabled = sub {
 		return [ { id => 'A', name => 'srcA' }, { id => 'B', name => 'srcB' } ];
@@ -284,6 +286,41 @@ sub run {
 		my @l = $HL->qualityLadder('hires', {}, undef);
 		check('8h hires 的地板（阶梯次一档）= flac24bit', ($l[1] // '') eq 'flac24bit', $l[1] // 'undef');
 	}
+}
+
+# ---------- 9. 0.11.100：请求 hires（真 Hi-Res 档）时的阶梯与闸门 ----------
+{
+	%path = (A => $srcA);
+
+	# 9a 请求 hires、交付 24bit/44.1k ⇒ **接受**（地板 = 阶梯次一档 = flac24bit）
+	run(want => 'hires', deliver => { A => 'flac-24' });
+	check('9a hires 请求 + 24bit/44.1k ⇒ 接受（地板 flac24bit）', @got == 1 && $got[0]{ok},
+		'got=' . scalar(@got));
+
+	# 9b 请求 hires、交付 128k mp3 ⇒ **拒绝**，并继续往下派发
+	run(want => 'hires', deliver => { A => 'mp3-128' });
+	check('9b hires 请求 + 128k mp3 ⇒ 拒绝', @got == 0, 'got=' . scalar(@got));
+	my @tiers9 = map { $_->{info}{type} } @launched;
+	check('9c 拒绝后继续派发到下一档（flac24bit）', (grep { $_ eq 'flac24bit' } @tiers9),
+		'tiers=' . join(',', @tiers9));
+
+	# 9d 请求 hires、交付 96k/24bit ⇒ 接受，且反推档位就是 hires
+	run(want => 'hires', deliver => { A => 'flac-24-96' });
+	check('9d hires 请求 + 96k/24bit ⇒ 接受', @got == 1 && $got[0]{ok}, 'got=' . scalar(@got));
+	my $t9 = Plugins::LxMusic::ProtocolHandler->_actualTier('flc', 2900, 24, $track->{types}, 96000);
+	check('9e 该交付反推出的档位 = hires', ($t9 // 'undef') eq 'hires', $t9 // 'undef');
+
+	# 9f 阶梯：曲目声明了 flac24bit ⇒ 请求 hires 时**第一档就是 hires**（不被曲目 types 裁掉）
+	my @lad = Plugins::LxMusic::Helper->qualityLadder('hires', $track, undef);
+	check('9f 曲目有 flac24bit ⇒ hires 允许参与且排第一',
+		($lad[0] // '') eq 'hires' && ($lad[1] // '') eq 'flac24bit', join(',', @lad));
+
+	# 9g 反向（决策 D2）：曲目**只声明 flac**（没有 flac24bit/也没 hires）⇒ 不硬凑 hires
+	my @lad2 = Plugins::LxMusic::Helper->qualityLadder('hires',
+		{ types => [ { type => '128k' }, { type => '320k' }, { type => 'flac' } ] }, undef);
+	check('9g 曲目只声明 flac ⇒ 阶梯不含 hires', !(grep { $_ eq 'hires' } @lad2), join(',', @lad2));
+
+	%path = (A => $srcA, B => $srcB);
 }
 
 print $failed ? "\nFAILED ($failed)\n" : "\nALL PASS\n";

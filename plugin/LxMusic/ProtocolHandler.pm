@@ -414,6 +414,12 @@ sub _finish_resolve {
 		title   => $info->{name},
 		quality => (defined $tier && length $tier ? $tier : $info->{type}),
 		format  => $fmt,
+		# 0.11.100（假码率根因）：**把真实探测到的码率写回 %METADATA**。
+		# 从前这里只写 samplerate/samplesize/channels，**唯独漏了 kbps** ⇒ 渲染期按
+		# "声明体积 ÷ 时长"写下的估算值（现场 1817）永远留在内存里，而 `getMetadataFor`
+		# 交给 LMS 的 bitrate 读的正是内存这条 ⇒ 面板同时显示 "1817" 与真实交付的 "MP3 128kbps"。
+		# 现在：显式传 `kbps`（没量到就是 undef）⇒ 由 cache_metadata 的新语义**就地清掉旧估算**。
+		kbps       => $kbps,
 		# 0.11.84：采样率/位深/声道也进 %METADATA ⇒ getMetadataFor（LMS 的 remoteMeta）
 		# 能把它们交给 UI（tag T/I/H 的另一条路径，lxm:// 那一行走的就是它）
 		samplerate => $samplerate,
@@ -1220,17 +1226,20 @@ sub explodePlaylist {
 				# 两次 `setRemoteMetadata`，加上 +3s 的尾部补发再写一遍 ⇒ 300 首 ≈ **900 次写库**。
 				# 现在：能解析出封面就**一次写完**（cover+title+secs+kbps+quality），
 				# 指纹随之记下 ⇒ 尾部补发对这 300 行是零写入（实测见 t/publish-dedupe-test.pl）。
+				# 0.11.100：与 `Plugin::_trackItems` 同口径 —— 估算码率**只认行档位（$q）自己**的
+				# 声明体积，不再退用"最大的一档"（那会让行标签与码率互相矛盾）。
 				my $secs = _secs_of_interval($t->{interval});
 				my $est;
 				if ($secs && ref($t->{types}) eq 'ARRAY') {
-					my $biggest;
+					my $exact;
 					for my $ty (@{ $t->{types} }) {
 						next unless ref $ty eq 'HASH';
+						next unless defined $ty->{type} && $ty->{type} eq $q;
 						my $b = eval { Plugins::LxMusic::Plugin::_bytesOf($ty->{size}) };
 						next unless $b;
-						$biggest = $b if !defined $biggest || $b > $biggest;
+						$exact = $b;
 					}
-					$est = int($biggest * 8 / 1000 / $secs) if $biggest;
+					$est = int($exact * 8 / 1000 / $secs) if $exact;
 				}
 				my $cover = eval { _cover_url(($t->{source} || $src), $t) } // '';
 				$class->publishQueueMetadata($u, {
@@ -1634,6 +1643,12 @@ sub cache_metadata {
 	# 旧实现第二个调用把整条记录替换掉 ⇒ cover 变 ''，后续补发就没封面可发（实测 0/100）。
 	# 现在只在"本次给了非空值"时覆盖对应字段。
 	my $old = $METADATA{$url} || {};
+	# 0.11.100：**`kbps` 的语义是"显式给了就以本次为准（含清空）"**，其余字段仍是"非空才覆盖"。
+	# 为什么单独给它开例外：渲染期写的是"声明体积 ÷ 时长"的**估算**码率（现场 1817），
+	# 而解析收尾必须能把它**换成真实值或清掉**；旧的 `$info->{kbps} || $old->{kbps}` 合并
+	# 会把没有量到真实值的场合的旧估算永久留住 ⇒ 面板上"1817"与"MP3 128kbps"并存。
+	# 反向保护：只带封面/歌名/时长的补发**不传这个键**（`exists` 为假）⇒ 不会误清真实值。
+	my $kbps = exists $info->{kbps} ? ($info->{kbps} || 0) : ($old->{kbps} || 0);
 	my %new = (
 		title   => $info->{title}   || $old->{title}   || '',
 		quality => $info->{quality} || $old->{quality} || '',
@@ -1642,7 +1657,7 @@ sub cache_metadata {
 		secs    => $info->{secs}    || $old->{secs}    || 0,
 		# 解析后才知道的真实值（0.11.10）：getMetadataFor 用它们给 UI 发
 		# "格式"标签与**数字**码率（此前误把档位 key 当码率发 ⇒ 队列行显示 br=flac24bit）
-		kbps    => $info->{kbps}    || $old->{kbps}    || 0,
+		kbps    => $kbps,
 		format  => $info->{format}  || $old->{format}  || '',
 		# 0.11.84（A0）：采样率/位深/声道同样按字段合并（getMetadataFor 要发 T/I/H）
 		samplerate => $info->{samplerate} || $old->{samplerate} || 0,
@@ -1690,7 +1705,18 @@ sub publishQueueMetadata {
 
 	# 指纹字段与 `republish_queued_rows` / `republish_known_queued` **逐字一致**
 	# （顺序也一致），否则"发过一次"与"补发时的判断"会各说各话。
-	my $sig = join("\x1f", map { defined $_ ? $_ : '' } @{$info}{qw(cover title secs kbps quality)});
+	# ⚠️⚠️ 0.11.100 踩到的 Perl 坑：**`map { … } @{$info}{qw(…)}}` 会给 `$info` 自动激活
+	# （autovivify）切片里**所有**键**（实测 perl 5.42：即使该切片只作 rvalue、只被 map 消费，
+	# 也会建键；普通 `%h{…}` 切片则不会）。后果：紧随其后的 `exists $info->{kbps}` 恒为真
+	# ⇒ "只带封面的补发"被误判成"显式 kbps=undef" ⇒ 把已量到的真实码率清掉（测试 E4 现场）。
+	# 所以：**是否存在必须在切片之前取好**，且取值一律走 `exists`→单个元素访问，不用切片。
+	my $has_kbps = exists $info->{kbps} ? 1 : 0;
+	my @fp;
+	for my $k (qw(cover title secs kbps quality)) {
+		my $v = exists $info->{$k} ? $info->{$k} : undef;
+		push @fp, (defined $v ? $v : '');
+	}
+	my $sig = join("\x1f", @fp);
 	my $dup = (($REPUBLISHED{$url} || '') eq $sig) ? 1 : 0;
 
 	# 内存态（%METADATA）**照旧合并**：即使不写 LMS，解析出来的字段也要留下
@@ -1698,8 +1724,12 @@ sub publishQueueMetadata {
 		title   => $info->{title},
 		cover   => $info->{cover},
 		secs    => $info->{secs},
-		kbps    => $info->{kbps},       # 0.11.31：补发时要能带上估算码率
 		quality => $info->{quality},
+		# ⚠️ 0.11.100：**只在调用方显式给了 `kbps` 时才透传**。
+		# `cache_metadata` 的新语义是"显式 kbps = 以本次为准（含清空）"，而本条调用里
+		# `_publish_cover` 这类补发**只带 cover** ⇒ 无条件透传会把已经量到的真实码率清成 0
+		# （补发本来是"只补封面"，不该动别的字段）。用 `$has_kbps`（切片之前取好的）判断。
+		($has_kbps ? (kbps => $info->{kbps}) : ()),
 	});
 
 	return 0 if $dup;
@@ -1880,7 +1910,13 @@ sub _actualTier {
 		#   一旦生效就是**假无损标签**（FLAC 的无损压缩率随内容浮动，码率不是可靠判据）。
 		#   新规则：① 采样率已知且 ≤48kHz ⇒ 一律 flac（不吹）；② 采样率也未知（探测没取到
 		#   实体）⇒ 保留旧的码率启发式，避免把"没测到"误报成低档。
-		if (($bits || 0) > 16) {
+		if (($bits || 0) > 16 && $samplerate && $samplerate >= 88200) {
+			# 0.11.100：**真 Hi-Res = 实测 ≥24bit 且 ≥88.2kHz**（两项都必须量到）。
+			# 定义依据：48kHz/24bit **不是** Hi-Res，96kHz/24bit 才是（用户 2026-09-29 明确指出）。
+			# 保守处：位深**没量到**时绝不推 hires（宁可标 flac/flac24bit，也不假报 Hi-Res）。
+			$tier = 'hires';
+		}
+		elsif (($bits || 0) > 16) {
 			$tier = 'flac24bit';
 		}
 		elsif (($bits || 0) > 0) {

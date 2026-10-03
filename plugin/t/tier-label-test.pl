@@ -143,25 +143,33 @@ sub label { return $H->qualityLabel($_[0], $_[1]) }
 #   kw 星海/念心 flac   → 1752.2kbps 24bit 48000Hz
 #   tx 玉宁熙 flac24bit → 2315.1kbps **16bit** 44100Hz（堵死"用码率猜 24bit"的那一格）
 {
-	# 8a 档位键**不变**（方案 B：采样率只细化显示，不改档位集）
-	check('8a kw 96k/24bit ⇒ 档位键仍是 flac24bit',
-		tier('flc', 2903, 24, undef, 96000) eq 'flac24bit',
+	# 8a 0.11.100：实测 ≥24bit 且 ≥88.2kHz ⇒ **hires**；48k/24bit 仍是 flac24bit
+	check('8a kw 96k/24bit ⇒ hires（真 Hi-Res）',
+		tier('flc', 2903, 24, undef, 96000) eq 'hires',
 		tier('flc', 2903, 24, undef, 96000) // 'undef');
-	check('8a kw 48k/24bit ⇒ 档位键同样是 flac24bit',
+	check('8a kw 48k/24bit ⇒ flac24bit（不是 Hi-Res）',
 		tier('flc', 1752, 24, undef, 48000) eq 'flac24bit',
 		tier('flc', 1752, 24, undef, 48000) // 'undef');
+	check('8a 96k/16bit ⇒ flac（位深先说话，位深不够就不是 24bit 也不是 Hi-Res）',
+		tier('flc', 1500, 16, undef, 96000) eq 'flac',
+		tier('flc', 1500, 16, undef, 96000) // 'undef');
+	check('8a 88.2k/24bit ⇒ hires（≥88200 就算）',
+		tier('flc', 2100, 24, undef, 88200) eq 'hires',
+		tier('flc', 2100, 24, undef, 88200) // 'undef');
+	# 保守处：位深**没量到**时绝不推 hires（宁可标 flac24bit，也不假报 Hi-Res）
+	check('8a 位深未知 + 96kHz + 1500kbps ⇒ flac24bit（不假报 Hi-Res）',
+		tier('flc', 1500, 0, undef, 96000) eq 'flac24bit',
+		tier('flc', 1500, 0, undef, 96000) // 'undef');
 
 	# 8b **显示层**能分辨 96k / 48k / 44.1k（这就是用户要的"看得出差别"）
-	check('8b 96k/24bit ⇒ 标签 FLAC 24bit/96k',
-		label('flac24bit', 96000) eq 'FLAC 24bit/96k', label('flac24bit', 96000));
-	check('8b 48k/24bit ⇒ 标签 FLAC 24bit/48k',
-		label('flac24bit', 48000) eq 'FLAC 24bit/48k', label('flac24bit', 48000));
-	check('8b 88.2k/24bit ⇒ 标签 FLAC 24bit/88.2k',
-		label('flac24bit', 88200) eq 'FLAC 24bit/88.2k', label('flac24bit', 88200));
-	check('8b flac16/44.1k ⇒ 标签 FLAC/44.1k',
-		label('flac', 44100) eq 'FLAC/44.1k', label('flac', 44100));
 	check('8b hires/96k ⇒ 标签 Hi-Res/96k',
 		label('hires', 96000) eq 'Hi-Res/96k', label('hires', 96000));
+	check('8b 48k/24bit ⇒ 标签 FLAC 24bit/48k',
+		label('flac24bit', 48000) eq 'FLAC 24bit/48k', label('flac24bit', 48000));
+	check('8b 88.2k/24bit ⇒ 标签 Hi-Res/88.2k',
+		label('hires', 88200) eq 'Hi-Res/88.2k', label('hires', 88200));
+	check('8b flac16/44.1k ⇒ 标签 FLAC/44.1k',
+		label('flac', 44100) eq 'FLAC/44.1k', label('flac', 44100));
 
 	# 8c 采样率未知 ⇒ 标签与 0.11.98 **逐字节相同**（不回归）
 	check('8c 无采样率 ⇒ FLAC 24bit（与旧版一致）',

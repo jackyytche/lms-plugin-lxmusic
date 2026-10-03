@@ -113,5 +113,58 @@ my $n2 = $PH->republish_queued_rows(\@rows);
 check('D3 feed 路径补发同样零写入', $n2 == 0 && $Slim::Music::Info::CALLS == 0,
 	"n=$n2 calls=$Slim::Music::Info::CALLS");
 
+# ---------- E 0.11.100：真实码率必须能覆盖/清掉渲染期的估算（"假码率"根因） ----------
+{
+	my $U3 = 'lxm://m/est1';
+
+	# ① 渲染期（_trackItems）按"声明体积 ÷ 时长"写下的估算
+	$PH->cache_metadata($U3, { title => 'E', quality => 'flac24bit', kbps => 1817 });
+	my $m = $PH->getMetadataFor(undef, $U3);
+	check('E1 估算码率在渲染期可见', (($m || {})->{bitrate} // 0) == 1817,
+		($m || {})->{bitrate} // 'undef');
+
+	# ② 解析收尾量到真实码率 ⇒ 必须覆盖（现场：1817 → 128）
+	$PH->cache_metadata($U3, { quality => '320k', kbps => 128 });
+	$m = $PH->getMetadataFor(undef, $U3);
+	check('E2 真实码率覆盖估算（1817 → 128）', (($m || {})->{bitrate} // 0) == 128,
+		($m || {})->{bitrate} // 'undef');
+
+	# ③ 解析收尾**没量到**（显式传 kbps => undef）⇒ 必须清掉旧值，绝不能留着当真实值显示
+	$PH->cache_metadata($U3, { kbps => 1817 });          # 先回到"有估算"的状态
+	$PH->cache_metadata($U3, { kbps => undef });         # 收尾：显式声明本次没量到
+	$m = $PH->getMetadataFor(undef, $U3);
+	check('E3 没量到真实值时清掉旧预估（面板不再显示假码率）',
+		!defined(($m || {})->{bitrate}), ($m || {})->{bitrate} // 'undef');
+
+	# ④ 只补封面（调用方**不传** kbps 键）⇒ 不许动已量到的真实值
+	$PH->cache_metadata($U3, { kbps => 1411 });
+	$PH->publishQueueMetadata($U3, { cover => 'http://img/e.jpg' });
+	$m = $PH->getMetadataFor(undef, $U3);
+	check('E4 只补封面不会清掉真实码率', (($m || {})->{bitrate} // 0) == 1411,
+		($m || {})->{bitrate} // 'undef');
+}
+
+# ---------- F 源码级护栏：不许再"退用最大一档的体积"估码率 ----------
+{
+	my $root = File::Spec->rel2abs(File::Spec->catdir($FindBin::Bin, '..', 'LxMusic'));
+	my $slurp = sub {
+		my ($f) = @_;
+		open my $fh, '<', File::Spec->catfile($root, $f) or return '';
+		local $/;
+		return <$fh> // '';
+	};
+	my $plug = $slurp->('Plugin.pm');
+	my $ph   = $slurp->('ProtocolHandler.pm');
+	# ⚠️ 护栏必须**跳过注释行**：说明性注释里会引用旧写法（第一版就误命中了自己的注释）。
+	my $code_only = sub {
+		my ($src) = @_;
+		return join("\n", grep { $_ !~ /^\s*#/ } split /\n/, $src);
+	};
+	check('F1 Plugin.pm 不再用 `$exact || $biggest` 估码率',
+		$code_only->($plug) !~ /\$exact\s*\|\|\s*\$biggest/ && length $plug, length $plug);
+	check('F2 ProtocolHandler 的整榜发布不再用"最大一档"体积',
+		$code_only->($ph) !~ /\$biggest\s*\*\s*8/ && length $ph, length $ph);
+}
+
 print $failed ? "\n$failed FAILED\n" : "\nALL PASS\n";
 exit($failed ? 1 : 0);
