@@ -2661,9 +2661,10 @@ sub _webPreview {
 				$t .= ' friendly=0' if $_->{ok} && defined $_->{friendly} && !$_->{friendly};
 				$t .= ' [' . $_->{path} . ']' if $_->{path};
 				# 0.11.105：把该次尝试**实际拿到的 URL** 也渲染出来（诊断盲区）。
-				# 起因：设备 vs 宿主"同一源同一首，宿主 FLAC / 设备 404"那条查不下去，
-				# 因为 tries 里没有 URL，只能靠日志；现在工具页直接看得到。
+				# 0.11.108：**带上尾巴**（`…tail`）—— 档位/后缀（`.flac`/`.mp3`）在 URL 末尾，
+				# 只看 160 字前缀会把"同一段 migu 前缀"误判成"同一条链"（本轮就差点踩）。
 				$t .= ' → ' . $_->{url} if $_->{url};
+				$t .= ' …' . $_->{url_tail} if $_->{url_tail};
 				encode_entities($t);
 			} @{ $res->{tries} || [] });
 			my $html;

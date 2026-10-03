@@ -816,12 +816,18 @@ sub resolveTrack {
 	my $inflight = 0;
 	# 0.11.107：**同一个源同时只允许一个候选在飞**（见派发器里的说明）。
 	my %busy_src;
+	# 0.11.108：在飞候选按**档位**计数 + 被压住的交付（音质优先，见 $finish 里的说明）。
+	my %inflight_tier;
+	my $held;
+	my $grace_armed = 0;         # 0.11.108：等待更高档的**上限**只武装一次
+	my $deliver_held;            # 0.11.108：前向声明（$finish 里要用；定义在 $finish 之后）
 	my $done     = 0;
 	my $dispatch;
 
 	# 交付一个候选（写 tries + 回调）；$friendly 标记是否播放器友好
 	my $finish = sub {
 		my ($src, $q, $url, $tm, $friendly, $verified, $kbps, $magic, $len, $bits) = @_;
+		my $force = $_[10];              # 0.11.108：真 = 跳过"等更高档"的压单（候选耗尽/预算到期时强制交付）
 		return if $done;                 # 并行窗口下只交付一次
 		my $fmt = $class->lmsFormat($magic, $url);
 
@@ -859,7 +865,7 @@ sub resolveTrack {
 			my $got_rank = Plugins::LxMusic::ProtocolHandler::tier_rank($got) // 0;
 			if ($floor && $got_rank && $got_rank < $floor) {
 				push @tries, { source => $src->{name}, quality => $q, why => 'tier-too-low',
-					delivered => $got, url => substr($url, 0, 160), %$tm };
+					delivered => $got, url => substr($url, 0, 160), url_tail => substr($url, -60), %$tm };
 				$log->warn('LxMusic resolve: [' . ($src->{name} // '?') . "] $q rejected: "
 					. "delivered " . ($got // '?') . ($kbps ? " ~${kbps}kbps" : '')
 					. " is below the ladder floor " . $l[1]);
@@ -880,9 +886,50 @@ sub resolveTrack {
 			}
 		}
 
+		# ── 0.11.108 质量优先：**更高档还在飞 ⇒ 先压住这份低档交付** ──────────────
+		# 现场（用户 2026-10-03："mg 仍旧是 128k mp3"）：阶梯是"档位为外层"，但**慢源**
+		# （玉宁熙，设备上 4~20s）还在跑 flac/flac24bit 时，低档候选（墨澜@320k）已经交付
+		# 128k mp3 并被接受 ⇒ `$done=1` ⇒ 慢源的高档结果到了也没人要。
+		# 用户口径「音质优先、起播慢可忍」⇒ 只要仍有**更高档的候选在飞**，就先把这份交付
+		# **压住**（保留其中最高的一档），让高档先跑完；高档全部失败/候选耗尽/预算到期时
+		# 再交付压住的那一份（绝不因此变成 FAIL）。
+		if (!$force && $want_rank && _pref('tierGuard', 1)) {
+			my $higher = 0;
+			for my $t (keys %inflight_tier) {
+				next unless $inflight_tier{$t};
+				$higher = 1 if (Plugins::LxMusic::ProtocolHandler::tier_rank($t) // 0) > $want_rank;
+			}
+			if ($higher) {
+				my $held_rank = $held ? ($held->{rank} // 0) : -1;
+				if ($want_rank > $held_rank) {
+					$held = { q => $q, rank => $want_rank,
+						args => [ $src, $q, $url, $tm, $friendly, $verified, $kbps, $magic, $len, $bits ] };
+				}
+				$log->warn('LxMusic resolve: [' . ($src->{name} // '?')
+					. "] $q 已可取链，但更高档仍在飞 —— 先压住（音质优先）");
+				# ⚠️ 等待**必须有上限**：LMS 只等 4~8s，无上限地把"能响"拖成"没声"就不是优化了。
+				# 默认 **3s 抢跑窗口**（`qualityHeadStart` 可调，0 = 旧行为：谁先来谁交付）。
+				# 口径：能在这个窗口内给出更高档的源，就等它；等不到就用低档保底（绝不静默变慢）。
+				if (!$grace_armed) {
+					$grace_armed = 1;
+					my $g = $a{qualityHeadStart};
+					$g = 3 unless defined $g && $g =~ /^\d+$/;
+					if ($g > 0) {
+						my $go = {};
+						Slim::Utils::Timers::setTimer($go, time() + $g, sub {
+							return if $done;
+							$log->warn("LxMusic resolve: 更高档 ${g}s 内没来 —— 交付压住的那一份（保底，别让用户没声）");
+							$deliver_held->();
+						});
+					}
+				}
+				$cand_settle->() if $cand_settle;
+				return;
+			}
+		}
+
 		$done = 1;
-		_src_ok(_src_key($src, $plat, $q));   # 0.11.57：成功即清零该三元组的失败计数
-		# 0.11.63：记下"这个源在这个平台上成功且多快" ⇒ 影响后续派发顺序
+		_src_ok(_src_key($src, $plat, $q));   # 0.11.57：成功即清零该三元组的失败计数		# 0.11.63：记下"这个源在这个平台上成功且多快" ⇒ 影响后续派发顺序
 		_score_note(_score_key($src, $plat), 1, $tm->{ms});
 		my $suspect = ($kbps && $kbps < 64) ? 1 : 0;
 		if ($suspect) {
@@ -926,6 +973,16 @@ sub resolveTrack {
 			tries      => \@tries,
 		});
 		return;
+	};
+
+	# 0.11.108：交付"被更高档压住"的那一份（强制，`$force=1` 跳过压单检查，避免自我循环）。
+	$deliver_held = sub {
+		return 0 unless $held;
+		my $h = $held;
+		$held = undef;
+		$log->warn('LxMusic resolve: 更高档都没成 —— 交付先前压住的那一份（' . ($h->{q} // '?') . '）');
+		$finish->(@{ $h->{args} }, 1);
+		return 1;
 	};
 
 	# 校验后交付（verifyUrl 关掉则直接交付）
@@ -981,6 +1038,14 @@ sub resolveTrack {
 		my $owner = {};
 		Slim::Utils::Timers::setTimer($owner, time() + $budget, sub {
 			return if $done;
+			# 0.11.108：预算到期时，**如果手里压着一份可播交付，就交付它**（音质优先，但绝不白等成 FAIL）。
+			# 现场：慢源 4~20s，若预算先到而又压着墨澜@320k 的 128k，旧行为是直接 FAIL ⇒ 用户"点了没声"。
+			if ($held) {
+				my $h = $held;
+				$held = undef;
+				$log->warn('LxMusic resolve: 预算到期，改交付先前压住的那一份（' . ($h->{q} // '?') . '）');
+				return $finish->(@{ $h->{args} }, 1);
+			}
 			$done = 1;
 			my $why = "resolve budget ${budget}s exceeded";
 			$log->warn("LxMusic resolve: $why (queued=" . scalar(@cand) . " inflight=$inflight)");
@@ -1018,12 +1083,14 @@ sub resolveTrack {
 
 			$inflight++;
 			$busy_src{ $src->{id} // '' }++;
+			$inflight_tier{$q}++;            # 0.11.108：质量优先的等待判据
 			my $settled = 0;
 			my $settle = sub {              # 每个候选只结算一次，并立刻补位
 				return if $settled;
 				$settled = 1;
 				$inflight--;
 				$busy_src{ $src->{id} // '' }--;
+				$inflight_tier{$q}--;
 				$dispatch->();
 			};
 			$cand_settle = $settle;         # 0.11.98：$finish 拒绝交付档位时要用它结算
@@ -1126,14 +1193,32 @@ sub resolveTrack {
 
 		return if $done || $inflight > 0;    # 还有在飞的候选 ⇒ 等它结算
 
+		# 0.11.108：候选耗尽且没有在飞 ⇒ 先交付"被更高档压住"的那一份（音质优先），
+		# 除非**兜底中转链**里还有档位更高、值得一试的（那就先试它，失败再回来交付压住的）。
+		if ($held) {
+			my $best_d_rank = 0;
+			for my $d (@deferred) {
+				my $r = Plugins::LxMusic::ProtocolHandler::tier_rank($d->{q}) // 0;
+				$best_d_rank = $r if $r > $best_d_rank;
+			}
+			return if $best_d_rank <= ($held->{rank} // 0) && $deliver_held->();
+		}
+
 		# 没有"播放器友好"的直链 ⇒ 退而求其次，用兜底的中转链（先校验一次再交付）
 		if (@deferred) {
 			my $d = shift @deferred;
 			$log->warn('LxMusic resolve: 没有"播放器友好"直链，改用兜底中转链 ['
 				. ($d->{src}{name} // '?') . '] ' . substr($d->{url}, 0, 80));
 			$inflight++;
+			$inflight_tier{ $d->{q} }++;     # 0.11.108：兜底中转链也要计入（质量优先的等待判据）
 			my $settled = 0;
-			my $settle = sub { return if $settled; $settled = 1; $inflight--; $dispatch->(); };
+			my $settle = sub {
+				return if $settled;
+				$settled = 1;
+				$inflight--;
+				$inflight_tier{ $d->{q} }--;
+				$dispatch->();
+			};
 			return $verifyThenFinish->($d->{src}, $d->{q}, $d->{url}, $d->{tm}, 0, $settle);
 		}
 

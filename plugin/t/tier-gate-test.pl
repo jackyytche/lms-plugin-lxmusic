@@ -56,7 +56,7 @@ sub check {
 
 # ---------- 桩：request / probeUrl / Sources ----------
 my (@launched, %cb, %path, @got, %cb_info, %enabled_ids, %local_reject, %probe_reject, %timeout_reject,
-	%inflight_src, $max_same);
+	%inflight_src, $max_same, %hold_fire);
 # ⚠️ 0.11.102：回调**按 (源|档位) 存**，不是按源 —— 并行窗口会把同一个源在不同档**同时**派发出去，
 # 旧写法 `%cb{$id}` 会被后一次派发覆盖 ⇒ 只 fire 最后一次那个档的交付，
 # "半开重试是否真的发生"就测不出来（判别性用例 10c 第一版就这么假失败）。
@@ -165,6 +165,7 @@ sub run {
 	%timeout_reject = %{ $opt{timeout_reject} || {} };   # 0.11.106：超时注入
 	%inflight_src = ();                                  # 0.11.107：同源并发统计
 	$max_same = 0;
+	%hold_fire = %{ $opt{hold_fire} || {} };             # 0.11.108：压住某些候选不 fire
 	Plugins::LxMusic::Helper->resolveTrack(
 		music => $track, src => 'mg', type => $opt{want},
 		cb    => sub { push @got, $_[0] },
@@ -183,8 +184,13 @@ sub run {
 			next if $fired{$k};
 			push @todo, [ $k, $e ];
 		}
-		last unless @todo;
-		for my $t (@todo) {
+		# 0.11.108：`hold_fire` 让某些候选**先不 fire**（模拟"慢源还在飞"）——
+		# 用来验证"更高档在飞时，低档交付被压住"；只剩被压住的候选时才放开。
+		my @later = grep { $hold_fire{ $_->[0] } } @todo;
+		my @now   = grep { !$hold_fire{ $_->[0] } } @todo;
+		@now = @later if !@now;
+		last unless @now;
+		for my $t (@now) {
 			my ($k, $e) = @$t;
 			$fired{$k} = 1;
 			my ($sid, $tier) = split /\|/, $k, 2;
@@ -513,6 +519,29 @@ sub run {
 	run(want => 'flac24bit', deliver => { A => 'flac-24' });
 	check('15a 同源同时只派一个候选（不再自己把自己拒成 busy）', $max_same == 1,
 		"max_same=$max_same launched=" . scalar(@launched));
+	delete $enabled_ids{list};
+}
+
+# ---------- 16. 0.11.108：**更高档还在飞 ⇒ 低档交付必须被压住**（音质优先） ----------
+# 现场（用户 2026-10-03 "mg 仍旧是 128k mp3"）：慢源（玉宁熙，设备上 4~20s）还在跑 flac/flac24bit 时，
+# 低档候选（墨澜@320k）已经交付 128k mp3 并被接受 ⇒ 慢源的高档结果到了也没人要。
+# 口径是"音质优先、起播慢可忍"⇒ 压住低档，等高档跑完；高档全败/预算到期再交付压住的那份。
+{
+	%path = (A => $srcA, B => $srcB);
+	$enabled_ids{list} = [ 'A', 'B' ];
+	run(
+		want         => 'flac24bit',
+		# 兜底：**每个**候选都能结算（否则未 fire 的候选会让窗口一直满着，收尾永远不触发）
+		deliver      => { A => 'mp3-128', B => 'mp3-128' },
+		# A 在 flac24bit 档给真无损（且被压住不 fire = "慢源还在飞"）
+		deliver_tier => { flac24bit => { A => 'flac-24' } },
+		hold_fire    => { 'A|flac24bit' => 1 },
+	);
+	check('16a 更高档仍在飞时，低档交付被压住（最终交付 = flac24bit）',
+		@got == 1 && (($got[0]{quality} // '') eq 'flac24bit'),
+		@got ? ($got[0]{quality} // '?') : 'none');
+	check('16b 只交付一次（压住的那份没有被抢先交付）', @got == 1, scalar(@got));
+	%hold_fire = ();
 	delete $enabled_ids{list};
 }
 
