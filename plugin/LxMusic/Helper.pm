@@ -80,6 +80,9 @@ my %SRC_FAIL;      # key => 连续失败次数
 my %SRC_BAD;       # key => 熔断时间
 my $SRC_BAD_N   = 2;
 my $SRC_BAD_TTL = 600;
+# 0.11.111：上闸后的**半开冷却**——过了这个秒数就放一次（见 `_src_tripped` 的说明）。
+# 取值权衡：太短（<30s）对"真死源"等于没闸；太长又会重现"偶发两次错误 → 整档消失 10 分钟"。
+my $SRC_RETRY_TTL = 90;
 
 # 0.11.58：**源能力表**（源文件路径 => { 平台 => { name, qualitys=>{...}, actions=>{...} } }）。
 # 权威来源：源自己在 `lx.send('inited', {sources:{kw:{qualitys:[...]}}})` 里声明（PC 端
@@ -402,7 +405,16 @@ sub _src_key {
 sub _src_tripped {
 	my $k = shift;
 	my $t = $SRC_BAD{$k} or return 0;
-	return (time() - $t) < $SRC_BAD_TTL ? 1 : 0;
+	my $age = time() - $t;
+	# ⚠️⚠️ 0.11.111：**半开冷却**。原来"上闸后 600s 内一律不生成候选"太粗暴：
+	# 任何**按曲目**的错误（例如"这一首没有无损条目"、某曲的链 404、源返回的 JSON 异常）
+	# 只要连来两次，就会让该源在该平台该档**整档消失 10 分钟**——本 session 里为此修了
+	# 五处（too-low/verify/local/timeout/同源并发），但**只要源的报错文案落在分类之外**
+	# 就会复现（0.11.110 实测：自建"咪咕无损桥"两次按曲目失败后被封，第 5 首起整段消失）。
+	# 现在：上闸后**冷却 $SRC_RETRY_TTL 秒就放一次**（半开）。失败则 `_src_failed` 把时间戳
+	# 刷新 ⇒ 再等一个冷却周期；成功则 `_src_ok` 清零。既有"防打爆"作用，又不会永久锁死。
+	return 0 if $age >= $SRC_RETRY_TTL;
+	return 1;
 }
 
 # 记一次失败：连续 $SRC_BAD_N 次就给这个三元组上闸（只在"刚上闸"那一次告警）
@@ -430,7 +442,17 @@ sub _src_ok {
 sub _breaker_reset { %SRC_FAIL = (); %SRC_BAD = (); return 1 }
 
 sub _breaker_state {
-	return +{ fail => { %SRC_FAIL }, bad => { %SRC_BAD }, n => $SRC_BAD_N, ttl => $SRC_BAD_TTL };
+	return +{ fail => { %SRC_FAIL }, bad => { %SRC_BAD }, n => $SRC_BAD_N, ttl => $SRC_BAD_TTL,
+		retry_ttl => $SRC_RETRY_TTL };
+}
+
+# 0.11.111：把某个三元组的上闸时间**往前拨**（测试用）——验证"冷却后半开"这条行为需要它，
+# 否则测试要真等 90 秒。只改内存里的时间戳，不改语义。
+sub _breaker_age {
+	my ($k, $secs) = @_;
+	return 0 unless exists $SRC_BAD{$k};
+	$SRC_BAD{$k} = time() - ($secs || 0);
+	return 1;
 }
 
 # ---------- 0.11.58：源能力表 ----------
@@ -886,14 +908,17 @@ sub resolveTrack {
 			}
 		}
 
-		# ── 0.11.108 质量优先：**更高档还在飞 ⇒ 先压住这份低档交付** ──────────────
-		# 现场（用户 2026-10-03："mg 仍旧是 128k mp3"）：阶梯是"档位为外层"，但**慢源**
-		# （玉宁熙，设备上 4~20s）还在跑 flac/flac24bit 时，低档候选（墨澜@320k）已经交付
-		# 128k mp3 并被接受 ⇒ `$done=1` ⇒ 慢源的高档结果到了也没人要。
-		# 用户口径「音质优先、起播慢可忍」⇒ 只要仍有**更高档的候选在飞**，就先把这份交付
-		# **压住**（保留其中最高的一档），让高档先跑完；高档全部失败/候选耗尽/预算到期时
-		# 再交付压住的那一份（绝不因此变成 FAIL）。
-		if (!$force && $want_rank && _pref('tierGuard', 1)) {
+		# ── 0.11.108/110 质量优先抢跑（**默认关闭**）──────────────────────────────
+		# 现场（用户 2026-10-03："mg 仍旧是 128k mp3"）：阶梯是"档位为外层"，但**慢源**还在跑
+		# 高档时，低档候选已经交付 128k 并被接受 ⇒ `$done=1` ⇒ 慢源的高档结果到了也没人要。
+		# 0.11.108/109 做过"压住低档、给高档 3s 抢跑窗口"。**0.11.110 起默认关闭**：
+		#   · 根因最后是**源**（mg 三个聚合源只给标清），换成自建 `咪咕无损桥` 后它常年最快
+		#     （设备实测 0.7~1.0s 直接交付 FLAC）⇒ 不需要等；
+		#   · 而"等"的代价实测很实在：设备上 4/12 首被拖到 24.5s 预算耗尽而 **FAIL**。
+		# 需要"宁可慢也要无损"时可显式传 `qualityHeadStart => N`（秒，>0 生效）。
+		my $head_start = $a{qualityHeadStart};
+		$head_start = 0 unless defined $head_start && $head_start =~ /^\d+$/;
+		if (!$force && $head_start > 0 && $want_rank && _pref('tierGuard', 1)) {
 			my $higher = 0;
 			for my $t (keys %inflight_tier) {
 				next unless $inflight_tier{$t};
@@ -906,22 +931,16 @@ sub resolveTrack {
 						args => [ $src, $q, $url, $tm, $friendly, $verified, $kbps, $magic, $len, $bits ] };
 				}
 				$log->warn('LxMusic resolve: [' . ($src->{name} // '?')
-					. "] $q 已可取链，但更高档仍在飞 —— 先压住（音质优先）");
+					. "] $q 已可取链，但更高档仍在飞 —— 先压住（音质优先 ${head_start}s）");
 				# ⚠️ 等待**必须有上限**：LMS 只等 4~8s，无上限地把"能响"拖成"没声"就不是优化了。
-				# 默认 **3s 抢跑窗口**（`qualityHeadStart` 可调，0 = 旧行为：谁先来谁交付）。
-				# 口径：能在这个窗口内给出更高档的源，就等它；等不到就用低档保底（绝不静默变慢）。
 				if (!$grace_armed) {
 					$grace_armed = 1;
-					my $g = $a{qualityHeadStart};
-					$g = 3 unless defined $g && $g =~ /^\d+$/;
-					if ($g > 0) {
-						my $go = {};
-						Slim::Utils::Timers::setTimer($go, time() + $g, sub {
-							return if $done;
-							$log->warn("LxMusic resolve: 更高档 ${g}s 内没来 —— 交付压住的那一份（保底，别让用户没声）");
-							$deliver_held->();
-						});
-					}
+					my $go = {};
+					Slim::Utils::Timers::setTimer($go, time() + $head_start, sub {
+						return if $done;
+						$log->warn("LxMusic resolve: 更高档 ${head_start}s 内没来 —— 交付压住的那一份（保底）");
+						$deliver_held->();
+					});
 				}
 				$cand_settle->() if $cand_settle;
 				return;

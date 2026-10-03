@@ -160,6 +160,10 @@ sub run {
 		Plugins::LxMusic::Helper::_src_failed($k, $k);
 		Plugins::LxMusic::Helper::_src_failed($k, $k);
 	}
+	# 0.11.111：把刚压上的熔断"老化"若干秒 ⇒ 用来验证"冷却后半开"（否则要真等 90s）
+	for my $k (@{ $opt{pretrip} || [] }) {
+		Plugins::LxMusic::Helper::_breaker_age($k, $opt{pretrip_age}) if $opt{pretrip_age};
+	}
 	# 0.11.103：本机准入拒绝注入（`"源|档位" => 1`）
 	%local_reject = %{ $opt{local_reject} || {} };
 	%timeout_reject = %{ $opt{timeout_reject} || {} };   # 0.11.106：超时注入
@@ -168,6 +172,8 @@ sub run {
 	%hold_fire = %{ $opt{hold_fire} || {} };             # 0.11.108：压住某些候选不 fire
 	Plugins::LxMusic::Helper->resolveTrack(
 		music => $track, src => 'mg', type => $opt{want},
+		# 0.11.110：抢跑窗口默认关闭（0）；要测它得显式传 `quality_head_start`
+		(defined $opt{quality_head_start} ? (qualityHeadStart => $opt{quality_head_start}) : ()),
 		cb    => sub { push @got, $_[0] },
 	);
 	return unless $opt{deliver};
@@ -522,26 +528,56 @@ sub run {
 	delete $enabled_ids{list};
 }
 
-# ---------- 16. 0.11.108：**更高档还在飞 ⇒ 低档交付必须被压住**（音质优先） ----------
-# 现场（用户 2026-10-03 "mg 仍旧是 128k mp3"）：慢源（玉宁熙，设备上 4~20s）还在跑 flac/flac24bit 时，
-# 低档候选（墨澜@320k）已经交付 128k mp3 并被接受 ⇒ 慢源的高档结果到了也没人要。
-# 口径是"音质优先、起播慢可忍"⇒ 压住低档，等高档跑完；高档全败/预算到期再交付压住的那份。
+# ---------- 16. 0.11.108/110：质量优先抢跑（**默认关闭**，可显式开） ----------
+# 现场（用户 2026-10-03 "mg 仍旧是 128k mp3"）：慢源还在跑高档时，低档候选已交付 128k 并被接受，
+# 慢源的高档结果到了也没人要。0.11.108/109 做过"压住低档 + 3s 抢跑窗口"。
+# **0.11.110 起默认关闭**（`qualityHeadStart` 默认 0）：根因最后是**源**（mg 聚合源只给标清），
+# 换上自建 `咪咕无损桥` 后它常年最快（设备实测 0.7~1.0s 直接给 FLAC）⇒ 不必等；
+# 而"等"的代价实测很实在（4/12 首被拖到 24.5s 预算耗尽而 FAIL）。下面同时钉住两种行为。
 {
 	%path = (A => $srcA, B => $srcB);
 	$enabled_ids{list} = [ 'A', 'B' ];
-	run(
+	my %common = (
 		want         => 'flac24bit',
-		# 兜底：**每个**候选都能结算（否则未 fire 的候选会让窗口一直满着，收尾永远不触发）
 		deliver      => { A => 'mp3-128', B => 'mp3-128' },
-		# A 在 flac24bit 档给真无损（且被压住不 fire = "慢源还在飞"）
 		deliver_tier => { flac24bit => { A => 'flac-24' } },
-		hold_fire    => { 'A|flac24bit' => 1 },
+		hold_fire    => { 'A|flac24bit' => 1 },   # A 的高档"慢"：先不 fire
 	);
-	check('16a 更高档仍在飞时，低档交付被压住（最终交付 = flac24bit）',
+	# 16a/16b：**显式开** 3s 抢跑 ⇒ 低档被压住，最终交付高档
+	run(%common, quality_head_start => 3);
+	check('16a 开启抢跑时，更高档仍在飞 ⇒ 低档被压住（最终 = flac24bit）',
 		@got == 1 && (($got[0]{quality} // '') eq 'flac24bit'),
 		@got ? ($got[0]{quality} // '?') : 'none');
 	check('16b 只交付一次（压住的那份没有被抢先交付）', @got == 1, scalar(@got));
+
+	# 16c：**默认（0）** ⇒ 谁先给可播链接谁交付（低档先到就先交付），不再等待
+	run(%common);
+	check('16c 默认关闭抢跑：低档先到就交付（= 320k），不等待',
+		@got == 1 && (($got[0]{quality} // '') eq '320k'),
+		@got ? ($got[0]{quality} // '?') : 'none');
 	%hold_fire = ();
+	delete $enabled_ids{list};
+}
+
+# ---------- 17. 0.11.111：熔断的**半开冷却**（防"偶发两次错误 → 整档消失 10 分钟"） ----------
+# 现场：本 session 修了五处"按曲目失败被当成平台级失败"的分类（too-low/verify/local/timeout/同源并发），
+# 但只要源的报错文案落在分类之外就会复现 —— 0.11.110 实测自建"咪咕无损桥"两次按曲目失败后被封，
+# 第 5 首起整段消失。结构性修法：上闸后冷却 90s 就**放一次**（半开），失败刷新时间戳，成功清零。
+{
+	%path = (A => $srcA, B => $srcB);
+	$enabled_ids{list} = [ 'A', 'B' ];
+	# ⚠️ 测试桩每次 run() 会先 `_breaker_reset()` ⇒ 手动 `_src_failed` 必须走 `pretrip` 通道
+	run(want => 'flac', deliver => { B => 'flac-16' }, pretrip => ['A|mg|flac']);
+	# ⚠️ 只看 **flac 档**：A 在 320k/128k 档没被闸，仍应正常参与（这是对的，别误判）
+	check('17a 刚上闸时该源在**该档**不生成候选',
+		!(scalar grep { ($_->{id} // '') eq 'A' && (($_->{info} || {})->{type} // '') eq 'flac' } @launched),
+		'launched=' . join(',', map { ($_->{id} // '?') . '@' . (($_->{info} || {})->{type} // '?') } @launched));
+	# 上闸时间往前拨到超过冷却期 ⇒ 应放一次（半开）
+	run(want => 'flac', deliver => { B => 'flac-16' }, pretrip => ['A|mg|flac'], pretrip_age => 120);
+	check('17b 超过冷却期后放一次（半开，A 在该档重新成为候选）',
+		(scalar grep { ($_->{id} // '') eq 'A' && (($_->{info} || {})->{type} // '') eq 'flac' } @launched) ? 1 : 0,
+		'launched=' . join(',', map { ($_->{id} // '?') . '@' . (($_->{info} || {})->{type} // '?') } @launched));
+	Plugins::LxMusic::Helper::_breaker_reset();
 	delete $enabled_ids{list};
 }
 
