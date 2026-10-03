@@ -341,7 +341,7 @@ sub _finish_resolve {
 	# 0.11.52：档位标签一律用**真实拿到的**（$tier 由 _actualTier 从 fmt/码率/位深推出来），
 	# 拿不到才退回"请求的档位"。用户报的问题：pref 选 flac24bit 时，**连 128kbps 的 MP3
 	# 也标成 "FLAC 24bit"**——因为旧代码直接拿 `$info->{type}`（请求值）当标签。
-	my $qLabel = $class->qualityLabel(defined $tier && length $tier ? $tier : $info->{type});
+	my $qLabel = $class->qualityLabel(defined $tier && length $tier ? $tier : $info->{type}, $samplerate);
 
 	# ⚠️ ct 必须用"我们嗅到的真实格式"来定，不能用档位标签猜：QQ/网易 CDN 的 .flac
 	# 直链会声明 Content-Type: audio/x-ogg，LMS 扫描时把这个错误类型写进轨道缓存，
@@ -999,7 +999,8 @@ sub scanUrl {
 		# 0.11.56：命中也要算**真实档位**（此前不传 ⇒ 退回请求档位，于是永远显示 FLAC 24bit）
 		# 0.11.60：连"上游声明的档位"一起传（`$info->{music}{types}`），与播放路径同一套推导
 		my $ctier = $class->_actualTier($cached->{fmt}, $cached->{kbps}, $cached->{bits},
-			(ref($info->{music}{types}) eq 'ARRAY' ? $info->{music}{types} : undef));
+			(ref($info->{music}{types}) eq 'ARRAY' ? $info->{music}{types} : undef),
+			$cached->{samplerate});
 		$class->_finish_resolve($song, $url, $info, $cached->{direct}, $args, $cb,
 			$cached->{fmt}, $cached->{kbps}, $cached->{secs}, $ctier,
 			$cached->{bits}, $cached->{samplerate}, $cached->{channels});
@@ -1052,7 +1053,8 @@ sub _resolve_fresh {
 			my $direct = $res->{url};
 			# 0.11.60：**真实档位**统一由这里算（fmt/码率/位深 + 上游 types[] 封顶），
 			# 工具页与元数据都取这个值 ⇒ 同一曲目在任何位置显示一致（A0）
-			my $tier = $class->_actualTier($res->{format}, $res->{actualKbps}, $res->{bits}, $res->{declared});
+			my $tier = $class->_actualTier($res->{format}, $res->{actualKbps}, $res->{bits}, $res->{declared},
+			$res->{samplerate});
 			$log->info(sprintf('LxMusic: resolved via [%s] type=%s%s verified=%s%s fmt=%s%s',
 				$res->{source} // '?', $tier // $res->{quality} // '?',
 				(defined $tier && defined $res->{quality} && $tier ne $res->{quality}
@@ -1736,8 +1738,8 @@ sub getMetadataFor {
 		$meta{cover} = $m->{cover} if $m->{cover};
 		$meta{secs}  = $m->{secs}  if $m->{secs};
 		if ($m->{quality}) {
-			# type 给人看：档位 key（flac24bit）→ 显示标签（FLAC 24bit）
-			$meta{type} = $class->qualityLabel($m->{quality});
+			# type 给人看：档位 key（flac24bit）→ 显示标签（FLAC 24bit，0.11.99 起带实测采样率）
+			$meta{type} = $class->qualityLabel($m->{quality}, $m->{samplerate});
 		}
 		# bitrate 必须是**数字 kbps**；没有真实码率就别发（否则 UI 显示乱值）
 		$meta{bitrate} = int($m->{kbps}) if $m->{kbps} && $m->{kbps} > 0;
@@ -1786,22 +1788,42 @@ sub _lms_image_cache {
 	return $LMS_CACHE;
 }
 
+# 0.11.99：档位标签可以带上**实测采样率**（`FLAC 24bit/96k` vs `FLAC 24bit/48k`）。
+#   起因（用户 2026-09-29）：「同一首《告白气球》，有的平台给 flac 96k/24bit，有的给 48k/24bit，
+#   界面上看不出差别」。采样率我们**早就量到了**（shim 从 FLAC STREAMINFO / MPEG 帧头读），
+#   这里只把它渲染进标签，**不改档位键、不改派发**（档位键仍是 flac24bit）。
+#   只给无损档加后缀（有损档的分档看码率，采样率不构成差别）。
+#   幂等：已经是人读标签（含空格，如 `FLAC 24bit`）时原样返回。
+sub _sr_suffix {
+	my ($sr) = @_;
+	return '' unless $sr && $sr >= 8000 && $sr <= 384000;
+	my $khz = sprintf('%.1f', $sr / 1000);
+	$khz =~ s/\.0$//;
+	return '/' . $khz . 'k';
+}
+
 sub qualityLabel {
-	my ($class, $type) = @_;
+	my ($class, $type, $samplerate) = @_;
 	$type = '' unless defined $type;
 	# 0.11.56：**幂等**——已经是人读标签（带空格，如 'FLAC 24bit' / 'MP3 320kbps'）就原样返回。
 	# 档位键永远不含空格，所以这条判断不会误伤；旧缓存/旧行里存的标签也不会再被 uc() 成
 	# "FLAC 24BIT" 那种大写乱码。
 	return $type if $type =~ /\s/;
-	return 'MP3 128kbps'  if $type eq '128k';
-	return 'MP3 192kbps'  if $type eq '192k';
-	return 'MP3 256kbps'  if $type eq '256k';
-	return 'MP3 320kbps'  if $type eq '320k';
-	return 'FLAC'         if $type eq 'flac';
-	return 'FLAC 24bit'   if $type eq 'flac24bit';
-	return 'Hi-Res'       if $type eq 'hires';
-	return 'AAC'          if $type eq 'aac';
-	return uc($type);
+	my $sr = _sr_suffix($samplerate);
+	# 无损三档才带采样率后缀（128k/192k/256k/320k/aac 的分档依据是码率）
+	my $lossless = ($type eq 'flac' || $type eq 'flac24bit' || $type eq 'hires') ? 1 : 0;
+	my $label;
+	$label = 'MP3 128kbps'  if $type eq '128k';
+	$label = 'MP3 192kbps'  if $type eq '192k';
+	$label = 'MP3 256kbps'  if $type eq '256k';
+	$label = 'MP3 320kbps'  if $type eq '320k';
+	$label = 'FLAC'         if $type eq 'flac';
+	$label = 'FLAC 24bit'   if $type eq 'flac24bit';
+	$label = 'Hi-Res'       if $type eq 'hires';
+	$label = 'AAC'          if $type eq 'aac';
+	$label = uc($type) unless defined $label;
+	$label .= $sr if $lossless && $sr;
+	return $label;
 }
 
 # 0.11.52：**从真实交付物反推档位**（而不是拿请求值当结果）。
@@ -1813,6 +1835,10 @@ sub qualityLabel {
 #   现场（A0 实测）：kw《晴天》上游只声明 `128k/320k/flac`，但交付流实测 1647kbps，
 #   于是"码率≥1400 ⇒ 24bit"的启发式把它标成 **FLAC 24bit** —— 比上游声明的还高，用户看到
 #   的就是"标签与来源自相矛盾"。规则：在"≤ 推出来的档位"的上游声明里取最高的那个。
+# 0.11.99：签名尾部新增**可选**第 6 参 `$samplerate`（实测采样率，Hz）。它只用于**收紧**
+#   位深未知时的兜底（见 flc 分支注释），**不改变档位集合**；老调用点不传 = 旧行为。
+#   调用点：`Helper::$finish`（传 `$tm->{sr}`）、缓存命中（`$cached->{samplerate}`）、
+#   交付（`$res->{samplerate}`）、工具页（`$res->{samplerate}`）。
 my @TIER_ORDER = qw(128k 192k 256k 320k flac flac24bit hires);
 my %TIER_RANK;
 # ⚠️ 0.11.76：**别**写成 `$TIER_RANK{ $TIER_ORDER[$i] } = ++$i for 0 .. $#TIER_ORDER`——
@@ -1837,7 +1863,7 @@ sub tier_rank {
 }
 
 sub _actualTier {
-	my ($class, $fmt, $kbps, $bits, $declared) = @_;
+	my ($class, $fmt, $kbps, $bits, $declared, $samplerate) = @_;
 	my $f = lc($fmt // '');
 	return undef unless length $f;
 
@@ -1847,10 +1873,28 @@ sub _actualTier {
 	# 一律先无条件初始化，再用 if/elsif 赋值。
 	my $tier;
 	if ($f eq 'flc') {
-		# 位深读到了就信它；**读不到**（探测没取到实体）时用码率兜底——
-		# 16bit/44.1k FLAC ≈ 900~1100kbps（mg 实测 934），24bit 通常 ≥1400kbps（念心 tx 实测 1709）。
-		$tier = ($bits || 0) > 16 ? 'flac24bit'
-			: (($bits || 0) ? 'flac' : (($kbps && $kbps >= 1400) ? 'flac24bit' : 'flac'));
+		# 位深读到了就信它（**读到位深 ⇒ 不看采样率、也不看码率**）。
+		# 0.11.99：**位深未知时不再无条件按码率吹 24bit**。
+		#   现场（用户 2026-09-29 实测）：`tx 玉宁熙 flac24bit → 2315.1kbps / **16bit** / 44100Hz`
+		#   —— 码率 2315 却只是 16bit/44.1k；旧规则"读不到位深且 ≥1400 ⇒ flac24bit"
+		#   一旦生效就是**假无损标签**（FLAC 的无损压缩率随内容浮动，码率不是可靠判据）。
+		#   新规则：① 采样率已知且 ≤48kHz ⇒ 一律 flac（不吹）；② 采样率也未知（探测没取到
+		#   实体）⇒ 保留旧的码率启发式，避免把"没测到"误报成低档。
+		if (($bits || 0) > 16) {
+			$tier = 'flac24bit';
+		}
+		elsif (($bits || 0) > 0) {
+			$tier = 'flac';
+		}
+		elsif ($samplerate && $samplerate >= 8000 && $samplerate <= 48000) {
+			$tier = 'flac';
+		}
+		elsif ($kbps && $kbps >= 1400) {
+			$tier = 'flac24bit';
+		}
+		else {
+			$tier = 'flac';
+		}
 	}
 	elsif ($f eq 'mp3') {
 		# 0.11.58：按实测码率就近取标（192/256kbps 不再被压成"128k"，也不再一律写 320k）

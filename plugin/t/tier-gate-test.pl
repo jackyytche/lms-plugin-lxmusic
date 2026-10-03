@@ -220,5 +220,71 @@ sub run {
 			== Plugins::LxMusic::ProtocolHandler::tier_rank('flac'));
 }
 
+# ---------- 8. 阶梯构造（0.11.99：按排名生成；修 `hires` 陷阱） ----------
+# 起因：`@QUALITY_LADDER` 里曾没有 `hires` ⇒ 请求 hires 时阶梯塌成 `('hires','128k')`，
+# **跳过 flac24bit/flac/320k**。以下断言把"默认档位逐项不回归"钉死。
+{
+	my $HL = 'Plugins::LxMusic::Helper';
+	my $lad = sub {
+		my ($want, $track, $decl) = @_;
+		return join(',', $HL->qualityLadder($want, $track || {}, $decl));
+	};
+
+	check('8a 默认档位 flac24bit 的阶梯与 0.11.98 逐项相同',
+		$lad->('flac24bit') eq 'flac24bit,flac,320k,128k', $lad->('flac24bit'));
+	check('8a 320k 的阶梯逐项相同',
+		$lad->('320k') eq '320k,128k', $lad->('320k'));
+	check('8a 128k 的阶梯逐项相同', $lad->('128k') eq '128k', $lad->('128k'));
+
+	# 8b **本次修复的核心**：请求 hires 必须能一路降到 flac24bit/flac/320k/128k
+	{
+		my @l = $HL->qualityLadder('hires', {}, undef);
+		check('8b hires 阶梯含 flac24bit/flac/320k/128k（修前只有 hires,128k）',
+			join(',', @l) eq 'hires,flac24bit,flac,320k,128k', join(',', @l));
+		my %in = map { $_ => 1 } @l;
+		check('8b hires 阶梯确实包含 flac/flac24bit/320k',
+			$in{flac24bit} && $in{flac} && $in{'320k'} && $in{'128k'});
+	}
+
+	# 8c 表里没有、但是梯档（192k/256k）：先试它本身，再接排名更低者（与旧行为一致）
+	check('8c 192k 阶梯 = 192k,128k', $lad->('192k') eq '192k,128k', $lad->('192k'));
+	# 8d 非梯档（ape/wav/未知）保持旧行为
+	check('8d ape（非梯档）阶梯 = ape,128k', $lad->('ape') eq 'ape,128k', $lad->('ape'));
+
+	# 8e 曲目声明过滤：只声明 flac 的曲目请求 flac24bit ⇒ 只试 flac
+	check('8e 曲目只声明 flac ⇒ 阶梯收敛为 flac',
+		$lad->('flac24bit', { types => [ { type => 'flac' } ] }) eq 'flac',
+		$lad->('flac24bit', { types => [ { type => 'flac' } ] }));
+
+	# 8f **旧的塌陷行为必须消失**：过滤后一个不剩时，回落成未过滤阶梯，而不是 ('128k')
+	{
+		my @l = $HL->qualityLadder('flac24bit',
+			{ types => [ { type => 'nonsense' } ] }, [ 'flac24bit' ]);
+		check('8f 过滤后为空不再塌成 128k（回落成完整阶梯）',
+			join(',', @l) eq 'flac24bit,flac,320k,128k', join(',', @l));
+	}
+
+	# 8g qualityFallback 关掉 ⇒ 只试请求档本身
+	{
+		# ⚠️ Helper 在编译期就 `my $prefs = preferences('plugin.lxmusic')`（名字带后缀），
+		#    测试必须用**同一个名字**取实例，否则设的值被测代码看不到（本用例第一版就栽在这）。
+		my $p = Slim::Utils::Prefs::preferences('plugin.lxmusic');
+		my $old = $p->get('qualityFallback');
+		$p->set('qualityFallback', 0);
+		my @l = $HL->qualityLadder('flac24bit', {}, undef);
+		check('8g 关掉 qualityFallback ⇒ 只试请求档', join(',', @l) eq 'flac24bit', join(',', @l));
+		# 复原（同一份 stub 会被后面的用例读到）
+		if (defined $old) { $p->set('qualityFallback', $old) } else { delete $p->{vals}{qualityFallback} }
+		my @l2 = $HL->qualityLadder('flac24bit', {}, undef);
+		check('8g 复原后阶梯回到完整形态', join(',', @l2) eq 'flac24bit,flac,320k,128k', join(',', @l2));
+	}
+
+	# 8h 档位闸地板：hires 的"次一档"必须是 flac24bit（而不是 128k）
+	{
+		my @l = $HL->qualityLadder('hires', {}, undef);
+		check('8h hires 的地板（阶梯次一档）= flac24bit', ($l[1] // '') eq 'flac24bit', $l[1] // 'undef');
+	}
+}
+
 print $failed ? "\nFAILED ($failed)\n" : "\nALL PASS\n";
 exit($failed ? 1 : 0);

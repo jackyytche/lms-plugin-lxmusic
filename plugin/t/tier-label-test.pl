@@ -55,11 +55,11 @@ my @WY  = ({ type => '128k' }, { type => '320k' }, { type => 'flac' });
 my @MG  = ({ type => '128k' }, { type => '320k' }, { type => 'flac' }, { type => 'flac24bit' });
 
 sub tier {
-	my ($fmt, $kbps, $bits, $decl) = @_;
-	return $H->_actualTier($fmt, $kbps, $bits, $decl);
+	my ($fmt, $kbps, $bits, $decl, $sr) = @_;
+	return $H->_actualTier($fmt, $kbps, $bits, $decl, $sr);
 }
 
-sub label { return $H->qualityLabel($_[0]) }
+sub label { return $H->qualityLabel($_[0], $_[1]) }
 
 # ---------- 1. 位深是量出来的 ⇒ 不受"上游声明"封顶（0.11.84） ----------
 {
@@ -135,6 +135,55 @@ sub label { return $H->qualityLabel($_[0]) }
 	check('空 fmt ⇒ undef', !defined tier('', 320, 0, undef));
 	check('undef fmt ⇒ undef', !defined tier(undef, 320, 0, undef));
 	check('未知键经 qualityLabel ⇒ 大写原样', label('xyz') eq 'XYZ', label('xyz'));
+}
+
+# ---------- 8. 采样率进判定与标签（0.11.99，用户 2026-09-29「96k 与 48k 看不出差别」） ----------
+# 实测格（tmp/_gaobai_qiqiu_matrix_20260929.txt / _tier_guard_cross_platform_20260929.txt）：
+#   kw 玉宁熙 flac24bit → 2903.2kbps 24bit 96000Hz
+#   kw 星海/念心 flac   → 1752.2kbps 24bit 48000Hz
+#   tx 玉宁熙 flac24bit → 2315.1kbps **16bit** 44100Hz（堵死"用码率猜 24bit"的那一格）
+{
+	# 8a 档位键**不变**（方案 B：采样率只细化显示，不改档位集）
+	check('8a kw 96k/24bit ⇒ 档位键仍是 flac24bit',
+		tier('flc', 2903, 24, undef, 96000) eq 'flac24bit',
+		tier('flc', 2903, 24, undef, 96000) // 'undef');
+	check('8a kw 48k/24bit ⇒ 档位键同样是 flac24bit',
+		tier('flc', 1752, 24, undef, 48000) eq 'flac24bit',
+		tier('flc', 1752, 24, undef, 48000) // 'undef');
+
+	# 8b **显示层**能分辨 96k / 48k / 44.1k（这就是用户要的"看得出差别"）
+	check('8b 96k/24bit ⇒ 标签 FLAC 24bit/96k',
+		label('flac24bit', 96000) eq 'FLAC 24bit/96k', label('flac24bit', 96000));
+	check('8b 48k/24bit ⇒ 标签 FLAC 24bit/48k',
+		label('flac24bit', 48000) eq 'FLAC 24bit/48k', label('flac24bit', 48000));
+	check('8b 88.2k/24bit ⇒ 标签 FLAC 24bit/88.2k',
+		label('flac24bit', 88200) eq 'FLAC 24bit/88.2k', label('flac24bit', 88200));
+	check('8b flac16/44.1k ⇒ 标签 FLAC/44.1k',
+		label('flac', 44100) eq 'FLAC/44.1k', label('flac', 44100));
+	check('8b hires/96k ⇒ 标签 Hi-Res/96k',
+		label('hires', 96000) eq 'Hi-Res/96k', label('hires', 96000));
+
+	# 8c 采样率未知 ⇒ 标签与 0.11.98 **逐字节相同**（不回归）
+	check('8c 无采样率 ⇒ FLAC 24bit（与旧版一致）',
+		label('flac24bit', 0) eq 'FLAC 24bit' && label('flac24bit', undef) eq 'FLAC 24bit');
+	check('8c 有损档不加采样率后缀（分档依据是码率）',
+		label('320k', 44100) eq 'MP3 320kbps' && label('128k', 48000) eq 'MP3 128kbps');
+
+	# 8d **码率兜底陷阱**（用户 2026-09-29 报的那一格）：位深未知 + 采样率已知 ≤48k ⇒ 不吹 24bit
+	check('8d 2315kbps + 位深未知 + 44100Hz ⇒ flac（此前会被吹成 flac24bit）',
+		tier('flc', 2315, 0, undef, 44100) eq 'flac',
+		tier('flc', 2315, 0, undef, 44100) // 'undef');
+	check('8d 2315kbps + 位深未知 + 48000Hz ⇒ flac',
+		tier('flc', 2315, 0, undef, 48000) eq 'flac',
+		tier('flc', 2315, 0, undef, 48000) // 'undef');
+	# 保留旧行为：**采样率也未知**（探测没取到实体）时仍可用码率启发式
+	check('8d 1647kbps + 位深未知 + 采样率未知 ⇒ flac24bit（旧行为保留）',
+		tier('flc', 1647, 0, undef, 0) eq 'flac24bit',
+		tier('flc', 1647, 0, undef, 0) // 'undef');
+	# 位深量到就是权威，采样率不参与
+	check('8d 位深=16 且码率 2315 ⇒ flac（采样率不改变结论）',
+		tier('flc', 2315, 16, undef, 96000) eq 'flac',
+		tier('flc', 2315, 16, undef, 96000) // 'undef');
 }
 
 print $failed ? "\n$failed FAILED\n" : "\nALL PASS\n";

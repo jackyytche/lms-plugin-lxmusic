@@ -131,7 +131,10 @@ set_pref('metaCacheDays', 30);
 	my $m = $P->getMetadataFor(undef, url(1));
 	check('getMetadataFor 拿回封面', ($m && $m->{cover} && $m->{cover} =~ /1\.jpg$/) ? 1 : 0,
 		($m ? join(',', sort keys %$m) : 'empty'));
-	check('getMetadataFor 拿回档位标签', ($m && ($m->{type} // '') eq 'FLAC') ? 1 : 0, ($m->{type} // '?'));
+	# 0.11.99：档位标签会带上**实测采样率**（本行存了 samplerate=44100 ⇒ `FLAC/44.1k`）。
+	# 采样率未知时仍是旧的 `FLAC`（`qualityLabel` 的幂等/无后缀分支，见 tier-label-test.pl §8）。
+	check('getMetadataFor 拿回档位标签（带采样率）', ($m && ($m->{type} // '') eq 'FLAC/44.1k') ? 1 : 0,
+		($m->{type} // '?'));
 	check('getMetadataFor 拿回数字码率的 bitrate', ($m && ($m->{bitrate} // 0) == 1010) ? 1 : 0);
 	check('二次 meta_load 是幂等的（不重复灌）', ($P->meta_load == 0) ? 1 : 0);
 }

@@ -715,7 +715,10 @@ sub _trackItems {
 		if (ref($t->{types}) eq 'ARRAY' && @{ $t->{types} }) {
 			my %has = map { (ref($_) eq 'HASH' && defined $_->{type}) ? ($_->{type} => 1) : () } @{ $t->{types} };
 			if (!$has{$q}) {
-				for my $cand (qw(flac24bit flac 320k 128k hires)) {
+				# 0.11.99：`hires` 提到最前（此前排在最后 ⇒ 若上游真声明了 hires，行标签反而取更低档）。
+				# 实测各平台 vendored SDK 的 types[] 只会出现 128k/192k/256k/320k/flac/flac24bit，
+				# 故这是防御性修正，不改变现网行为。
+				for my $cand (qw(hires flac24bit flac 320k 128k)) {
 					if ($has{$cand}) { $rowq = $cand; last; }
 				}
 			}
@@ -2660,8 +2663,13 @@ sub _webPreview {
 				# 现场：wy 行请求 flac、实际交付 ~128kbps 的流，旧代码在这行写 "[全豆要] flac ~128kbps"
 				# —— 同一行里"flac"和"128kbps"自相矛盾，用户看到的正是这种。
 				my $realTier = Plugins::LxMusic::ProtocolHandler->_actualTier(
-					$res->{format}, $res->{actualKbps}, $res->{bits}, $res->{declared});
-				my $shown = $realTier || $res->{quality} || '?';
+					$res->{format}, $res->{actualKbps}, $res->{bits}, $res->{declared},
+					$res->{samplerate});
+				# 0.11.99：显示层带上**实测采样率**（`FLAC 24bit/96k` vs `FLAC 24bit/48k`）——
+				# 这是用户"96k 与 48k 界面看不出差别"的直接修复；档位键本身不变。
+				my $shown = (defined $realTier && length $realTier)
+					? Plugins::LxMusic::ProtocolHandler->qualityLabel($realTier, $res->{samplerate})
+					: ($res->{quality} || '?');
 				my $req = (defined $realTier && defined $res->{quality} && $realTier ne $res->{quality})
 					? " (requested $res->{quality})" : '';
 				my $via = encode_entities(sprintf('[%s] %s%s%s', $res->{source} // '?', $shown, $req,

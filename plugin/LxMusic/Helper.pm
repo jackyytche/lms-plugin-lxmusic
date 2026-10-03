@@ -156,7 +156,11 @@ sub pluginVersion {
 #   · 失败换源：core/music/utils.ts:291-334——逐源重试（429 不换源）
 #   · 实际码率：PC 端拿不到（源回传的 type 就是请求值，见 preload.js:83），
 #     我们用 HEAD 的 Content-Length ÷ 时长反推，避免"以为在听 flac 其实是 128k"
-my @QUALITY_LADDER = qw(flac24bit flac 320k 128k);   # PC: TRY_QUALITYS_LIST + 128k 兜底
+# 0.11.99：`hires` 补进阶梯**最顶**。此前这张表里没有它（而 ProtocolHandler 的 @TIER_ORDER 里有），
+# 于是"请求 hires"会走 §qualityLadder 的"不在表里"分支 ⇒ 阶梯塌成 `('hires','128k')`，
+# 跳过 flac24bit/flac/320k —— 一旦 UI 暴露 hires，用户选 Hi-Res 反而拿到 128k MP3。
+# PC 侧 TRY_QUALITYS_LIST 只有 flac24bit/flac/320k（PC 没有 hires 档）；hires 是我们的扩展。
+my @QUALITY_LADDER = qw(hires flac24bit flac 320k 128k);   # PC: TRY_QUALITYS_LIST + 128k 兜底
 
 # ⚠️ 0.11.94：**空串要当成"没设"**。表单整表回放/老版本 pref 会留下 `''`，而 `''` 是 **defined** 的：
 # 旧写法 `defined $v ? $v : $d` 会把 `''` 原样返回 ⇒ 布尔项变"关"、数字项变 0。
@@ -164,15 +168,32 @@ my @QUALITY_LADDER = qw(flac24bit flac 320k 128k);   # PC: TRY_QUALITYS_LIST + 1
 # **全都**指望"未设 = 用默认"，所以在这里一次修掉：空串 ⇒ 默认值。
 sub _pref { my ($k, $d) = @_; my $v = $prefs->get($k); return (defined $v && $v ne '') ? $v : $d }
 
-# 返回"该试哪些档位"（有序）——多源时外层按音质、内层按源，优先保音质
+# 返回"该试哪些档位"（有序，从高到低）——多源时外层按音质、内层按源，优先保音质
+# 0.11.99：阶梯改为**按排名生成**（此前是"在 @QUALITY_LADDER 里找子串、再切片"）。
+#   · 请求档在表里 ⇒ 从它往下切（默认 flac24bit 的结果与 0.11.98 **逐项相同**，有断言钉住）；
+#   · 不在表里但是**梯档**（192k/256k 等）⇒ 先试它本身，再接**排名严格更低**的那些；
+#   · 不是梯档（ape/wav/未知）⇒ 保持旧行为 `($want,'128k')`。
+#   ⚠️ 排名只有**一份权威来源**（ProtocolHandler::tier_rank）：Helper 不再自带第二份顺序表
+#   ——"表里有/阶梯里没有"正是本次这个 bug 的温床。
 sub qualityLadder {
 	my ($class, $want, $track, $declared) = @_;
 	$want = '320k' unless defined $want && length $want;
 	return ($want) unless _pref('qualityFallback', 1);
 
-	my $idx;
+	my ($idx, @list);
 	for my $i (0 .. $#QUALITY_LADDER) { $idx = $i, last if $QUALITY_LADDER[$i] eq $want }
-	my @list = defined $idx ? @QUALITY_LADDER[ $idx .. $#QUALITY_LADDER ] : ($want, '128k');
+	if (defined $idx) {
+		@list = @QUALITY_LADDER[ $idx .. $#QUALITY_LADDER ];
+	}
+	else {
+		# ⚠️ 单元环境可能只加载了 Helper（循环依赖），与 $finish 的档位闸同一套防护。
+		require Plugins::LxMusic::ProtocolHandler
+			unless Plugins::LxMusic::ProtocolHandler->can('tier_rank');
+		my $wr = Plugins::LxMusic::ProtocolHandler::tier_rank($want);
+		@list = defined $wr
+			? ($want, grep { (Plugins::LxMusic::ProtocolHandler::tier_rank($_) // 0) < $wr } @QUALITY_LADDER)
+			: ($want, '128k');
+	}
 
 	# 曲目实际具备的档位（搜索结果 types，对应 PC 的 musicInfo.meta._qualitys）
 	my %have = (ref($track->{types}) eq 'ARRAY')
@@ -184,7 +205,10 @@ sub qualityLadder {
 	my @out = grep { (!%have || $have{$_}) && (!%decl || $decl{$_}) } @list;
 	my %seen;
 	@out = grep { !$seen{$_}++ } @out;
-	return @out ? @out : ('128k');
+	# 0.11.99：全被过滤掉时**回落成未过滤的阶梯**，不再塌成 `('128k')`。
+	# 旧写法在"曲目声明不全 / 源没声明该档"时会把整条阶梯压成 128k（等于主动放弃无损）；
+	# 与本文件的能力表裁剪处置一致：宁可慢，也不能因为一张表点了没声。
+	return @out ? @out : @list;
 }
 
 # 'mm:ss' / 'hh:mm:ss' / 秒数 -> 秒（与 Plugin::_secsOf 同语义）
@@ -783,7 +807,8 @@ sub resolveTrack {
 			# 注意 `$class` 在这里是 **Helper**，不能用它去调 ProtocolHandler 的方法。
 			my $got = Plugins::LxMusic::ProtocolHandler->_actualTier(
 				$fmt, $kbps, $bits,
-				(ref($track->{types}) eq 'ARRAY' ? $track->{types} : undef));
+				(ref($track->{types}) eq 'ARRAY' ? $track->{types} : undef),
+				$tm->{sr});   # 0.11.99：实测采样率（收紧"位深未知时的码率兜底"）
 			my $got_rank = Plugins::LxMusic::ProtocolHandler::tier_rank($got) // 0;
 			if ($floor && $got_rank && $got_rank < $floor) {
 				push @tries, { source => $src->{name}, quality => $q, why => 'tier-too-low',
