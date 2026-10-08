@@ -1,6 +1,6 @@
-Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 1213.
+Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 1268.
 	(Maybe you meant system() when you said exec()?)
-Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 1337.
+Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 1392.
 	(Maybe you meant system() when you said exec()?)
 ok - parse ok=1
 ok - parse data url
@@ -30,9 +30,9 @@ ok - probe: 无魔数但 CT=audio/* ⇒ 放行（留活口）
 ok - probe: 5xx ⇒ 拒绝（魔数也不能救）
 
 ALL PASS
-Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 1213.
+Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 1268.
 	(Maybe you meant system() when you said exec()?)
-Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 1337.
+Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 1392.
 	(Maybe you meant system() when you said exec()?)
 LOG-WARN: LxMusic resolve: try [srcA] type=flac
 LOG-WARN: LxMusic resolve: try [srcB] type=flac
@@ -67,10 +67,10 @@ LOG-WARN: LxMusic resolve: try [srcA] type=flac
 LOG-WARN: LxMusic resolve: try [srcA] type=flac
 LOG-WARN: LxMusic resolve: try [srcB] type=flac
 LOG-WARN: LxMusic caps: [A.js] declares kw(128k/flac), wy(flac)
-LOG-WARN: LxMusic state: loaded 1 caps, 2 scored pairs from /tmp/51boPwAK1h/state.json
+LOG-WARN: LxMusic state: loaded 1 caps, 2 scored pairs from /tmp/qDofGyl_L8/state.json
 LOG-WARN: LxMusic resolve: try [srcB] type=flac
 LOG-WARN: LxMusic resolve: try [srcA] type=flac
-LOG-WARN: LxMusic state: /tmp/51boPwAK1h/state.json 解析失败，忽略（unexpected end of string while parsing JSON string, at character offset 3 (before "his is not json") at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/JSON/XS.pm line 49.
+LOG-WARN: LxMusic state: /tmp/qDofGyl_L8/state.json 解析失败，忽略（unexpected end of string while parsing JSON string, at character offset 3 (before "his is not json") at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/JSON/XS.pm line 49.
 ）
 LOG-WARN: LxMusic resolve: try [srcA] type=flac
 LOG-WARN: LxMusic resolve: try [srcB] type=flac
@@ -145,9 +145,9 @@ ok - enc: 换到明文 .flac 才交付
 ok - enc: tries 里留了"厂商加密容器"的拒绝原因
 
 ALL PASS
-Statement unlikely to be reached at t_build/Plugins/LxMusic/Helper.pm line 1213.
+Statement unlikely to be reached at t_build/Plugins/LxMusic/Helper.pm line 1268.
 	(Maybe you meant system() when you said exec()?)
-Statement unlikely to be reached at t_build/Plugins/LxMusic/Helper.pm line 1337.
+Statement unlikely to be reached at t_build/Plugins/LxMusic/Helper.pm line 1392.
 	(Maybe you meant system() when you said exec()?)
 ok - A1 首轮写满 300 行
 ok - A2 之后 4 轮"通知风暴"零写入（指纹止血）
@@ -162,9 +162,9 @@ ok - D1 连续"写了却队列没变" ⇒ 进入 60s 隔离
 ok - D2 隔离期内即使内容变了也不写
 
 ALL OK
-Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 1213.
+Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 1268.
 	(Maybe you meant system() when you said exec()?)
-Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 1337.
+Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 1392.
 	(Maybe you meant system() when you said exec()?)
 ok - size: 函数调用默认 -> 300
 ok - size: 函数调用 kind=big -> 500
@@ -193,9 +193,9 @@ ok - secs: 什么都没有 -> undef
 ok - secs: 明显不合理的估算被丢弃
 
 ALL PASS
-Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 1213.
+Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 1268.
 	(Maybe you meant system() when you said exec()?)
-Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 1337.
+Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 1392.
 	(Maybe you meant system() when you said exec()?)
 ok - 空状态只发一次全平台探测
 ok - 平台顺序 = kg,tx,wy,mg,kw
@@ -224,9 +224,9 @@ ok - 无结果时给一行 text 提示
 
 (PER=50 MAXPAGES=3 CAP=150)
 ALL OK
-Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 1213.
+Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 1268.
 	(Maybe you meant system() when you said exec()?)
-Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 1337.
+Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 1392.
 	(Maybe you meant system() when you said exec()?)
 ok - mg 形态：窗口 300 只出 100 行（不再补出重复）
 ok - mg 形态：100 行两两不同
@@ -265,9 +265,9 @@ ok - [0.11.96] 护栏：explodePlaylist 的 $CAP = 1000（与 handler 同口径�
 ok - [0.11.96] 护栏：explodePlaylist 的 $MAXPAGE 已放到 24
 
 ALL OK
-Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 1213.
+Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 1268.
 	(Maybe you meant system() when you said exec()?)
-Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 1337.
+Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 1392.
 	(Maybe you meant system() when you said exec()?)
 ok - kw 晴天: flc+1647kbps+bits=24 ⇒ flac24bit（声明只到 flac 也不能压）
 ok - kw 晴天: 显示标签 = FLAC 24bit
@@ -301,9 +301,9 @@ ok - undef fmt ⇒ undef
 ok - 未知键经 qualityLabel ⇒ 大写原样
 
 ALL PASS
-Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 1213.
+Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 1268.
 	(Maybe you meant system() when you said exec()?)
-Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 1337.
+Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 1392.
 	(Maybe you meant system() when you said exec()?)
 Subroutine Plugins::LxMusic::Helper::request redefined at t/worker-lifecycle-test.pl line 121.
 ok - retry: worker marked dead BEFORE the re-dispatch (no reuse of a dying worker)
@@ -347,9 +347,9 @@ ok - E-1: _finish 早放名额（job 一结束就还回去）
 ok - E-1: 放行点在回调**之后**（回调抛异常不能把排队项永久堵死）
 
 ALL PASS
-Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 1213.
+Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 1268.
 	(Maybe you meant system() when you said exec()?)
-Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 1337.
+Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 1392.
 	(Maybe you meant system() when you said exec()?)
 ok - warm: 两行都热到了
 ok - warm: kw 用大图档（...:500，与列表档 300 不同的缓存键）
@@ -373,9 +373,9 @@ ok - key: 乱码目标 -> 空（宁可不解，也别拿错键写缓存）
 ok - key: _coverOf(kind=big) 的代理目标与热键一致（500）
 
 ALL PASS
-Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 1213.
+Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 1268.
 	(Maybe you meant system() when you said exec()?)
-Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 1337.
+Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 1392.
 	(Maybe you meant system() when you said exec()?)
 ok - 进平台：发出了 标签 + 排序 + 第一页列表 三个上游请求
 ok - 并行：分类标签**先于**排序发出（标签不吃排序，不必等）
@@ -393,9 +393,9 @@ ok - _pl_warm_platform(undef) 直接返回（不炸）
 ok - _pl_warm_platform(src, []) 只热标签、不炸
 
 ALL PASS
-Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 1213.
+Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 1268.
 	(Maybe you meant system() when you said exec()?)
-Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 1337.
+Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 1392.
 	(Maybe you meant system() when you said exec()?)
 ok - A1 首次发布真的写了 LMS（返回 1）
 ok - A2 同内容第二次发布**不写**（返回 0）
@@ -410,9 +410,9 @@ ok - D2 尾部补发对这 300 行**零写入**（指纹命中）
 ok - D3 feed 路径补发同样零写入
 
 ALL PASS
-Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 1213.
+Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 1268.
 	(Maybe you meant system() when you said exec()?)
-Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 1337.
+Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 1392.
 	(Maybe you meant system() when you said exec()?)
 Name "Slim::Player::Playlist::PLAYLIST" used only once: possible typo at t/meta-persist-test.pl line 455.
 Name "Slim::Player::Client::CLIENTS" used only once: possible typo at t/meta-persist-test.pl line 450.
@@ -490,3 +490,54 @@ ok - 非空设定值仍被尊重（resolveTtl=300）
 ok - ★ 结构护栏：模板里的每个 pref_* 控件都在 Settings::prefs() 里注册（没有"死控件"）
 
 全部通过
+Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 1268.
+	(Maybe you meant system() when you said exec()?)
+Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 1392.
+	(Maybe you meant system() when you said exec()?)
+ok - buildUrl returns a url
+ok - url is pure ASCII even with a CJK title
+ok - query no longer carries n=
+ok - query carries s=kw
+ok - query carries t=flac
+ok - no percent-encoded CJK left in the url
+ok - parseUrl round-trips
+ok - name round-trips through musicInfo _title
+ok - returned name is a character string (not raw bytes)
+ok - src/type round-trip
+ok - music payload survives
+ok - non-ASCII upstream fields are passed through as-is (byte strings double-encode)
+ok - character-string upstream fields survive (no double encoding)
+ok - _title is stripped out of music (no leak downstream)
+ok - caller music hash is not mutated
+ok - legacy n= url still parses
+ok - legacy n= still provides the display name
+ok - legacy url keeps music payload
+ok - legacy url has no _title and no leftover keys
+ok - _title wins over legacy n= when both present
+ok - empty name still builds a url
+ok - empty name parses back as empty
+ok - omitted name still builds a url
+ok - garbage url returns undef
+ok - bad base64 returns undef
+ok - buildUrl without music returns undef
+
+ALL PASS
+Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 1268.
+	(Maybe you meant system() when you said exec()?)
+Statement unlikely to be reached at /home/runner/work/lms-plugin-lxmusic/lms-plugin-lxmusic/plugin/t/../LxMusic/Helper.pm line 1392.
+	(Maybe you meant system() when you said exec()?)
+ok - 1a flac24bit + 128k mp3: 该次交付被拒（未交付）
+ok - 1b 拒绝后继续派发到下一档（flac）
+ok - 1c 交付的是 flac 而不是 128k mp3
+ok - 1d 交付档位(flac) 高于被拒的 128k
+ok - 2a flac24bit + flac16bit: 接受
+ok - 2b 交付就是那个 flac
+ok - 3  320k + 128k mp3: 接受（不该更严）
+ok - 4  flac + 320k: 接受
+ok - 5a 128k 请求 + 128k 交付: 接受
+ok - 6  flac24bit + ogg: 非梯档放行（不误伤 OGG 源）
+ok - 7a 128k < 320k < flac < flac24bit
+ok - 7b 非梯档无排名
+ok - 7c 方法形式与函数形式一致
+
+ALL PASS
