@@ -1366,7 +1366,11 @@ sub request {
 	elsif ($action eq 'search' || $action eq 'boards' || $action eq 'boardlist'
 		|| $action eq 'songlist' || $action eq 'songlistdetail' || $action eq 'songlistbytag'
 		# 0.11.36：歌单 PC 对齐的两个新元数据动作（排序 tab / 分类标签）也走 sdk.bundle.js
-		|| $action eq 'songlistsorts' || $action eq 'songlisttags') {
+		|| $action eq 'songlistsorts' || $action eq 'songlisttags'
+		# 0.11.114：专辑搜索/整张曲目也走 sdk.bundle.js（⚠️ 这里是 **Perl 侧白名单**，与
+		# shim 的 SDK_ACTIONS 是两道独立的门——0.11.113 只加了 shim 侧，设备实证探测轮
+		# 全数 "source missing"：动作掉进 else 分支被当作"要订阅源路径"）
+		|| $action eq 'albumsearch' || $action eq 'albumtracks') {
 		-f $SDK or do { $cb->(_err('sdk bundle not installed (search/browse disabled)')); return };
 		$source = $SDK;
 	}
@@ -1395,7 +1399,8 @@ sub request {
 	#    设备是 i386（Atom 级），每请求 fork+解析 700KB bundle ≈0.5s，而歌单下钻一次要问好几层。
 	# 返回 0 = worker 不可用（起不来/写失败/积压），落回下面的 fork 路径。
 	my %SDK_WORKER_ACTIONS = map { $_ => 1 }
-		qw(search boards boardlist songlist songlistdetail songlistbytag songlistsorts songlisttags);
+		qw(search boards boardlist songlist songlistdetail songlistbytag songlistsorts songlisttags
+		   albumsearch albumtracks);   # 0.11.114：专辑两动作也走常驻 worker（与上面 Perl 白名单成对）
 	if (workerEnabled()) {
 		# 0.11.54：**慢源改走 fork**。现场（用户报"mg 几乎没有一首有声"）：
 		#   玉宁熙的 mg 取链要串行打 3 次上游（单次响应 60~250KB），单曲 20~40s；

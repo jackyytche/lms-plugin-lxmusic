@@ -1143,6 +1143,9 @@ sub explodePlaylist {
 	my ($kind, $src, $id);
 	if    ($url =~ m{^lxm://b/([a-z]+)/([A-Za-z0-9_-]+)$}) { ($kind, $src, $id) = ('board', $1, $2) }
 	elsif ($url =~ m{^lxm://l/([a-z]+)/([A-Za-z0-9_-]+)$}) { ($kind, $src, $id) = ('songlist', $1, $2) }
+	# 0.11.112 专辑整单：搜索结果的专辑行带 playlist => lxm://a/<src>/<albumid>
+	# （专辑曲目 shim 一次整张返回 ⇒ 分页循环由 total/首行去重自然停在 1 页，不会多打）
+	elsif ($url =~ m{^lxm://a/([a-z]+)/([A-Za-z0-9_-]+)$}) { ($kind, $src, $id) = ('album', $1, $2) }
 
 	if ($kind) {
 		# 0.11.67：**整榜要取满**。现场（实测）：`playlist add lxm://b/kw/kw__93` 只进 100 行，
@@ -1166,10 +1169,12 @@ sub explodePlaylist {
 		my $fetch;                      # 递归闭包：一页一页取，够了/取不动就收尾
 		$fetch = sub {
 			Plugins::LxMusic::Helper->request(
-				action  => ($kind eq 'board' ? 'boardlist' : 'songlistdetail'),
+				action  => ($kind eq 'board' ? 'boardlist' : ($kind eq 'album' ? 'albumtracks' : 'songlistdetail')),
 				info    => ($kind eq 'board'
 					? { source => $src, bangid => $id, page => $page }
-					: { source => $src, id     => $id, page => $page }),
+					: (($kind eq 'album')
+						? { source => $src, id     => $id }          # 专辑整张一次返回，无页参
+						: { source => $src, id     => $id, page => $page })),
 				timeout => 45,
 				cb      => sub {
 					my ($res) = @_;

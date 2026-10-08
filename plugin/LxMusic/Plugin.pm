@@ -175,6 +175,14 @@ sub handleFeed {
 			url         => \&sdkSonglistSearchHandler,
 			passthrough => ['search'],
 		},
+		# 0.11.112 专辑搜索：五平台 lean 直连（端点侦查见 docs/album-search-feasibility.md；
+		# 订阅源无关——搜索不经过订阅源，与歌曲/歌单搜索同一性质）
+		{
+			name        => _u('搜索专辑'),
+			type        => 'search',
+			url         => \&sdkAlbumSearchHandler,
+			passthrough => ['search'],
+		},
 		# kw 榜单 0.11.0 复活：wbd 签名失效后改走免签名 kbangserver（sdk 内已切换）
 		(
 			map { {
@@ -1013,6 +1021,7 @@ sub sdkSonglistSearchHandler {
 	$window = 50 if $window < 1 || $window > 300;
 
 	my $st = _pl_search_state($q);      # 取（或新建）这次搜索的页缓存
+	$st->{rounds} = 0;   # 活性护栏：每次进入重置（随专辑泵 0.11.113 一并加固）
 
 	# 取数泵：**反复**算"这个窗口还缺什么"，缺就取，取完再算，直到窗口铺满（或到上限）。
 	# ⚠️ 不能只算一次：第一次调用时还不知道各平台 total ⇒ 只能先探第 1 页；
@@ -1021,7 +1030,7 @@ sub sdkSonglistSearchHandler {
 	my $pump;
 	$pump = sub {
 		my $need = _pl_search_missing($st, $index, $window);
-		if (!@$need) {
+		if (!@$need || ++$st->{rounds} > 8) {   # 护栏：最多 8 轮，超了就用手头已存的交卷
 			$cb->(_pl_search_feed($st, $index, $window));
 			return;
 		}
@@ -1088,6 +1097,9 @@ sub _pl_search_store {
 	if (!($res && $res->{ok} && ref $res->{data} eq 'ARRAY')) {
 		$st->{fail}{"$src|$page"} = 1;
 		$st->{failed}++;
+		# ⚠️ 冻机根因同款（0.11.114 随专辑泵一并根治）：探测失败也要置 probed，否则
+		# missing 永远重发 ['*',1]（0.11.112 专辑泵死循环冻机，见 _al_search_store）。
+		$st->{probed} = 1 if $src eq '*';
 		if ($src ne '*') {
 			my $seen = ($page - 1) * $PL_SEARCH_PER;
 			my $cur  = $st->{slots}{$src};
@@ -1118,6 +1130,17 @@ sub _pl_search_store {
 			my $cur  = $st->{slots}{$g};
 			$st->{slots}{$g} = (defined $cur && $cur < $seen) ? $cur : $seen;
 		}
+	}
+	# ⚠️ 活性护栏（0.11.113，随专辑泵同款洞补上）：ok 但零分组既没存页也没标失败
+	# ⇒ missing 会永远重发同一页（0.11.112 专辑泵设备实证死循环冻机，见 _al_search_store）。
+	if (!grep { ref($_) eq 'HASH' && ref $_->{list} eq 'ARRAY' && @{ $_->{list} } } @{ $res->{data} }) {
+		if ($src ne '*') {
+			$st->{fail}{"$src|$page"} = 1;
+			my $seen = ($page - 1) * $PL_SEARCH_PER;
+			my $cur  = $st->{slots}{$src};
+			$st->{slots}{$src} = (defined $cur && $cur < $seen) ? $cur : $seen;
+		}
+		$log->warn("LxMusic pl-search $src page $page ok-but-empty (treated as failed)");
 	}
 	$st->{probed} = 1 if $src eq '*';
 	return;
@@ -1258,6 +1281,289 @@ sub _plItems {
 			url         => \&sdkSonglistDetailHandler,
 			passthrough => [ 'songlistdetail', $src, $pl->{id}, $head ],
 			($plurl ? (playlist => $plurl) : ()),
+			(($img && $img =~ m{^https?://}) ? (image => _u($img)) : ()),
+		};
+		last if @items >= $max;
+	}
+	return \@items;
+}
+
+# ================================================== 0.11.112 专辑搜索：搜索 -> 详情 -> 播放/整单
+# 侦查与端点实测（2026-10-08）：docs/album-search-feasibility.md；订阅源无关。
+# 结构完全照抄歌单搜索的"页缓存 + 平台优先拼接"泵（_pl_search_*），仅三处不同：
+#   ① action=albumsearch（shim 五平台 lean 直连）；② 条目渲染 _alItems（💿 + 封面）；
+#   ③ 下钻是专辑详情（整张一次取，shim cap 300，窗口纯本地切片 + _feed_cache）。
+# 未照抄的部分（有意简化，注释即契约）：无 web 页（XMLBrowser 先行）、专辑 >300 首截断。
+my %ALBUM_SEARCH;
+my $ALBUM_SEARCH_PER      = 30;    # 每平台每页
+my $ALBUM_SEARCH_MAXPAGES = 5;     # 每平台 ≤150 行（专辑搜索深度足够；歌单搜索是 3×50）
+my $ALBUM_SEARCH_TTL      = 600;
+my $ALBUM_SEARCH_MAXQ     = 8;     # 同时缓存几次查询
+
+sub sdkAlbumSearchHandler {
+	my ($client, $cb, $args) = @_;
+	my $q = $args->{search} || '';
+	$q =~ s/^\s+|\s+$//g;
+
+	unless (length $q) {
+		$cb->({ items => [ { name => _u('输入专辑关键词'), type => 'text' } ] });
+		return;
+	}
+
+	my $index  = $args->{index} || 0;
+	my $window = $args->{quantity} || 50;
+	$window = 50 if $window < 1 || $window > 300;
+
+	my $st = _al_search_state($q);
+	$st->{rounds} = 0;   # 活性护栏：每次进入重置（防御纵深，见 pump 内 $ROUNDS_MAX）
+
+	my $pump;
+	$pump = sub {
+		my $need = _al_search_missing($st, $index, $window);
+		if (!@$need || ++$st->{rounds} > 8) {   # 护栏：即使几何再有洞，泵最多 8 轮就交卷
+			$cb->(_al_search_feed($st, $index, $window));
+			return;
+		}
+		my $pending = scalar @$need;
+		my $done = 0;
+		my $finish = sub {
+			my ($src, $page, $res) = @_;
+			_al_search_store($st, $src, $page, $res);
+			return if $done;
+			return if --$pending > 0;
+			$done = 1;
+			$pump->();
+		};
+		for my $n (@$need) {
+			my ($src, $page) = @$n;
+			my %info = ( query => $q, page => $page, limit => $ALBUM_SEARCH_PER );
+			$info{source} = $src unless $src eq '*';    # '*' = 首次全平台探测（学 total 与顺序）
+			Plugins::LxMusic::Helper->request(
+				action  => 'albumsearch',
+				info    => \%info,
+				timeout => 30,
+				cb      => sub { my ($res) = @_; $finish->($src, $page, $res); },
+			);
+		}
+		return;
+	};
+	$pump->();
+	return;
+}
+
+sub _al_search_state {
+	my ($q) = @_;
+	if (scalar(keys %ALBUM_SEARCH) >= $ALBUM_SEARCH_MAXQ && !$ALBUM_SEARCH{$q}) {
+		my ($old) = sort { ($ALBUM_SEARCH{$a}{at} || 0) <=> ($ALBUM_SEARCH{$b}{at} || 0) } keys %ALBUM_SEARCH;
+		delete $ALBUM_SEARCH{$old} if defined $old;
+	}
+	my $e = $ALBUM_SEARCH{$q};
+	if (!$e || (time() - ($e->{at} || 0)) >= $ALBUM_SEARCH_TTL) {
+		$e = $ALBUM_SEARCH{$q} = { at => time(), query => $q, pages => {}, total => {}, order => [], failed => 0 };
+	}
+	$e->{at} = time();
+	return $e;
+}
+
+# 页键 = "<src>|<page>"；首次探测那次 src 记作 '*'（同歌单搜索的几何，见 _pl_search_store）
+sub _al_search_store {
+	my ($st, $src, $page, $res) = @_;
+	$st->{pages}{"$src|$page"} = [] if $src eq '*';   # 占位，防重入
+	if (!($res && $res->{ok} && ref $res->{data} eq 'ARRAY')) {
+		$st->{fail}{"$src|$page"} = 1;
+		$st->{failed}++;
+		# ⚠️ 冻机根因（0.11.112/113 设备实证）：探测轮失败时这里 return 会**跳过 probed 置位**
+		# ⇒ missing 永远重发 ['*',1] ⇒ 泵死循环 → qjs fork 堆积 → 整机冻死（用户被迫按 reset）。
+		# 0.11.114：失败也要置 probed（探测失败=这次搜索没有可用平台，直接交卷）。
+		$st->{probed} = 1 if $src eq '*';
+		if ($src ne '*') {
+			my $seen = ($page - 1) * $ALBUM_SEARCH_PER;
+			my $cur  = $st->{slots}{$src};
+			$st->{slots}{$src} = (defined $cur && $cur < $seen) ? $cur : $seen;
+		}
+		$log->warn(sprintf('LxMusic al-search %s page %d failed: %s',
+			$src, $page, ($res && $res->{error}) ? $res->{error} : 'no data'));
+		return;
+	}
+	my $stored = 0;
+	for my $grp (@{ $res->{data} }) {
+		next unless $grp && ref $grp->{list} eq 'ARRAY';
+		my $g = $grp->{source} || '?';
+		next unless @{ $grp->{list} };
+		$stored++;
+		$st->{pages}{"$g|$page"} = $grp->{list};
+		$st->{total}{$g} = $grp->{total} if defined $grp->{total};
+		if ($src eq '*') {          # 探测轮：定顺序 + 定各平台上界（此后只许缩，不许长）
+			push @{ $st->{order} }, $g unless grep { $_ eq $g } @{ $st->{order} };
+			my $cap = $ALBUM_SEARCH_PER * $ALBUM_SEARCH_MAXPAGES;
+			my $t   = $grp->{total};
+			my $s   = (defined $t && $t > 0) ? ($t < $cap ? $t : $cap) : $cap;
+			my $cur = $st->{slots}{$g};
+			$st->{slots}{$g} = (defined $cur && $cur < $s) ? $cur : $s;
+		}
+		my $n = scalar @{ $grp->{list} };
+		if ($n < $ALBUM_SEARCH_PER) {   # 末页不足一页 ⇒ 收敛上界
+			my $seen = ($page - 1) * $ALBUM_SEARCH_PER + $n;
+			my $cur  = $st->{slots}{$g};
+			$st->{slots}{$g} = (defined $cur && $cur < $seen) ? $cur : $seen;
+		}
+	}
+	# ⚠️ 活性护栏（0.11.113，设备事故修复）：响应 ok 但**零分组**（单平台页号超界 / 上游整批
+	# 失败 ⇒ shim 的 catch 全吞后回 []）既没存页也没标失败 ⇒ _al_search_missing 会**永远
+	# 重发同一页** ⇒ 泵死循环 → 请求风暴 → qjs fork 堆积 → 整机冻死（0.11.112 装机实证，
+	# 用户被迫按 reset）。这里把"ok-但-空"按失败处理：标 fail + 收敛上界。
+	# （歌单搜索的 _pl_search_store 有同款洞，本轮一并补——见同函数。）
+	if (!$stored) {
+		if ($src ne '*') {
+			$st->{fail}{"$src|$page"} = 1;
+			my $seen = ($page - 1) * $ALBUM_SEARCH_PER;
+			my $cur  = $st->{slots}{$src};
+			$st->{slots}{$src} = (defined $cur && $cur < $seen) ? $cur : $seen;
+		}
+		$log->warn("LxMusic al-search $src page $page ok-but-empty (treated as failed)");
+	}
+	$st->{probed} = 1 if $src eq '*';
+	return;
+}
+
+sub _al_search_order {
+	my ($st) = @_;
+	return @{ $st->{order} || [] };
+}
+
+# 平台优先拼接几何：返回 [ [src, base, slots], ... ] 与总行数
+sub _al_search_geom {
+	my ($st) = @_;
+	my @geom;
+	my $base = 0;
+	for my $src (_al_search_order($st)) {
+		my $s = $st->{slots}{$src} || 0;
+		push @geom, [ $src, $base, $s ];
+		$base += $s;
+	}
+	return (\@geom, $base);
+}
+
+# 这个窗口还缺哪些上游页：[ ['*',1] ] = 首次探测；否则 [ [src,page], ... ]
+sub _al_search_missing {
+	my ($st, $index, $window) = @_;
+	return [ [ '*', 1 ] ] unless $st->{probed};
+
+	my ($geom) = _al_search_geom($st);
+	my @need;
+	my $stop = $index + $window;
+	for my $g (@$geom) {
+		my ($src, $base, $slots) = @$g;
+		next if $slots <= 0;
+		my $lo = $index > $base ? $index - $base : 0;
+		my $hi = $stop < $base + $slots ? $stop - $base : $slots;
+		next if $hi <= $lo;
+		my $p1 = int($lo / $ALBUM_SEARCH_PER) + 1;
+		my $p2 = int(($hi - 1) / $ALBUM_SEARCH_PER) + 1;
+		for my $p ($p1 .. $p2) {
+			next if $p > $ALBUM_SEARCH_MAXPAGES;
+			next if $st->{pages}{"$src|$p"} && @{ $st->{pages}{"$src|$p"} };
+			next if $st->{fail}{"$src|$p"};
+			push @need, [ $src, $p ];
+		}
+	}
+	return \@need;
+}
+
+# 组装这个窗口的 feed（items + 原生翻页契约）
+sub _al_search_feed {
+	my ($st, $index, $window) = @_;
+	my ($geom, $total) = _al_search_geom($st);
+
+	my @items;
+	my $stop = $index + $window;
+	for my $g (@$geom) {
+		my ($src, $base, $slots) = @$g;
+		next if $slots <= 0 || $base >= $stop || $base + $slots <= $index;
+		my $lo = $index > $base ? $index - $base : 0;
+		my $hi = $stop < $base + $slots ? $stop - $base : $slots;
+		my @rows;
+		for my $local ($lo .. $hi - 1) {
+			my $p   = int($local / $ALBUM_SEARCH_PER) + 1;
+			my $off = $local % $ALBUM_SEARCH_PER;
+			my $list = $st->{pages}{"$src|$p"};
+			next unless ref $list eq 'ARRAY' && @$list > $off;
+			push @rows, $list->[$off];
+		}
+		next unless @rows;
+		push @items, @{ _alItems($src, \@rows, scalar @rows) };
+	}
+
+	my $feed = {
+		items  => \@items,
+		offset => $index,
+		total  => $total,
+	};
+	$log->warn(sprintf('LxMusic al-search win idx=%d qty=%d rows=%d total=%d pages=%d failed=%d',
+		$index, $window, scalar(@items), $total, scalar(keys %{ $st->{pages} }), $st->{failed} || 0));
+	return @items
+		? $feed
+		: { items => [ {
+			name   => $st->{failed} ? _u('专辑搜索失败（上游页取不到）') : _u('无专辑结果'),
+			type   => 'text',
+		} ] };
+}
+
+# 专辑条目渲染（与 _plItems 同款：名称 +（来源 · N首 · 歌手 · 年份）+ 封面）。
+# shim 侧行契约：{ id, name, singer, cover, count, year }（id 必为 [A-Za-z0-9_-]）
+sub _alItems {
+	my ($src, $list, $max) = @_;
+	$max ||= 40;
+	my @items;
+	for my $al (@$list) {
+		next unless ref($al) eq 'HASH' && $al->{id};
+		my $name = _u($al->{name} || '?');
+		my $meta = join(_u(' · '), grep { $_ ne '' } (
+			_u($src),
+			($al->{count} ? _u($al->{count}) . _u('首') : ''),
+			($al->{singer} ? _u($al->{singer}) : ''),
+			($al->{year} ? _u($al->{year}) : ''),
+		));
+		my $img = $al->{cover} || '';
+		$img = 'https://d.musicapp.migu.cn' . $img if $img =~ m{^/};
+		# 封面同样走缩略 + 代理（_shouldProxyCover 按主机判定，mg 的 WebP 例外同歌单）
+		if ($img && $img =~ m{^https?://}) {
+			$img = _coverThumb($img);
+			$img = _coverProxyUrl($img) if _shouldProxyCover($img);
+		}
+		my $alurl = ($al->{id} =~ /^[A-Za-z0-9_-]+$/) ? "lxm://a/$src/$al->{id}" : undef;
+		# 专辑头部随下钻链接带下去（名字/封面/歌手/首数）——mg 详情要两跳，能省一跳是一跳
+		my $head = eval {
+			encode_base64url($TRACK_JSON->encode({
+				name   => $al->{name} || '',
+				img    => ($img && $img =~ m{^https?://}) ? $img : '',
+				author => $al->{singer} || '',
+				count  => ($al->{count} || 0) + 0,
+			}))
+		} // '';
+		push @items, {
+			name        => _u('💿 ') . $name . ($meta ne '' ? "  ($meta)" : ''),
+			# ⚠️ type=playlist 是**行内原生按钮的钥匙**（0.11.115，用户要求"条目右侧 添加/收藏/播放"）：
+			#   达菲皮肤 gencontrol（tmp/daphile-xmlbrowser.html:198-214）：type=playlist ⇒
+			#   ▶ playAllLink / ＋ addAllLink（action=playall/addall → XMLBrowser.pm:409-417
+			#   把 playlist 属性换成 url → playlist play → explodePlaylist 整单展开）；
+			#   ♡ 收藏来自 _favoritesUrl（Slim/Web/XMLBrowser.pm:1412）：type=playlist +
+			#   playlist 属性 ⇒ 收藏 URL=lxm://a/... ⇒ 从收藏播放也走整单展开。
+			#   type=link（旧值）在这三个分支里都落进 dummylink（行尾两个灰点）＝用户看到的"没按钮"。
+			#   下钻不受影响：行名链接走 item.index（模板 :361 ELSE 分支），与 type 无关。
+			type        => 'playlist',
+			url         => \&sdkAlbumDetailHandler,
+			passthrough => [ 'albumdetail', $src, $al->{id}, $head ],
+			($alurl ? (playlist => $alurl) : ()),
+			# ♡ 收藏的钥匙：_favoritesUrl（Slim/Web/XMLBrowser.pm:1412）先看 favorites_url——
+			# 本行 url 是 coderef（下钻用），不给 favorites_url 的话函数因 !ref 失败返回 undef
+			# ⇒ 行级 favorites 永不置位 ⇒ ♡ 不渲染（0.11.115 设备渲染实证：▶/＋ 出了、♡ 没出）。
+			# 给了之后：收藏 URL=lxm://a/...（favadd :1005 用 favorites_title/name、type=playlist
+			# 原样保留 ⇒ 从收藏播放=整单展开）。
+			($alurl ? (favorites_url => $alurl) : ()),
+			# 收藏条目的名字用干净的专辑名（favadd 取 favorites_title || name，:1005）——
+			# 别把 💿 和 "kg · 11首 · 周杰伦 · 2008-10-15" 塞进收藏列表
+			favorites_title => $name,
 			(($img && $img =~ m{^https?://}) ? (image => _u($img)) : ()),
 		};
 		last if @items >= $max;
@@ -1882,6 +2188,117 @@ sub sdkSonglistDetailHandler {
 	);
 	};
 	$fetch->();
+	return;
+}
+
+# 专辑详情（0.11.112）：shim 一次把整张拿回来（各平台 cap 300 首）⇒ 窗口**纯本地切片**，
+# 与歌单详情"按窗取数"相反——专辑普遍 ≤100 首，整取比分窗打上游更快也更省。
+# 页头配方与歌单详情同款（feed 级 image/play/actions/albumData）；整单播放走 lxm://a/。
+# ⚠️ 专辑 >300 首时行数在 300 截断（total 仍如实显示；真需要再加按窗取数）。
+sub sdkAlbumDetailHandler {
+	my ($client, $cb, $args, $mode, $src, $alid, $headB64) = @_;
+	$src  ||= 'kg';
+	$alid ||= '';
+
+	unless (length $alid) {
+		$cb->({ items => [ { name => _u('专辑 id 缺失'), type => 'text' } ] });
+		return;
+	}
+
+	# 列表行随链接带下来的专辑头部（name/img/author/count）——mg 详情省一跳的成果
+	my $head = {};
+	if (defined $headB64 && length $headB64) {
+		my $hj = eval { decode_base64url($headB64) };
+		my $h  = $hj ? eval { JSON::XS->new->utf8->decode($hj) } : undef;
+		$head = $h if ref $h eq 'HASH';
+	}
+
+	my $index  = $args->{index} || 0;
+	my $window = $args->{quantity} || 50;
+	$window = 50 if $window < 1 || $window > 300;
+
+	my $ckey = join('|', 'ald', $src, $alid, $index);
+	if (my $hit = _feed_cache_get($ckey, $PL_DETAIL_TTL, $window)) {
+		$cb->($hit);
+		return;
+	}
+	# 覆盖式命中：看过一次整页后，点这一页里的任意一首不再打上游
+	if (my $hit = _feed_cache_cover('ald', $src, $alid, $index, $window, $PL_DETAIL_TTL)) {
+		$cb->($hit);
+		return;
+	}
+
+	my $t0 = time();
+	Plugins::LxMusic::Helper->request(
+		action  => 'albumtracks',
+		info    => { source => $src, id => $alid },
+		timeout => 30,
+		cb      => sub {
+			my ($res) = @_;
+			unless ($res->{ok} && $res->{data} && $res->{data}{list}) {
+				$cb->({ items => [ { name => _u('专辑详情失败: ') . ($res->{error} || 'unknown'), type => 'text' } ] });
+				return;
+			}
+			_log_shim_http('al-detail', $res);
+
+			my $all   = $res->{data}{list};
+			my $info  = $res->{data}{info} || {};
+			my $total = $info->{count} || $head->{count} || $res->{data}{total} || scalar @$all;
+
+			# 封面：shim info 优先（未处理的原图）→ 列表行那份（已缩略/代理）→ 首曲推导
+			my $cover;
+			if (($info->{img} // '') =~ m{^https?://}) {
+				my $im = $info->{img};
+				$im = _coverThumb($im);
+				$cover = _shouldProxyCover($im) ? _coverProxyUrl($im) : $im;
+			}
+			elsif (($head->{img} // '') =~ m{^https?://}) {
+				$cover = $head->{img};
+			}
+			elsif (@$all && $all->[0]) {
+				$cover = _coverOf($all->[0]);
+			}
+
+			my @list = @$all;
+			@list = @list[ $index .. $#list ] if $index && @list > $index;
+			@list = @list[ 0 .. $window - 1 ] if @list > $window;
+			my $tracks = _trackItems(\@list, undef, undef, $index);
+
+			my $alname = $info->{name}  || $head->{name} || $alid;
+			my $author = $info->{author} || $head->{author} || '';
+
+			my $feed = {
+				items  => $tracks,
+				offset => $index,
+				(total => $total),
+				($cover ? (image => $cover) : ()),
+				(play    => "lxm://a/$src/$alid"),
+				(actions => _all_actions("lxm://a/$src/$alid")),
+				(albumData => [
+					{ name => _u('💿 ') . _u($alname), type => 'text', label => 'ALBUM' },
+					{ name => _u('[' . $src . ']')
+						. ($author ? _u(' · ') . _u($author) : '')
+						. _u(' · ') . int($total) . _u(' 首'),
+					  type => 'text', label => 'ARTIST' },
+				]),
+			};
+			_feed_cache_put($ckey, $feed, $window);
+			# 整张都在手里 ⇒ 顺手把**下一个窗口**本地切好（0 上游流量，下一页直接命中缓存；
+			# 同歌单详情 0.11.89 的"上游给整单"分支，这里是无条件常态）
+			if ($total > ($index + $window) && scalar(@$all) > ($index + $window)) {
+				my $nidx = $index + $window;
+				my @nlist = @$all;
+				@nlist = @nlist[ $nidx .. $#nlist ] if @nlist > $nidx;
+				@nlist = @nlist[ 0 .. $window - 1 ] if @nlist > $window;
+				my $nfeed = { %$feed, items => _trackItems(\@nlist, undef, undef, $nidx), offset => $nidx };
+				_feed_cache_put(join('|', 'ald', $src, $alid, $nidx), $nfeed, $window);
+			}
+			$log->warn(sprintf('LxMusic al-detail MISS src=%s id=%s idx=%d win=%d tracks=%d total=%d shim_ms=%s ms=%d',
+				$src, $alid, $index, $window, scalar(@$tracks), int($total),
+				(defined $res->{ms} ? $res->{ms} : '?'), int((time() - $t0) * 1000)));
+			$cb->($feed);
+		},
+	);
 	return;
 }
 

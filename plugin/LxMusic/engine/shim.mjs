@@ -785,7 +785,7 @@ async function main(std, os) {
 	//   boards    payload = { source }                       -> getBoards()
 	//   boardlist payload = { source, bangid|id, page? }     -> getList(bangid, page)
 	//     注：kg/tx/wy/mg 的 getList 吃 bangid；kw 榜单上游 wbd 签名已失效（搜索不受影响）
-	const SDK_ACTIONS = { search: 1, boards: 1, boardlist: 1, songlist: 1, songlistdetail: 1, songlistbytag: 1, songlistsorts: 1, songlisttags: 1 };
+	const SDK_ACTIONS = { search: 1, boards: 1, boardlist: 1, songlist: 1, songlistdetail: 1, songlistbytag: 1, songlistsorts: 1, songlisttags: 1, albumsearch: 1, albumtracks: 1 };
 	// 0.11.43：这个分支同时服务「fork 单次」与「常驻 worker」两种形态。
 	// 动机：设备是 i386（Atom 级），每个请求 fork 一个 qjs 再解析 ~700KB bundle ≈ 0.5s；
 	// 而歌单下钻一次要问好几层（平台/排序/分类/列表/曲目），这笔固定开销被放大数倍。
@@ -1294,6 +1294,449 @@ async function main(std, os) {
 			};
 		}
 
+		// ============================================================
+		// 0.11.112 专辑搜索（albumsearch）+ 专辑曲目（albumtracks）
+		// 五平台 lean 直连；端点/字段/坑的侦查与实测见 docs/album-search-feasibility.md
+		// （2026-10-08 宿主侧逐平台验证过：搜索+详情全通）。订阅源无关：搜索不经过订阅源，
+		// 与歌曲/歌单搜索同一性质（发现类全走插件侧）。
+		// 列表行形状契约（Perl 侧 _alItems 消费）：
+		//   { id, name, singer, cover, count, year }  —— id 必为 [A-Za-z0-9_-]（lxm://a/ 正则）
+		// ============================================================
+
+		// ---- sha1（纯 JS，hex 输出）。shim 主层没有现成 hash 入口（node-crypto.js 只服务
+		// sdk bundle 的模块表），tx 专辑搜索的 zzcSign 需要它。输入按 UTF-8 字节处理。----
+		function __sha1Hex(str) {
+			const msg = toUtf8(String(str));
+			const ml = msg.length;
+			const total = (((ml + 9) + 63) >> 6) << 6;          // 补位后的总字节数（≥64）
+			const W = new Int32Array(total >> 2);
+			for (let i = 0; i < ml; i++) W[i >> 2] |= msg[i] << ((3 - (i & 3)) << 3);
+			W[ml >> 2] |= 0x80 << ((3 - (ml & 3)) << 3);
+			W[(total >> 2) - 1] = (ml << 3) & 0xffffffff;       // bit 长度（低 32 位；搜索串远小于 512MB）
+			let h0 = 0x67452301, h1 = 0xefcdab89, h2 = 0x98badcfe, h3 = 0x10325476, h4 = 0xc3d2e1f0;
+			const w = new Int32Array(80);
+			const rotl = (n, b) => ((n << b) | (n >>> (32 - b)));   // 循环左移（sha1 标准）
+			for (let off = 0; off < total; off += 64) {
+				for (let i = 0; i < 16; i++) w[i] = W[(off >> 2) + i];
+				for (let i = 16; i < 80; i++) {
+					const n = w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16];
+					w[i] = (n << 1) | (n >>> 31);
+				}
+				let a = h0, b = h1, c = h2, d = h3, e = h4;
+				for (let i = 0; i < 80; i++) {
+					let f, k;
+					if (i < 20)      { f = (b & c) | (~b & d);            k = 0x5a827999; }
+					else if (i < 40) { f = b ^ c ^ d;                     k = 0x6ed9eba1; }
+					else if (i < 60) { f = (b & c) | (b & d) | (c & d);   k = 0x8f1bbcdc; }
+					else             { f = b ^ c ^ d;                     k = 0xca62c1d6; }
+					const t = (rotl(a, 5) + f + e + k + w[i]) | 0;
+					e = d; d = c; c = rotl(b, 30); b = a; a = t;
+				}
+				h0 = (h0 + a) | 0; h1 = (h1 + b) | 0; h2 = (h2 + c) | 0;
+				h3 = (h3 + d) | 0; h4 = (h4 + e) | 0;
+			}
+			const part = n => ('00000000' + (n >>> 0).toString(16)).slice(-8);
+			return part(h0) + part(h1) + part(h2) + part(h3) + part(h4);
+		}
+
+		// ---- tx musics.fcg 签名（zzcSign，逐字复刻 vendored tx/utils/crypto.js）----
+		// ⚠️ 越界语义坑：PART_1_INDEXES 里的 **40** 超出 sha1 hex（40 字符）的最后下标，
+		// JS `hash[40]` 是 undefined、`Array.prototype.join` 把 undefined 拼成**空串**——
+		// 其它语言按"越界=抛错"移植会当场崩（宿主侧 Python 探针 2026-10-08 踩过）。
+		const __TX_P1 = [23, 14, 6, 36, 16, 40, 7, 19];
+		const __TX_P2 = [16, 1, 32, 12, 19, 27, 8, 5];
+		const __TX_SCRAMBLE = [89, 39, 179, 150, 218, 82, 58, 252, 177, 52, 186, 123, 120, 64, 242, 133, 143, 161, 121, 179];
+		function __txZzcSign(text) {
+			const h = __sha1Hex(text);
+			const pick = idxs => idxs.map(i => (i < h.length ? h[i] : '')).join('');
+			const bytes = [];
+			for (let i = 0; i < 20; i++) bytes.push(__TX_SCRAMBLE[i] ^ parseInt(h.slice(i * 2, i * 2 + 2), 16));
+			const B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+			let b64 = '';
+			for (let i = 0; i < bytes.length; i += 3) {
+				const has1 = i + 1 < bytes.length, has2 = i + 2 < bytes.length;
+				const n1 = bytes[i], n2 = has1 ? bytes[i + 1] : 0, n3 = has2 ? bytes[i + 2] : 0;
+				b64 += B64[n1 >> 2] + B64[((n1 & 3) << 4) | (n2 >> 4)];
+				if (has1) b64 += B64[((n2 & 15) << 2) | (n3 >> 6)];
+				if (has2) b64 += B64[n3 & 63];
+			}
+			// 上游是“整串 base64 后删 / + =”；20 字节 → 27 字符（无 padding 等价）
+			return ('zzc' + pick(__TX_P1) + b64.replace(/[\/+=]/g, '') + pick(__TX_P2)).toLowerCase();
+		}
+
+		// ⚠️ sign 必须对**将要发送的同一串** payload 计算（签名串与发送体逐字节一致——
+		// 宿主侧曾因“签名用紧凑串、发送用带空格串”拿到 code 2000）。
+		async function __txSignedPost(bodyObj) {
+			const payload = JSON.stringify(bodyObj);
+			const r = await globalThis.__lxBinHttp.fetch('https://u.y.qq.com/cgi-bin/musics.fcg?sign=' + __txZzcSign(payload), {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json', 'User-Agent': 'QQMusic 14090508(android 12)' },
+				body: toUtf8(payload),
+				timeout: 15000,
+			});
+			if (r.statusCode !== 200) throw new Error('tx album http ' + r.statusCode);
+			return JSON.parse(utf8Decode(r.bytes));
+		}
+
+		// ---- 各平台专辑搜索：统一返回 { list: [{id,name,singer,cover,count,year}], total } ----
+		async function __albumSearch(src, q, page, limit) {
+			if (src === 'kw') return __albumSearchKw(q, page, limit);
+			if (src === 'kg') return __albumSearchKg(q, page, limit);
+			if (src === 'tx') return __albumSearchTx(q, page, limit);
+			if (src === 'wy') return __albumSearchWy(q, page, limit);
+			if (src === 'mg') return __albumSearchMg(q, page, limit);
+			throw new Error('albumsearch: unknown source ' + src);
+		}
+
+		async function __albumSearchKw(q, page, limit) {
+			// ⚠️ `mobi=1` 是开关：缺它 ft=album 会被无视且回单引号非严格 JSON（侦查实测）
+			const url = 'http://search.kuwo.cn/r.s?all=' + encodeURIComponent(q)
+				+ '&ft=album&rformat=json&encoding=utf8&rn=' + limit + '&pn=' + (page - 1) + '&mobi=1';
+			const r = await globalThis.__lxBinHttp.fetch(url, { timeout: 15000 });
+			if (r.statusCode !== 200) throw new Error('kw album http ' + r.statusCode);
+			const j = JSON.parse(utf8Decode(r.bytes));
+			const list = (j.albumlist || []).map(it => ({
+				id: String(it.albumid || it.id || ''),
+				name: String(it.album || it.name || ''),
+				singer: String(it.artist || ''),
+				cover: String(it.hts_img || it.img || ''),
+				count: Number(it.albumnum) || Number(it.songnum) || 0,
+				year: '',
+			}));
+			return { list, total: Number(j.TOTAL) || list.length };
+		}
+
+		async function __albumSearchKg(q, page, limit) {
+			const url = 'http://mobilecdn.kugou.com/api/v3/search/album?keyword=' + encodeURIComponent(q)
+				+ '&page=' + page + '&pagesize=' + limit;
+			const r = await globalThis.__lxBinHttp.fetch(url, { timeout: 15000 });
+			if (r.statusCode !== 200) throw new Error('kg album http ' + r.statusCode);
+			const j = JSON.parse(utf8Decode(r.bytes));
+			const d = (j && j.data) || {};
+			const list = (d.info || []).map(it => ({
+				id: String(it.albumid != null ? it.albumid : ''),
+				name: String(it.albumname || ''),
+				singer: String(it.singername || ''),
+				cover: it.imgurl ? String(it.imgurl).replace('{size}', '240') : '',
+				count: Number(it.songcount) || 0,
+				year: String(it.publishtime || '').slice(0, 10),
+			}));
+			return { list, total: Number(d.total) || list.length };
+		}
+
+		async function __albumSearchTx(q, page, limit) {
+			// search_type：0=歌曲、2=专辑、8=用户（侦查实测）
+			const j = await __txSignedPost({
+				comm: {
+					_channelid: '0', _os_version: '6.2.9200-2', ct: '19', cv: '2151',
+					guid: '1F70E520B2EAA7D25E11760783C53CA9', patch: '118',
+					psrf_access_token_expiresAt: 0, psrf_qqaccess_token: '', psrf_qqopenid: '',
+					psrf_qqunionid: '', tmeAppID: 'qqmusic', tmeLoginType: 0, uin: '0',
+					wid: '7223299733393904640',
+				},
+				req: {
+					module: 'music.search.SearchCgiService', method: 'DoSearchForQQMusicDesktop',
+					param: {
+						grp: 1, num_per_page: limit, page_num: page, query: q,
+						remoteplace: 'txt.newclient.top', search_type: 2, searchid: '94611404730223620',
+					},
+				},
+			});
+			const req1 = j && j.req;
+			if (!req1 || req1.code !== 0) throw new Error('tx album search code ' + (req1 && req1.code));
+			const al = ((req1.data || {}).body || {}).album || {};
+			const list = (al.list || []).map(it => ({
+				id: String(it.albumMID || ''),
+				name: String(it.albumName || ''),
+				singer: String(it.singerName || ''),
+				cover: String(it.albumPic || ''),
+				count: Number(it.song_count) || 0,
+				year: String(it.publicTime || '').slice(0, 10),
+			}));
+			return { list, total: Number(al.totalnum) || list.length };
+		}
+
+		async function __albumSearchWy(q, page, limit) {
+			const url = 'https://music.163.com/api/search/get/web?s=' + encodeURIComponent(q)
+				+ '&type=10&limit=' + limit + '&offset=' + ((page - 1) * limit);
+			const r = await globalThis.__lxBinHttp.fetch(url, {
+				headers: { 'User-Agent': 'Mozilla/5.0', Referer: 'https://music.163.com' },
+				timeout: 15000,
+			});
+			if (r.statusCode !== 200) throw new Error('wy album http ' + r.statusCode);
+			const j = JSON.parse(utf8Decode(r.bytes));
+			const res = j.result || {};
+			const list = (res.albums || []).map(it => ({
+				id: String(it.id != null ? it.id : ''),
+				name: String(it.name || ''),
+				singer: String((it.artist || {}).name || ''),
+				cover: String(it.picUrl || ''),
+				count: Number(it.size) || 0,
+				year: '',
+			}));
+			return { list, total: Number(res.albumCount) || list.length };
+		}
+
+		async function __albumSearchMg(q, page, limit) {
+			// app.c.nf.migu.cn（免签名）与死掉的 jadeite 不是一台——侦查实测 310-437ms 可达
+			const sw = JSON.stringify({ song: 0, album: 1, singer: 0, tagSong: 0, mvSong: 0, songlist: 0, bestShow: 0 });
+			const url = 'https://app.c.nf.migu.cn/MIGUM2.0/v1.0/content/search_all.do?ua=Android_migu&version=5.0.1'
+				+ '&text=' + encodeURIComponent(q) + '&pageNo=' + page + '&pageSize=' + limit
+				+ '&searchSwitch=' + encodeURIComponent(sw);
+			const r = await globalThis.__lxBinHttp.fetch(url, {
+				headers: { 'User-Agent': 'okhttp/3.9.1' }, timeout: 15000,
+			});
+			if (r.statusCode !== 200) throw new Error('mg album http ' + r.statusCode);
+			const j = JSON.parse(utf8Decode(r.bytes));
+			const ard = j.albumResultData || {};
+			// ⚠️ result 里混着非专辑卡（resourceType 2003=歌曲），必须按 '5' 过滤
+			const list = (ard.result || [])
+				.filter(it => it && String(it.resourceType) === '5')
+				.map(it => ({
+					id: String(it.id || ''),
+					name: String(it.name || ''),
+					singer: String(it.singer || ''),
+					cover: __mgImg(it.imgItems),
+					count: 0,
+					year: String(it.publishDate || '').slice(0, 10),
+				}));
+			return { list, total: Number(ard.totalCount) || list.length };
+		}
+
+		// mg 卡片封面对象数组（imgSizeType 01/02/03）→ 取一个 URL
+		function __mgImg(items) {
+			const arr = items || [];
+			const pick = t => { for (const it of arr) { if (it && it.imgSizeType === t && it.img) return String(it.img); } return ''; };
+			return pick('02') || pick('03') || pick('01') || (arr[0] && arr[0].img ? String(arr[0].img) : '');
+		}
+
+		// mg 档位声明（newRateFormats，与 SDK filterData 的 PQ/HQ/SQ/ZQ24 同映射）→ types/_types
+		function __mgTypes(formats) {
+			const types = [], _types = {};
+			(formats || []).forEach(t => {
+				const ft = t && (t.formatType || t.type);
+				let ty = null;
+				if (ft === 'PQ') ty = '128k';
+				else if (ft === 'HQ') ty = '320k';
+				else if (ft === 'SQ') ty = 'flac';
+				else if (ft === 'ZQ24') ty = 'flac24bit';
+				if (ty && !_types[ty]) { types.push({ type: ty }); _types[ty] = {}; }
+			});
+			return { types, _types };
+		}
+
+		// ---- 各平台专辑曲目：整张一次取（专辑普遍 ≤100 首，上游 cap 300）。
+		// 统一返回 { list: SDK songInfo 形状（与各平台搜索/歌单详情同构 ⇒ 直接进取链）,
+		//            total, source, info: {name, img, author, count} } ----
+		async function __albumTracksKw(id) {
+			if (!/^[A-Za-z0-9_-]+$/.test(id)) throw new Error('kw albumtracks: bad id');
+			const url = 'http://search.kuwo.cn/r.s?pn=0&rn=300&stype=albuminfo&albumid=' + encodeURIComponent(id)
+				+ '&show_copyright_off=0&encoding=utf&vipver=MUSIC_9.1.0&mobi=1&rformat=json';
+			const r = await globalThis.__lxBinHttp.fetch(url, { timeout: 15000 });
+			if (r.statusCode !== 200) throw new Error('kw albumtracks http ' + r.statusCode);
+			const j = JSON.parse(utf8Decode(r.bytes));
+			const sl = sdk.kw && sdk.kw.songList;
+			if (!sl || !sl.filterListDetail) throw new Error('kw albumtracks: sdk unavailable');
+			// 复用 SDK 的 filterListDetail（N_MINFO 解析档位不重写）；⚠️ 专辑接口的字段是
+			// camelCase `albumId`，而 filterListDetail 读小写 `albumid` ⇒ 事后补齐
+			const list = (sl.filterListDetail(j.musiclist || []) || []).map(t => {
+				if (t && t.albumId == null) t.albumId = String(id);
+				return t;
+			});
+			const count = Number(j.songnum) || list.length;
+			return {
+				list, page: 1, limit: 300, total: count, source: 'kw',
+				info: { name: j.name || j.title || '', img: j.pic || j.img || '', author: j.artist || '', count },
+			};
+		}
+
+		async function __albumTracksKg(id) {
+			if (!/^\d+$/.test(id)) throw new Error('kg albumtracks: bad id');
+			const url = 'http://mobiles.kugou.com/api/v3/album/song?version=9108&albumid=' + id
+				+ '&plat=0&pagesize=300&area_code=0&page=1&with_res_tag=0';
+			const r = await globalThis.__lxBinHttp.fetch(url, { timeout: 15000 });
+			if (r.statusCode !== 200) throw new Error('kg albumtracks http ' + r.statusCode);
+			const j = JSON.parse(utf8Decode(r.bytes));
+			if (!j || j.status !== 1 || !j.data) throw new Error('kg albumtracks: bad body');
+			const d = j.data || {};
+			// ⚠️ 曲目列表在 data.info（不是 songs）；字段与 special/song 同构，映射同 kgLeanDetail
+			const list = (d.info || []).map(it => {
+				const types = [], _types = {};
+				if (it.filesize) { const s = __sizeFmt(it.filesize); types.push({ type: '128k', size: s, hash: it.hash }); _types['128k'] = { size: s, hash: it.hash }; }
+				if (it['320filesize']) { const s = __sizeFmt(it['320filesize']); types.push({ type: '320k', size: s, hash: it['320hash'] }); _types['320k'] = { size: s, hash: it['320hash'] }; }
+				if (it['sqfilesize']) { const s = __sizeFmt(it['sqfilesize']); types.push({ type: 'flac', size: s, hash: it.sqhash }); _types.flac = { size: s, hash: it.sqhash }; }
+				const fn = String(it.filename || '');
+				const dash = fn.indexOf(' - ');
+				const singer = dash > 0 ? fn.slice(0, dash) : '';
+				const name = dash > 0 ? fn.slice(dash + 3) : fn;
+				let secs = Number(it.duration) || 0;
+				if (secs > 10000) secs = Math.round(secs / 1000);
+				return {
+					singer, name, albumName: '',
+					albumId: String(it.album_id != null ? it.album_id : id),
+					songmid: String(it.audio_id != null ? it.audio_id : ''),
+					albumAudioId: String(it.album_audio_id != null ? it.album_audio_id : ''),
+					source: 'kg', interval: __fmtTime(secs), img: null, lrc: null,
+					hash: it.hash, types, _types, typeUrl: {},
+				};
+			});
+			const count = Number(d.total) || list.length;
+			return { list, page: 1, limit: 300, total: count, source: 'kg', info: { name: '', img: '', author: '', count } };
+		}
+
+		async function __albumTracksTx(mid) {
+			if (!/^[A-Za-z0-9_-]+$/.test(mid)) throw new Error('tx albumtracks: bad id');
+			// 经典免签端点（signed 的 AlbumSongList 模块实测 code 104400 拒绝——侦查记录）
+			const url = 'https://c.y.qq.com/v8/fcg-bin/fcg_v8_album_info_cp.fcg?albummid=' + encodeURIComponent(mid)
+				+ '&format=json&platform=yqq';
+			const r = await globalThis.__lxBinHttp.fetch(url, {
+				headers: { Referer: 'https://y.qq.com/', 'User-Agent': 'Mozilla/5.0' }, timeout: 15000,
+			});
+			if (r.statusCode !== 200) throw new Error('tx albumtracks http ' + r.statusCode);
+			const j = JSON.parse(utf8Decode(r.bytes));
+			const d = (j && j.data) || {};
+			const cover = 'https://y.gtimg.cn/music/photo_new/T002R500x500M000' + mid + '.jpg';
+			// v8 字段（size128/…）与歌单口（file.size_128mp3/…）不同构 ⇒ 手工映射到 tx songInfo
+			const list = (d.list || []).map(it => {
+				const types = [], _types = {};
+				if (it.size128) { const s = __sizeFmt(it.size128); types.push({ type: '128k', size: s }); _types['128k'] = { size: s }; }
+				if (it.size320) { const s = __sizeFmt(it.size320); types.push({ type: '320k', size: s }); _types['320k'] = { size: s }; }
+				if (it.sizeflac) { const s = __sizeFmt(it.sizeflac); types.push({ type: 'flac', size: s }); _types.flac = { size: s }; }
+				return {
+					singer: (it.singer || []).map(s => s.name).join('、'),
+					name: String(it.songname || ''),
+					albumName: String(it.albumname || ''),
+					albumId: String(it.albummid || mid),
+					albumMid: String(it.albummid || mid),
+					songId: it.songid,
+					songmid: String(it.songmid || ''),
+					strMediaMid: String(it.songmid || ''),
+					source: 'tx',
+					interval: __fmtTime(Number(it.interval) || 0),
+					img: cover,
+					lrc: null, otherSource: null,
+					types, _types, typeUrl: {},
+				};
+			});
+			const count = list.length;
+			const author = list.length && list[0].singer ? list[0].singer : '';
+			return { list, page: 1, limit: 300, total: count, source: 'tx',
+				info: { name: String(d.name || ''), img: cover, author, count } };
+		}
+
+		async function __albumTracksWy(id) {
+			if (!/^\d+$/.test(id)) throw new Error('wy albumtracks: bad id');
+			const sl = sdk.wy && sdk.wy.songList;
+			// ① 专辑头 + 歌曲（免签名明文；⚠️ 该口**不带 privileges**——root 只有
+			//   resourceState/songs/code/album，侦查实测 ⇒ 必须像 wyLeanDetail 那样补第二跳）
+			const r1 = await globalThis.__lxBinHttp.fetch('https://music.163.com/api/v1/album/' + id, {
+				headers: { 'User-Agent': 'Mozilla/5.0', Referer: 'https://music.163.com' }, timeout: 15000,
+			});
+			if (r1.statusCode !== 200) throw new Error('wy albumtracks http ' + r1.statusCode);
+			const j1 = JSON.parse(utf8Decode(r1.bytes));
+			const al = (j1 && j1.album) || {};
+			const songs = j1.songs || [];
+			if (!songs.length) throw new Error('wy albumtracks: empty songs');
+			// ② privileges（明文 POST /api/v3/song/detail，与 wyLeanDetail 同源）
+			let privs = [];
+			try {
+				const idsJson = '[' + songs.map(s => String(s.id)).join(',') + ']';
+				const cjson = '[' + songs.map(s => '{"id":' + String(s.id) + '}').join(',') + ']';
+				const form = 'ids=' + encodeURIComponent(idsJson) + '&c=' + encodeURIComponent(cjson);
+				// ⚠️ wyLeanDetail 的 WY_HDRS 是它函数内的局部常量，这里拿不到 ⇒ 自带同款
+				const wyHeaders = {
+					'Content-Type': 'application/x-www-form-urlencoded',
+					'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/60.0.3112.90 Safari/537.36',
+					'Referer': 'https://music.163.com/',
+					'Cookie': 'MUSIC_U=',
+				};
+				const r2 = await globalThis.__lxBinHttp.fetch('https://music.163.com/api/v3/song/detail', {
+					method: 'POST',
+					headers: wyHeaders,
+					body: toUtf8(form),
+					timeout: 15000,
+				});
+				if (r2.statusCode === 200) {
+					const b2 = JSON.parse(utf8Decode(r2.bytes));
+					if (b2 && Array.isArray(b2.privileges) && b2.privileges.length) privs = b2.privileges;
+				}
+			} catch (e) { /* privileges 拿不到 ⇒ 走手工兜底映射（无档位声明） */ }
+			let list;
+			if (sl && sl.filterListDetail && privs.length) {
+				// ⚠️ 缺 privileges 时 filterListDetail 会在 privilege.id 上抛——两者必须成对
+				list = sl.filterListDetail({ playlist: { tracks: songs }, privileges: privs });
+			} else {
+				list = songs.map(s => ({
+					singer: (s.ar || []).map(a => a.name).join('、'),
+					name: String(s.name || ''),
+					albumName: String((s.al || {}).name || al.name || ''),
+					albumId: String(id),
+					source: 'wy',
+					interval: __fmtTime(Math.round((s.dt || 0) / 1000)),
+					songmid: String(s.id),
+					img: String((s.al || {}).picUrl || al.picUrl || ''),
+					lrc: null, otherSource: null,
+					types: [], _types: {}, typeUrl: {},
+				}));
+			}
+			const count = Number(al.size) || list.length;
+			return { list, page: 1, limit: 300, total: count, source: 'wy',
+				info: {
+					name: String(al.name || ''), img: String(al.picUrl || ''),
+					author: String((al.artist || {}).name || ''), count,
+				} };
+		}
+
+		async function __albumTracksMg(id) {
+			if (!/^[A-Za-z0-9_-]+$/.test(id)) throw new Error('mg albumtracks: bad id');
+			const H = { 'User-Agent': 'okhttp/3.9.1' };
+			// ⚠️ id 空间有三套：搜索卡带的是 contentId（6009270…），queryAlbumSong 只认
+			// materialId（1139605…，即歌曲项 albums[0].id）。先过一遍实体换 id：
+			// 实体拿不到/没有 materialId 时按“id 已是 materialId”直接试曲目口（兜底）。
+			let materialId = String(id);
+			let meta = {};
+			try {
+				const r1 = await globalThis.__lxBinHttp.fetch(
+					'https://app.c.nf.migu.cn/MIGUM2.0/v1.0/content/resourceinfo.do?resourceId=' + encodeURIComponent(id)
+					+ '&resourceType=5', { headers: H, timeout: 15000 });
+				if (r1.statusCode === 200) {
+					const j1 = JSON.parse(utf8Decode(r1.bytes));
+					const ent = (j1.resource || [])[0] || {};
+					if (ent.materialId) materialId = String(ent.materialId);
+					meta = ent;
+				}
+			} catch (e) { /* 实体失败不致命：曲目口用原 id 兜底 */ }
+			const r2 = await globalThis.__lxBinHttp.fetch(
+				'https://app.c.nf.migu.cn/MIGUM2.0/v1.0/content/queryAlbumSong?albumId=' + encodeURIComponent(materialId)
+				+ '&pageNo=1&pageSize=300', { headers: H, timeout: 15000 });
+			if (r2.statusCode !== 200) throw new Error('mg albumtracks http ' + r2.statusCode);
+			const j2 = JSON.parse(utf8Decode(r2.bytes));
+			const raw = ((j2.data || {}).songList) || [];
+			const img = __mgImg(meta.imgItem) || __mgImg(raw.length ? (raw[0].albumImgs || raw[0].imgItems) : []);
+			const list = raw.map(it => {
+				const t = __mgTypes(it.newRateFormats || it.rateFormats);
+				return {
+					singer: String(it.singer || ''),
+					name: String(it.songName || ''),
+					albumName: String(it.album || ''),
+					albumId: String(it.albumId || materialId),
+					songmid: String(it.songId || ''),
+					copyrightId: String(it.copyrightId || ''),
+					source: 'mg',
+					interval: it.duration ? __fmtTime(Number(it.duration)) : '',
+					img,
+					lrc: null, otherSource: null,
+					types: t.types, _types: t._types, typeUrl: {},
+				};
+			});
+			const count = Number(meta.totalCount) || list.length;
+			return { list, page: 1, limit: 300, total: count, source: 'mg',
+				info: {
+					name: String(meta.title || ''), img,
+					author: String(meta.singer || ''), count,
+				} };
+		}
+
 		// 0.11.43：参数化（从前闭包吃外层的 action/payload，常驻 worker 一进程要服务多个请求）
 		const runSdk = async (act, argPayload) => {
 			const action = act;
@@ -1430,6 +1873,40 @@ async function main(std, os) {
 					}
 				}
 				return await sl.getListDetail(id, page);
+			}
+			if (action === 'albumsearch') {
+				// 专辑搜索：跨平台并行（与 songlist 同构——groups 数组、每平台 page/total）。
+				// `payload.source` 只取一个平台：插件的虚拟列表是平台优先拼接，
+				// 翻页窗口往往只落在一个平台上（0.11.78 同款教训：不过滤会把 4/5 请求白打）。
+				const q = String(payload.query || payload.name || '');
+				if (!q) throw new Error('albumsearch: query required');
+				const page = Number(payload.page) || 1;
+				const perSrc = Number(payload.limit) || 30;
+				const only = payload.source || payload.src || '';
+				const AL_SOURCES = only ? [String(only)] : ['kg', 'tx', 'wy', 'mg', 'kw'];
+				const tasks = AL_SOURCES.map(s =>
+					__albumSearch(s, q, page, perSrc).then(r => {
+						if (!r || !r.list || !r.list.length) return null;
+						return { source: s, page, list: r.list, total: r.total };
+					}).catch(e => {
+						print('LOG albumsearch ' + s + ' failed: ' + String((e && e.message) || e));
+						return null;
+					})
+				);
+				const groups = (await Promise.all(tasks)).filter(g => g);
+				return groups;
+			}
+			if (action === 'albumtracks') {
+				// 专辑曲目：整张一次取（各 __albumTracks* 内部 cap 300），插件侧窗口切片
+				const src = payload.source || payload.src;
+				const id = String(payload.id != null ? payload.id : '');
+				if (!id) throw new Error('albumtracks: id required');
+				if (src === 'kw') return await __albumTracksKw(id);
+				if (src === 'kg') return await __albumTracksKg(id);
+				if (src === 'tx') return await __albumTracksTx(id);
+				if (src === 'wy') return await __albumTracksWy(id);
+				if (src === 'mg') return await __albumTracksMg(id);
+				throw new Error('albumtracks: unknown source ' + src);
 			}
 			const mod = sdk[payload.source] && sdk[payload.source].leaderboard;
 			if (!mod) throw new Error('sdk: no leaderboard for source ' + payload.source);

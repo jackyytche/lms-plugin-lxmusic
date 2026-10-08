@@ -32,6 +32,11 @@ use warnings;
 use FindBin;
 use File::Spec;
 
+# 2026-10-08 补（Ubuntu 迁移时发现）：兄弟套件都有这行，经 plugin/t/JSON/XS.pm
+# 存根解析 JSON::XS（本机没装 libjson-xs-perl 时兜底）；此前缺失导致本套件
+# "Can't locate JSON/XS.pm" 直接编译失败却仍 exit 0。
+use lib File::Spec->catdir($FindBin::Bin);
+
 BEGIN {
 	my $root  = File::Spec->rel2abs(File::Spec->catdir($FindBin::Bin, '..'));
 	my $build = File::Spec->catdir($root, 't_build', 'Plugins', 'LxMusic');
