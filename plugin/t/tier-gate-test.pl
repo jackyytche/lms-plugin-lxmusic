@@ -19,6 +19,8 @@
 #   · 请求档已是阶梯末档（128k）⇒ 不设地板，任何可播都接受；
 #   · 非梯档交付（如 ogg/wav）⇒ 不参与比较，一律放行（不误伤）；
 #   · 拒绝**不会**卡住并行窗口（被拒候选必须结算并补位）。
+#   · 0.11.117 同档「质量优先窗口」：同档里"快而低档"的交付先压住，等同档更好的那份；
+#     单源（无同档兄弟在飞）立即交付；`qualityHold=0` 回到"先到者交付"（见 18a~18d）。
 use strict;
 use warnings;
 
@@ -174,6 +176,8 @@ sub run {
 		music => $track, src => 'mg', type => $opt{want},
 		# 0.11.110：抢跑窗口默认关闭（0）；要测它得显式传 `quality_head_start`
 		(defined $opt{quality_head_start} ? (qualityHeadStart => $opt{quality_head_start}) : ()),
+		# 0.11.117：同档质量优先窗口（生产默认读 pref；测试桩里显式传才可复现）
+		(defined $opt{quality_hold} ? (qualityHold => $opt{quality_hold}) : ()),
 		cb    => sub { push @got, $_[0] },
 	);
 	return unless $opt{deliver};
@@ -241,25 +245,35 @@ sub run {
 }
 
 # ---------- 2. flac24bit 请求拿到 flac(16bit) ⇒ 接受（阶梯允许降一档） ----------
+# ⚠️ 0.11.117：本用例口径是"**单源**交付降一档 ⇒ 接受"，必须真的只留一个源：
+#   桩里由 `%path` 决定"哪些源有文件"（`Sources::enabled` 恒返回 A+B），上一块结尾
+#   把 `%path` 恢复成了 (A,B) ⇒ 若不收回，B 就成了**同档在飞**的第二候选，
+#   新的"同档质量优先窗口"会（正确地）压住 A 的降档交付 ⇒ 本用例假失败（实测踩到）。
 {
+	%path = (A => $srcA);
 	run(want => 'flac24bit', deliver => { A => 'flac-16' });
 	check('2a flac24bit + flac16bit: 接受', @got == 1 && $got[0]{ok},
 		'got=' . scalar(@got));
 	check('2b 交付就是那个 flac', @got && $got[0]{url} =~ m{/flac-16/},
 		@got ? $got[0]{url} : 'none');
+	%path = (A => $srcA, B => $srcB);
 }
 
 # ---------- 3. 320k 请求拿到 128k mp3 ⇒ 接受（次一档就是 128k） ----------
 {
+	%path = (A => $srcA);
 	run(want => '320k', deliver => { A => 'mp3-128' });
 	check('3  320k + 128k mp3: 接受（不该更严）', @got == 1 && $got[0]{ok},
 		'got=' . scalar(@got));
+	%path = (A => $srcA, B => $srcB);
 }
 
 # ---------- 4. flac 请求拿到 320k ⇒ 接受（阶梯内降一档） ----------
 {
+	%path = (A => $srcA);
 	run(want => 'flac', deliver => { A => 'mp3-320' });
 	check('4  flac + 320k: 接受', @got == 1 && $got[0]{ok}, 'got=' . scalar(@got));
+	%path = (A => $srcA, B => $srcB);
 }
 
 # ---------- 5. 128k 请求（阶梯末档）⇒ 不设地板，任何可播都接受 ----------
@@ -550,10 +564,18 @@ sub run {
 		@got ? ($got[0]{quality} // '?') : 'none');
 	check('16b 只交付一次（压住的那份没有被抢先交付）', @got == 1, scalar(@got));
 
-	# 16c：**默认（0）** ⇒ 谁先给可播链接谁交付（低档先到就先交付），不再等待
-	run(%common);
-	check('16c 默认关闭抢跑：低档先到就交付（= 320k），不等待',
+	# 16c：**把 `qualityHeadStart` 关掉、同时也把 0.11.117/119 的质量窗口关掉**（`quality_hold => 0`）
+	# ⇒ 回到"谁先给可播链接谁交付"。
+	# ⚠️ 0.11.117 起"低档先到就交付"**不再是默认**（默认 `qualityHold=3` 会压住低档等更好的），
+	#   所以本用例必须显式 `quality_hold => 0` 才能测"抢跑这一个开关"的语义（16d 测新默认）。
+	run(%common, quality_hold => 0);
+	check('16c 抢跑与质量窗口都关掉：低档先到就交付（= 320k），不等待',
 		@got == 1 && (($got[0]{quality} // '') eq '320k'),
+		@got ? ($got[0]{quality} // '?') : 'none');
+	# 16d：0.11.117/119 的新默认 —— 即使抢跑关着，质量窗口也会压住低档
+	run(%common, quality_hold => 3);
+	check('16d 质量窗口默认开：低档先到也被压住（最终 = flac24bit）',
+		@got == 1 && (($got[0]{quality} // '') eq 'flac24bit'),
 		@got ? ($got[0]{quality} // '?') : 'none');
 	%hold_fire = ();
 	delete $enabled_ids{list};
@@ -579,6 +601,71 @@ sub run {
 		'launched=' . join(',', map { ($_->{id} // '?') . '@' . (($_->{info} || {})->{type} // '?') } @launched));
 	Plugins::LxMusic::Helper::_breaker_reset();
 	delete $enabled_ids{list};
+}
+
+# ---------- 18. 0.11.117：同档「质量优先窗口」（降档交付先压住，等同档更好的那份） ----------
+# 现场（用户 2026-10-11）：「wy 平台只有 320k mp3？」
+# 宿主侧 6 首真实 wy 曲目实测：HYWmusic 6/6 给真 FLAC、1010音源 1/6；设备侧对照：把 1010 停掉后
+# 同一首立刻变 FLAC 24bit 1612kbps/0.76s ⇒ 源没问题，是"快而低档"的源把"慢而高档"的源饿死：
+# 同档候选**并行**派发（先到先得），而交付闸的地板允许 flac→320k ⇒ 先到的 320k 就 $done=1。
+# 本闸：手上这份低于**本曲阶梯最高档**、且同档还有候选在飞（或窗口已开）⇒ 先压住最多 $hold 秒。
+{
+	%path = (A => $srcA, B => $srcB);
+	$enabled_ids{list} = [ 'A', 'B' ];
+	# 18a：A 在同档（flac）只给 320k mp3、B 给真 flac；B 后到（hold_fire 模拟慢源）⇒ 必须交付 B 的 flac
+	Slim::Utils::Timers::resetForTest();
+	run(want => 'flac', deliver => { A => 'mp3-320', B => 'flac-16' },
+		hold_fire => { 'B|flac' => 1 }, quality_hold => 1);
+	check('18a 同档更优者胜：交付的是 B 的真 flac（不是先到的 320k）',
+		@got == 1 && $got[0]{ok} && $got[0]{url} =~ m{/flac-16/},
+		@got ? ($got[0]{url} // '?') : 'none');
+	check('18b 先到的那份 320k 被压住过（窗口武装了定时器 ⇒ 有上限，不是无限等）',
+		(scalar grep { ($_->{at} // 0) <= time() + 3 } Slim::Utils::Timers::listPending()) ? 1 : 0,
+		'pending=' . scalar(Slim::Utils::Timers::listPending()));
+	# 18c：`qualityHold => 0`（用户要"能响优先"）⇒ 回到旧行为：先到的 320k 直接交付
+	run(want => 'flac', deliver => { A => 'mp3-320', B => 'flac-16' },
+		hold_fire => { 'B|flac' => 1 }, quality_hold => 0);
+	check('18c qualityHold=0（关）⇒ 回到"先到者交付"= 320k',
+		@got == 1 && $got[0]{ok} && $got[0]{url} =~ m{/mp3-320/},
+		@got ? ($got[0]{url} // '?') : 'none');
+	# 18d：单源（没有同档兄弟在飞）⇒ 降档交付**立即**发生，零额外等待（不误伤最常见路径）
+	%path = (A => $srcA);
+	run(want => 'flac', deliver => { A => 'mp3-320' }, quality_hold => 2);
+	check('18d 单源降档 ⇒ 立即交付（窗口不开，零开销）',
+		@got == 1 && $got[0]{ok} && $got[0]{url} =~ m{/mp3-320/},
+		@got ? ($got[0]{url} // '?') : 'none');
+	%path = (A => $srcA, B => $srcB);
+	delete $enabled_ids{list};
+	Slim::Utils::Timers::resetForTest();
+}
+
+# ---------- 19. 0.11.119：跨档也要等（"更好档还在飞"必须跨档看） ----------
+# 现场（用户 2026-10-11）：「tx 能出 192k 24bit，但一旦解析不出就直接退回 mp3」。
+# 设备 tries 实证：mp3 是从 **320k 档**交付的，而能做无损的 1010音源还在 **flac 档**飞；
+# 0.11.117 的判据只看"**同一档**有没有兄弟"（$q=320k 只有它自己）⇒ 不压 ⇒ 先到的 mp3 交付。
+# 阶梯是"全档位铺开、并行派发"，所以"更好档在飞"要**跨档**看（本用例 A 的 flac 档当场失败、
+# 由 320k 档给 mp3，B 的 flac 档慢一步到 ⇒ 必须等 B）。
+{
+	%path = (A => $srcA, B => $srcB);
+	$enabled_ids{list} = [ 'A', 'B' ];
+	# ⚠️ 桩的"交付循环"由 `deliver` 是否存在决定（`return unless $opt{deliver}`）⇒
+	#   只用 `deliver_tier` 时必须同时给一个（可为空的）`deliver`，否则整个循环不跑（第一版就这么假失败）。
+	run(want => 'flac', local_reject => { 'A|flac' => 1 }, deliver => {},
+		deliver_tier => { '320k' => { A => 'mp3-320' }, 'flac' => { B => 'flac-16' } },
+		hold_fire => { 'B|flac' => 1 }, quality_hold => 1);
+	check('19a 低档（320k）交付被压住，最终交付更高档的 flac（跨档等待）',
+		@got == 1 && $got[0]{ok} && $got[0]{url} =~ m{/flac-16/},
+		@got ? ($got[0]{url} // '?') : 'none');
+	# 19b：同样场景但**只有一个源**（没有更高档候选在飞）⇒ 不允许白等，低档立即交付
+	%path = (A => $srcA);
+	run(want => 'flac', local_reject => { 'A|flac' => 1 }, deliver => {},
+		deliver_tier => { '320k' => { A => 'mp3-320' } }, quality_hold => 2);
+	check('19b 无更高档候选在飞 ⇒ 立即交付低档（不白等）',
+		@got == 1 && $got[0]{ok} && $got[0]{url} =~ m{/mp3-320/},
+		@got ? ($got[0]{url} // '?') : 'none');
+	%path = (A => $srcA, B => $srcB);
+	delete $enabled_ids{list};
+	Slim::Utils::Timers::resetForTest();
 }
 
 print $failed ? "\nFAILED ($failed)\n" : "\nALL PASS\n";

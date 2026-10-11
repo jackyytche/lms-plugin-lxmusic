@@ -77,6 +77,7 @@ sub prefs {
 		workerEnable workerIdle preferStreamable
 		warmEnable warmMax resolveBudget sdkWorkers coverThumb coverThumbBig
 		coverWarmMax
+		qualityHold
 		metaCache metaCacheMax metaCacheDays
 	));
 }

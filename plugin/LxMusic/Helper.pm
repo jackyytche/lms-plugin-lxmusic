@@ -842,6 +842,7 @@ sub resolveTrack {
 	my %inflight_tier;
 	my $held;
 	my $grace_armed = 0;         # 0.11.108：等待更高档的**上限**只武装一次
+	my $hold_armed = 0;          # 0.11.117：同档质量优先窗口的**上限**也只武装一次
 	my $deliver_held;            # 0.11.108：前向声明（$finish 里要用；定义在 $finish 之后）
 	my $done     = 0;
 	my $dispatch;
@@ -871,20 +872,23 @@ sub resolveTrack {
 		require Plugins::LxMusic::ProtocolHandler
 			unless Plugins::LxMusic::ProtocolHandler->can('tier_rank');
 		my $want_rank = Plugins::LxMusic::ProtocolHandler::tier_rank($q) // 0;
+		# 0.11.117：`$got / $got_rank / $floor` 提到闸门外层 —— 下面的"同档质量优先窗口"要用它们
+		# 判断"手上这份是不是降档交付"（原来只在本闸内部用，窗口够不着）。
+		my ($got, $got_rank, $floor) = (undef, 0, 0);
 		if ($want_rank && _pref('tierGuard', 1)) {
 			my @l = $class->qualityLadder($q, $track, $a{declaredQualitys});
-			my $floor = (@l > 1)
+			$floor = (@l > 1)
 				? (Plugins::LxMusic::ProtocolHandler::tier_rank($l[1]) // 0) : 0;
 			# ⚠️ `_actualTier` 是 **ProtocolHandler 的方法**，签名
 			#   ($class, $fmt, $kbps, $bits, $declared)。
 			# 少传 $class 会让参数整体左移一位（$fmt 收到档位字符串、$bits 收到 types 数组），
 			# 结果恒等于"码率数字" ⇒ 排名恒为 0 ⇒ 闸门永不拒绝。本闸第一版就这么错的。
 			# 注意 `$class` 在这里是 **Helper**，不能用它去调 ProtocolHandler 的方法。
-			my $got = Plugins::LxMusic::ProtocolHandler->_actualTier(
+			$got = Plugins::LxMusic::ProtocolHandler->_actualTier(
 				$fmt, $kbps, $bits,
 				(ref($track->{types}) eq 'ARRAY' ? $track->{types} : undef),
 				$tm->{sr});   # 0.11.99：实测采样率（收紧"位深未知时的码率兜底"）
-			my $got_rank = Plugins::LxMusic::ProtocolHandler::tier_rank($got) // 0;
+			$got_rank = Plugins::LxMusic::ProtocolHandler::tier_rank($got) // 0;
 			if ($floor && $got_rank && $got_rank < $floor) {
 				push @tries, { source => $src->{name}, quality => $q, why => 'tier-too-low',
 					delivered => $got, url => substr($url, 0, 160), url_tail => substr($url, -60), %$tm };
@@ -938,13 +942,76 @@ sub resolveTrack {
 					my $go = {};
 					Slim::Utils::Timers::setTimer($go, time() + $head_start, sub {
 						return if $done;
-						$log->warn("LxMusic resolve: 更高档 ${head_start}s 内没来 —— 交付压住的那一份（保底）");
-						$deliver_held->();
+						$deliver_held->("更高档 ${head_start}s 内没来");
 					});
 				}
 				$cand_settle->() if $cand_settle;
 				return;
 			}
+		}
+
+		# ── 0.11.117 同档「质量优先窗口」──────────────────────────────────────────
+		# 现场（用户 2026-10-11）：「wy 平台只有 320k mp3？」
+		# 根因（宿主侧 + 设备侧双向实测）：wy 上两个源都能出链 —— 1010音源 1.6s 给 320k mp3、
+		#   HYWmusic 2.3s 给**真 FLAC**；而同档候选是**并行**派发的（$K=2，先到先得），
+		#   交付闸的**地板**规则又是 `flac → 320k`（$floor = ladder[1]）⇒ 先到的那份 320k 被
+		#   当成合格交付（$done=1），真无损那份到了也没人要。设备侧对照：把 1010 停掉后，
+		#   同一首立刻变成 **FLAC 24bit 1612kbps / 0.76s**（比 320k 那份还快）。
+		#   ⇒ 这不是源的问题，是"快而低档"的源把"慢而高档"的源饿死了。
+		# 修法：手上这份**低于本曲阶梯最高档**（但仍在底线上，否则上面的闸已经拒了）时，
+		#   只要**同档还有别的候选在飞**（或窗口已经开着）就先压住，最多 `$hold` 秒
+		#   （pref `qualityHold`，默认 2，0=关）；窗口内来了更好的就交付它，
+		#   超时或预算到期交付压住的（保底）。
+		# ⚠️ 基准取 `$ladder[0]`（本曲**能达到**的最高档）而不是 `$a{type}`：请求 flac24bit
+		#   而该曲没有 24bit 条目时阶梯就从 flac 起，此时"交付 flac"是**达标**、必须立即交付，
+		#   只有 320k 才算退而求其次（设备实证：这次 wy 的阶梯就是 flac 起跳）。
+		# ⚠️ 窗口开着时，**任何**低于 `$ladder[0]` 的交付都要压（不只是同一档）：
+		#   压住第一份后会补位派发更低档的候选，那些候选自身不算"降档"（$q 就是它的档），
+		#   若放它们交付，等待就白等了（窗口会被低档结果抢先结束）。
+		# 与 0.11.108 `qualityHeadStart` 的分工：那个管"**更高档**还在飞"，本闸管"同一档里
+		#   我这份退而求其次、兄弟候选可能更好" —— 前者默认关，后者正是这次 wy 的场景。
+		# 风险有界：只在"会降档"时最多 +$hold 秒；单候选且无窗口（最常见）零开销；
+		#   预算到期那条路径本来就会交付压住的那份（0.11.108），不会变成"点了没声"。
+		my $hold = defined $a{qualityHold} ? $a{qualityHold} : _pref('qualityHold', 3);
+		$hold = 0 unless defined $hold && $hold =~ /^\d+(?:\.\d+)?$/;
+		my $top_rank   = Plugins::LxMusic::ProtocolHandler::tier_rank($ladder[0]) // 0;
+		my $below_best = ($top_rank && $got_rank && $got_rank < $top_rank) ? 1 : 0;
+		# 0.11.119：判据从"**同一档**还有兄弟在飞"放宽到"**还有更高档的候选在飞**"。
+		# 现场（用户 2026-10-11）：「tx 能出 192k 24bit，但一旦解析不出就直接退回 mp3」——
+		#   设备 tries 实证：mp3 是从 **320k 档**交付的，而能做无损的 1010音源还在 **flac 档**飞；
+		#   旧判据只看 `$inflight_tier{$q}`（$q=320k，只有它自己）⇒ 不压 ⇒ 先到的 mp3 直接交付。
+		#   阶梯是"全档位铺开、并行派发"的，所以"更好档还在飞"必须**跨档**看。
+		# 自己不算"别的候选"（同档只扣自己那一份）：单候选降档时没有别人可等 ⇒ 立即交付。
+		my $best_other = 0;
+		for my $t (keys %inflight_tier) {
+			my $n = $inflight_tier{$t} || 0;
+			$n-- if $t eq $q;
+			next unless $n > 0;
+			my $r = Plugins::LxMusic::ProtocolHandler::tier_rank($t) // 0;
+			$best_other = $r if $r > $best_other;
+		}
+		if (!$force && $hold > 0 && $below_best && _pref('tierGuard', 1)
+			&& (($best_other && $best_other > $got_rank) || $hold_armed)) {
+			my $better = !$held || ($got_rank > ($held->{got_rank} // 0));
+			if ($better) {
+				$held = { q => $q, rank => $top_rank, got_rank => $got_rank,
+					args => [ $src, $q, $url, $tm, $friendly, $verified, $kbps, $magic, $len, $bits ] };
+			}
+			$log->warn('LxMusic resolve: [' . ($src->{name} // '?') . "] $q 只给出 "
+				. ($got // '?') . ($kbps ? " ~${kbps}kbps" : '')
+				. '（本曲最高档 ' . $ladder[0] . '），另有更高档候选在飞'
+				. " —— 先压住（质量优先 ${hold}s）");
+			# ⚠️ 上限只武装一次：多次"压住"共用同一个到期点，窗口绝不会被反复延长。
+			if (!$hold_armed) {
+				$hold_armed = 1;
+				my $go = {};
+				Slim::Utils::Timers::setTimer($go, time() + $hold, sub {
+					return if $done;
+					$deliver_held->("同档 ${hold}s 内没有更好的");
+				});
+			}
+			$cand_settle->() if $cand_settle;
+			return;
 		}
 
 		$done = 1;
@@ -995,11 +1062,15 @@ sub resolveTrack {
 	};
 
 	# 0.11.108：交付"被更高档压住"的那一份（强制，`$force=1` 跳过压单检查，避免自我循环）。
+	# 0.11.117：`$why` 可选 —— 0.11.108 只服务"等更高档"，现在同档质量优先窗口也走它，
+	# 所以日志要说清是哪个窗口到期（不带参数时保留原文案，老调用点行为不变）。
 	$deliver_held = sub {
+		my ($why) = @_;
 		return 0 unless $held;
 		my $h = $held;
 		$held = undef;
-		$log->warn('LxMusic resolve: 更高档都没成 —— 交付先前压住的那一份（' . ($h->{q} // '?') . '）');
+		$log->warn('LxMusic resolve: ' . ($why || '更高档都没成')
+			. ' —— 交付先前压住的那一份（' . ($h->{q} // '?') . '）');
 		$finish->(@{ $h->{args} }, 1);
 		return 1;
 	};
@@ -1060,10 +1131,7 @@ sub resolveTrack {
 			# 0.11.108：预算到期时，**如果手里压着一份可播交付，就交付它**（音质优先，但绝不白等成 FAIL）。
 			# 现场：慢源 4~20s，若预算先到而又压着墨澜@320k 的 128k，旧行为是直接 FAIL ⇒ 用户"点了没声"。
 			if ($held) {
-				my $h = $held;
-				$held = undef;
-				$log->warn('LxMusic resolve: 预算到期，改交付先前压住的那一份（' . ($h->{q} // '?') . '）');
-				return $finish->(@{ $h->{args} }, 1);
+				return $deliver_held->('预算到期');
 			}
 			$done = 1;
 			my $why = "resolve budget ${budget}s exceeded";
